@@ -283,12 +283,48 @@ impl Error {
     /// The stream feeding the engine failed.
     ///
     /// The compressed data itself was fine as far as it went; the source could not deliver more.
-    /// The original failure is available from [`source`][std::error::Error::source]. Produced by
-    /// [`other`][Self::other] and [`other_with_recovery`][Self::other_with_recovery], and by the
-    /// adapters behind the `futures-stream` feature.
+    /// The original failure is available from [`source`][std::error::Error::source], or by value
+    /// from [`into_source`][Self::into_source]. Produced by [`other`][Self::other] and
+    /// [`other_with_recovery`][Self::other_with_recovery], and by the adapters behind the
+    /// `futures-stream` feature.
     #[must_use]
     pub fn is_source(&self) -> bool {
         self.kind == Kind::Source
+    }
+
+    /// Takes the wrapped error, leaving this one behind.
+    ///
+    /// [`source`][std::error::Error::source] only lends the wrapped error, which is not enough for
+    /// a caller whose own error type owns its cause. A caller that wrapped one of its errors on the
+    /// way in - as the `futures-stream` adapters do for a failing source - can take it back out
+    /// here and report it unchanged, instead of burying it under a second layer.
+    ///
+    /// Returns `None` when nothing was wrapped, which is every error this crate raises itself
+    /// except the ones [`is_source`][Self::is_source] identifies.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use compressors::Error;
+    ///
+    /// #[derive(Debug)]
+    /// struct Disconnected;
+    /// # impl std::fmt::Display for Disconnected {
+    /// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// #         f.write_str("disconnected")
+    /// #     }
+    /// # }
+    /// # impl std::error::Error for Disconnected {}
+    ///
+    /// let error = Error::other("the source stopped", Disconnected);
+    /// assert!(error.is_source());
+    ///
+    /// let original = error.into_source().expect("a source error wraps its cause");
+    /// assert!(original.downcast::<Disconnected>().is_ok());
+    /// ```
+    #[must_use]
+    pub fn into_source(self) -> Option<Box<dyn StdError + Send + Sync>> {
+        self.source
     }
 }
 
@@ -383,6 +419,37 @@ mod tests {
     use recoverable::RecoveryKind;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct Cause;
+
+    impl fmt::Display for Cause {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("the cause")
+        }
+    }
+
+    impl StdError for Cause {}
+
+    #[test]
+    fn a_wrapped_cause_can_be_taken_back_by_value() {
+        let error = Error::other("the source stopped", Cause);
+
+        assert!(error.is_source());
+        assert!(error.source().is_some(), "the cause is also visible by reference");
+
+        let taken = error.into_source().expect("a source error wraps its cause");
+
+        drop(taken.downcast::<Cause>().expect("the original type survives the round trip"));
+    }
+
+    #[test]
+    fn an_error_this_crate_raises_itself_wraps_nothing() {
+        let error = Error::new(Kind::CorruptData, "the trailer checksum did not match");
+
+        assert!(!error.is_source());
+        assert!(error.into_source().is_none());
+    }
 
     #[test]
     fn a_build_failure_renders_and_converts_to_an_invalid_configuration() {

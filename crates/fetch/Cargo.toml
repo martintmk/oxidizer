@@ -63,6 +63,22 @@ rustls = [
 native-tls = ["dep:native-tls", "fetch_hyper?/native-tls", "fetch_tls/native-tls"]
 json = ["http_extensions/json"]
 test-util = ["tick/test-util", "http_extensions/test-util"]
+
+# Automatic decompression of compressed response bodies. Codecs are opt-in;
+# the default build links no codec at all.
+compression-gzip = ["dep:compressors", "dep:http_compression", "http_compression/gzip"]
+# The HTTP `deflate` format is zlib-wrapped DEFLATE (RFC 9110 8.4.1.2), which is
+# `compressors/zlib`. Raw RFC 1951 has no HTTP token.
+compression-deflate = ["dep:compressors", "dep:http_compression", "http_compression/deflate"]
+compression-brotli = ["dep:compressors", "dep:http_compression", "http_compression/brotli"]
+compression-zstd = ["dep:compressors", "dep:http_compression", "http_compression/zstd"]
+compression-all = [
+    "compression-brotli",
+    "compression-deflate",
+    "compression-gzip",
+    "compression-zstd",
+]
+
 tokio = [
     "dep:tokio",
     "dep:anyspawn",
@@ -84,11 +100,13 @@ tokio = [
 # internal
 anyspawn = { workspace = true, optional = true }
 bytesbuf = { workspace = true, features = ["std"] }
+compressors = { workspace = true, optional = true }
 data_privacy = { workspace = true }
 fetch_hyper = { workspace = true, optional = true }
 fetch_options = { workspace = true }
 fetch_tls = { workspace = true }
 fundle = { workspace = true }
+http_compression = { workspace = true, optional = true }
 http_extensions = { workspace = true }
 layered = { workspace = true, features = [
     "dynamic-service",
@@ -130,6 +148,12 @@ rustls-platform-verifier = { workspace = true, optional = true }
 # internal
 anyspawn = { path = "../anyspawn", features = ["tokio"] }
 benchmarking = { path = "../benchmarking" }
+# Mirrors the optional dependencies so `cfg(test)` builds compile the
+# decompression wiring (docs/optional-deps-in-test-builds.md).
+compressors = { path = "../compressors", features = ["brotli", "futures-stream", "gzip", "zlib", "zstd"] }
+http_compression = { path = "../http_compression", features = ["brotli", "deflate", "gzip", "zstd"] }
+# Every codec, so `cfg(test)` builds exercise all of them without the crate
+# having to enumerate features (docs/optional-deps-in-test-builds.md).
 data_privacy = { path = "../data_privacy" }
 fetch_hyper = { path = "../fetch_hyper", features = ["rustls", "native-tls"] }
 fetch_tls = { path = "../fetch_tls", features = ["rustls", "native-tls"] }
@@ -254,6 +278,7 @@ required-features = ["test-util"]
 name = "http_client_streaming"
 required-features = ["tokio", "rustls"]
 
+
 [[bench]]
 harness = false
 name = "pipelines"
@@ -291,6 +316,17 @@ required-features = ["test-util"]
 [[test]]
 name = "timeout"
 required-features = ["test-util"]
+
+[[test]]
+name = "decompression"
+required-features = [
+    "test-util",
+    "compression-brotli",
+    "compression-deflate",
+    "compression-gzip",
+    "compression-zstd",
+]
+
 
 # >>> anvil-managed: anvil-lints
 [lints]

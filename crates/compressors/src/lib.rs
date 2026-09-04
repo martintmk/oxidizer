@@ -280,14 +280,6 @@ pub use builder::{CompressorBuilder, DecompressorBuilder};
 use bytesbuf::BytesView;
 pub use error::{BuildError, Error, Result};
 pub use input::InputData;
-#[cfg(any(
-    test,
-    feature = "brotli",
-    feature = "deflate",
-    feature = "gzip",
-    feature = "zlib",
-    feature = "zstd"
-))]
 pub use level::Level;
 pub use limits::DecompressorLimits;
 pub use resources::Resources;

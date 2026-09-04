@@ -1689,6 +1689,7 @@ dependencies = [
  "benchmarking",
  "bytes",
  "bytesbuf",
+ "compressors",
  "criterion",
  "ctor",
  "data_privacy",
@@ -1699,6 +1700,7 @@ dependencies = [
  "fundle",
  "futures",
  "http",
+ "http_compression",
  "http_extensions",
  "hyper-util",
  "insta",
@@ -2372,6 +2374,26 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+]
+
+[[package]]
+name = "http_compression"
+version = "0.1.0"
+dependencies = [
+ "bytesbuf",
+ "compressors",
+ "ctor",
+ "futures",
+ "http",
+ "http-body",
+ "http_extensions",
+ "layered",
+ "mime",
+ "ohno 0.5.0",
+ "seatbelt",
+ "smallvec",
+ "testing_aids",
+ "tokio",
 ]
 
 [[package]]

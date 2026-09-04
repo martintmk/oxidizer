@@ -1,0 +1,80 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "http_compression"
+description = "HTTP request and response body compression and decompression."
+version = "0.1.0"
+readme = "README.md"
+keywords = ["http", "compression", "decompression", "gzip", "middleware"]
+categories = ["compression", "network-programming"]
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+include.workspace = true
+repository = "https://github.com/microsoft/oxidizer/tree/main/crates/http_compression"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # Workspace sibling crates
+    "compressors::*",
+    "http_extensions::*",
+    # The HTTP ecosystem this crate is built on
+    "http::*",
+    "layered::layer::Layer",
+    "ohno::error_label::ErrorLabel",
+    "layered::service::Service",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+gzip = ["compressors/gzip"]
+# The HTTP `deflate` format is zlib-wrapped DEFLATE (RFC 9110 8.4.1.2), so it
+# maps to zlib. `compressors/deflate` is raw RFC 1951 and has no HTTP token.
+deflate = ["compressors/zlib"]
+brotli = ["compressors/brotli"]
+zstd = ["compressors/zstd"]
+
+[dependencies]
+# internal
+bytesbuf = { workspace = true, features = ["std"] }
+compressors = { workspace = true, features = ["futures-stream"] }
+http_extensions = { workspace = true }
+layered = { workspace = true }
+ohno = { workspace = true }
+seatbelt = { workspace = true }
+
+# external
+futures = { workspace = true, features = ["std"] }
+http = { workspace = true }
+http-body = { workspace = true }
+mime = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+# internal
+compressors = { path = "../compressors", features = [
+    "brotli",
+    "futures-stream",
+    "gzip",
+    "zlib",
+    "zstd",
+] }
+http_extensions = { path = "../http_extensions", features = ["test-util"] }
+ohno = { path = "../ohno", features = ["test-util"] }
+testing_aids = { path = "../testing_aids" }
+
+# external
+ctor = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "rt"] }
+
+# >>> anvil-managed: anvil-lints
+[lints]
+workspace = true
+# <<< anvil-managed: anvil-lints

@@ -35,6 +35,8 @@ fn poll_compression<S, C, E>(
     mut source: Pin<&mut S>,
     compression: &mut C,
     finished: &mut bool,
+    flush_on_pending: bool,
+    needs_flush: &mut bool,
     cx: &mut Context<'_>,
 ) -> Poll<Option<Result<BytesView>>>
 where
@@ -73,12 +75,22 @@ where
                 return Poll::Ready(Some(Err(Error::invalid_state("the operation requested input after end of input"))));
             }
             Ok(Output::NeedInput) => match source.as_mut().poll_next(cx) {
+                Poll::Pending if flush_on_pending && *needs_flush => {
+                    if let Err(error) = compression.flush() {
+                        *finished = true;
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    // Drain this flush before polling the source again. Idle polls must not
+                    // keep producing empty compressed blocks when no new input has arrived.
+                    *needs_flush = false;
+                }
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     compression.end_input();
                     input_ended = true;
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
+                    *needs_flush |= !chunk.is_empty();
                     if let Err(error) = compression.push(chunk) {
                         *finished = true;
                         return Poll::Ready(Some(Err(error)));
@@ -142,6 +154,8 @@ pin_project! {
         source: S,
         compression: C,
         finished: bool,
+        flush_on_pending: bool,
+        needs_flush: bool,
     }
 }
 
@@ -160,7 +174,37 @@ where
             source,
             compression,
             finished: false,
+            flush_on_pending: false,
+            needs_flush: false,
         }
+    }
+
+    /// Flushes buffered compression output when the source returns [`Poll::Pending`].
+    ///
+    /// Disabled by default. Enable this for interactive streams whose consumers need to
+    /// decompress each burst before more input arrives. A flush keeps the stream open, but
+    /// can reduce compression efficiency by ending a compressed block early.
+    ///
+    /// Immediately available source chunks are not flushed individually. Once a burst has
+    /// been flushed, further idle polls do not flush again until new non-empty input arrives.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "gzip")] {
+    /// use compressors::{CompressionStream, Resources, gzip};
+    /// use futures::stream;
+    ///
+    /// let source = stream::pending::<Result<bytesbuf::BytesView, std::io::Error>>();
+    /// let compressed =
+    ///     CompressionStream::compress(source, gzip::Compressor::new(&Resources::default()))
+    ///         .flush_on_pending(true);
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn flush_on_pending(mut self, enabled: bool) -> Self {
+        self.flush_on_pending = enabled;
+        self
     }
 }
 
@@ -231,7 +275,67 @@ where
             source,
             compression,
             finished: false,
+            flush_on_pending: false,
+            needs_flush: false,
         }
+    }
+}
+
+impl<S, C> CompressionStream<S, C> {
+    /// Borrows the source this adapter reads from.
+    ///
+    /// Useful when the source carries state the adapter does not model - a byte stream cannot
+    /// express HTTP trailers, for instance, so a consumer that needs them keeps them on its own
+    /// source type and reaches them back through here rather than through a shared slot.
+    #[must_use]
+    pub fn get_ref(&self) -> &S {
+        &self.source
+    }
+
+    /// Mutably borrows the source this adapter reads from.
+    ///
+    /// Polling the source directly loses whatever it yields, because this adapter never sees it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "gzip")]
+    /// # {
+    /// use bytesbuf::BytesView;
+    /// use compressors::{CompressionStream, Resources, gzip};
+    /// use futures::stream;
+    ///
+    /// let source = stream::empty::<std::result::Result<BytesView, std::io::Error>>();
+    /// let mut stream =
+    ///     CompressionStream::decompress(source, gzip::Decompressor::new(&Resources::default()));
+    ///
+    /// let _source: &mut _ = stream.get_mut();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn get_mut(&mut self) -> &mut S
+    where
+        S: Unpin,
+    {
+        &mut self.source
+    }
+
+    /// Mutably borrows the pinned source this adapter reads from.
+    ///
+    /// The pin-preserving counterpart of [`get_mut`][Self::get_mut], for a source that is not
+    /// [`Unpin`].
+    #[must_use]
+    pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut S> {
+        self.project().source
+    }
+
+    /// Consumes this adapter and returns the source it was reading from.
+    ///
+    /// Any input already pushed into the engine, and any output not yet pulled from it, is
+    /// discarded along with the engine.
+    #[must_use]
+    pub fn into_inner(self) -> S {
+        self.source
     }
 }
 
@@ -245,18 +349,26 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
-        poll_compression(this.source, this.compression, this.finished, cx)
+        poll_compression(
+            this.source,
+            this.compression,
+            this.finished,
+            *this.flush_on_pending,
+            this.needs_flush,
+            cx,
+        )
     }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytesbuf::BytesBuf;
+    use futures::channel::mpsc;
     use futures::executor::block_on;
     use futures::task::noop_waker;
     use futures::{StreamExt, stream};
@@ -264,7 +376,7 @@ mod tests {
     use super::*;
     use crate::format::Format;
     use crate::testing::{ProgressCompression, view};
-    use crate::{DecompressorLimits, Level, Resources, gzip};
+    use crate::{CompressorBuilder, DecompressorBuilder, DecompressorLimits, Level, Resources, gzip};
 
     fn ok_stream(chunks: Vec<BytesView>) -> impl Stream<Item = std::result::Result<BytesView, std::io::Error>> {
         stream::iter(chunks.into_iter().map(Ok))
@@ -279,6 +391,39 @@ mod tests {
             }
             Ok(collected.consume_all())
         })
+    }
+
+    #[test]
+    fn the_source_is_reachable_through_the_adapter() {
+        let source = ok_stream(vec![view(b"payload")]);
+        let mut stream = CompressionStream::compress(source, gzip::Compressor::new(&Resources::default()));
+
+        // Borrowing must not disturb the adapter, so compression still runs to
+        // completion afterwards.
+        let _shared: &_ = stream.get_ref();
+        let _exclusive: &mut _ = stream.get_mut();
+
+        collect(stream).expect("borrowing the source does not disturb the adapter");
+    }
+
+    #[test]
+    fn the_source_can_be_taken_back_out() {
+        let source = ok_stream(vec![view(b"payload")]);
+        let stream = CompressionStream::compress(source, gzip::Compressor::new(&Resources::default()));
+
+        let recovered = stream.into_inner();
+
+        // Nothing was consumed from the source, so it still yields its chunk.
+        let chunks: Vec<_> = block_on(recovered.collect());
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn the_pinned_source_is_reachable_through_the_adapter() {
+        let source = ok_stream(vec![view(b"payload")]);
+        let mut stream = Box::pin(CompressionStream::compress(source, gzip::Compressor::new(&Resources::default())));
+
+        let _pinned: Pin<&mut _> = stream.as_mut().get_pin_mut();
     }
 
     #[test]
@@ -526,6 +671,116 @@ mod tests {
             collect(CompressionStream::compress(source, gzip::Compressor::new(&Resources::default()))).expect("compression succeeds");
 
         assert_eq!(gzip.range(0..2).to_vec(), vec![0x1f, 0x8b]);
+    }
+
+    #[test]
+    fn flushing_on_pending_delivers_each_burst_before_eof_with_tiny_chunks() {
+        for &format in Format::ALL {
+            for size in [1, 2, 7] {
+                let (sender, source) = mpsc::unbounded::<std::result::Result<BytesView, std::io::Error>>();
+                let compressor = CompressorBuilder::new()
+                    .output_chunk_size(NonZeroUsize::new(size).unwrap())
+                    .build_format(format, &Resources::default())
+                    .unwrap();
+                let decompressor = DecompressorBuilder::new().build_format(format, &Resources::default()).unwrap();
+                let compressed = CompressionStream::compress(source, compressor).flush_on_pending(true);
+                let mut decoded = CompressionStream::decompress(compressed, decompressor);
+                let waker = noop_waker();
+                let mut cx = Context::from_waker(&waker);
+
+                for burst in [b"first burst".as_slice(), b"second burst".as_slice()] {
+                    sender.unbounded_send(Ok(view(burst))).unwrap();
+                    let mut received = Vec::new();
+                    for _ in 0..1024 {
+                        match Pin::new(&mut decoded).poll_next(&mut cx) {
+                            Poll::Ready(Some(chunk)) => received.extend(chunk.unwrap().to_vec()),
+                            Poll::Ready(None) => panic!("the source is still open"),
+                            Poll::Pending => {}
+                        }
+                        if received.len() >= burst.len() {
+                            break;
+                        }
+                    }
+                    assert_eq!(received, burst, "{format:?}, output chunk size {size}");
+                }
+
+                drop(sender);
+                assert!(collect(decoded).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn flushing_on_pending_is_opt_in_and_can_be_disabled() {
+        for explicitly_disabled in [false, true] {
+            let (sender, source) = mpsc::unbounded::<std::result::Result<BytesView, std::io::Error>>();
+            let compressed = CompressionStream::compress(source, gzip::Compressor::new(&Resources::default()));
+            let compressed = if explicitly_disabled {
+                compressed.flush_on_pending(true).flush_on_pending(false)
+            } else {
+                compressed
+            };
+            let mut decoded = CompressionStream::decompress(compressed, gzip::Decompressor::new(&Resources::default()));
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            sender.unbounded_send(Ok(view(b"small burst"))).unwrap();
+            for _ in 0..8 {
+                assert!(Pin::new(&mut decoded).poll_next(&mut cx).is_pending());
+            }
+
+            drop(sender);
+            assert_eq!(collect(decoded).unwrap().to_vec(), b"small burst");
+        }
+    }
+
+    #[test]
+    fn idle_polls_and_empty_chunks_do_not_repeat_a_flush() {
+        for &format in Format::ALL {
+            let (sender, source) = mpsc::unbounded::<std::result::Result<BytesView, std::io::Error>>();
+            let compressor = CompressorBuilder::new().build_format(format, &Resources::default()).unwrap();
+            let mut compressed = CompressionStream::compress(source, compressor).flush_on_pending(true);
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+
+            sender.unbounded_send(Ok(view(b"flush once"))).unwrap();
+            let mut paused = false;
+            for _ in 0..1024 {
+                match Pin::new(&mut compressed).poll_next(&mut cx) {
+                    Poll::Ready(Some(chunk)) => {
+                        chunk.unwrap();
+                    }
+                    Poll::Pending => {
+                        paused = true;
+                        break;
+                    }
+                    Poll::Ready(None) => panic!("the source is still open"),
+                }
+            }
+            assert!(paused, "{format:?}");
+
+            for _ in 0..8 {
+                sender.unbounded_send(Ok(BytesView::new())).unwrap();
+                assert!(Pin::new(&mut compressed).poll_next(&mut cx).is_pending(), "{format:?}");
+            }
+
+            drop(sender);
+            collect(compressed).unwrap();
+        }
+    }
+
+    #[test]
+    fn enabling_flush_does_not_change_an_immediately_ready_stream() {
+        for &format in Format::ALL {
+            let compress = |flush| {
+                let compressor = CompressorBuilder::new().build_format(format, &Resources::default()).unwrap();
+                collect(CompressionStream::compress(ok_stream(vec![view(b"first "), view(b"second")]), compressor).flush_on_pending(flush))
+                    .unwrap()
+                    .to_vec()
+            };
+
+            assert_eq!(compress(true), compress(false), "{format:?}");
+        }
     }
 
     #[test]
