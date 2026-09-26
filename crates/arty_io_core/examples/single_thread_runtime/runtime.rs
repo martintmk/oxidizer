@@ -8,10 +8,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arty_io_core::{
-    Coordinator, Cycle, Driver, DriverError, DriverHandle, DriverOptions, DriverProvider, DriverRole, IoContext, ProviderOptions,
-    ShutdownError, SystemTaskSpawner,
+    Cycle, Driver, DriverError, DriverHandle, DriverOptions, DriverProvider, DriverRole, IoContext, ProviderOptions, ShutdownError,
+    SystemTaskSpawner,
 };
 use thread_aware_core::{Thread, ThreadAware};
+
+use super::coordinator::Coordinator;
 
 type ContextBox = Box<dyn Any + Send>;
 type DriverStore = Vec<Box<dyn ErasedDriver>>;
@@ -29,7 +31,7 @@ trait ErasedDriver {
     fn context_type(&self) -> TypeId;
     fn context(&self) -> ContextBox;
     fn role(&self) -> DriverRole;
-    fn execute_cycle(&mut self, cycle: Cycle<'_>) -> Result<(), DriverError>;
+    fn execute_cycle(&mut self, cycle: &mut Cycle<'_>) -> Result<(), DriverError>;
     fn shutdown(self: Box<Self>) -> Result<(), ShutdownError>;
 }
 
@@ -60,7 +62,7 @@ impl<D: Driver, C: IoContext> ErasedDriver for RegisteredDriver<D, C> {
         self.role
     }
 
-    fn execute_cycle(&mut self, cycle: Cycle<'_>) -> Result<(), DriverError> {
+    fn execute_cycle(&mut self, cycle: &mut Cycle<'_>) -> Result<(), DriverError> {
         self.driver.execute_cycle(cycle)
     }
 
@@ -138,10 +140,8 @@ impl Runtime {
             provider.relocate(None, options.thread());
             let (mut driver, context) = provider.create(options).expect("sample driver initialization is infallible");
             driver
-                .execute_cycle(Cycle::new(Instant::now(), Duration::ZERO, coordinator))
+                .execute_cycle(&mut Cycle::new(Instant::now(), Duration::ZERO, false, coordinator))
                 .expect("sample driver initialization cycle is infallible");
-            coordinator.complete_cycle();
-            coordinator.begin_cycle();
             let reply_context = context.clone();
             register_driver(drivers, driver, context, role);
             let _ = reply_tx.send(reply_context);
@@ -172,12 +172,11 @@ impl Runtime {
 
 fn run_worker(worker: &Thread, spawner: &SystemTaskSpawner, commands: &mpsc::Receiver<Command>) {
     let mut drivers = DriverStore::new();
-    let mut coordinator = Coordinator::new();
+    let mut coordinator = Coordinator;
 
     while let Ok(command) = commands.recv() {
         match command {
             Command::Run(operation) => {
-                coordinator.begin_cycle();
                 operation(worker, spawner, &mut coordinator, &mut drivers);
                 execute_driver_cycle(&mut drivers, &mut coordinator);
             }
@@ -225,15 +224,14 @@ fn execute_driver_cycle(drivers: &mut DriverStore, coordinator: &mut Coordinator
     let started_at = Instant::now();
     for driver in drivers.iter_mut().filter(|driver| driver.role() == DriverRole::Secondary) {
         driver
-            .execute_cycle(Cycle::new(started_at, Duration::ZERO, coordinator))
+            .execute_cycle(&mut Cycle::new(started_at, Duration::ZERO, false, coordinator))
             .expect("sample driver cycle is infallible");
     }
     if let Some(primary) = drivers.iter_mut().find(|driver| driver.role() == DriverRole::Primary) {
         primary
-            .execute_cycle(Cycle::new(started_at, Duration::ZERO, coordinator))
+            .execute_cycle(&mut Cycle::new(started_at, Duration::ZERO, true, coordinator))
             .expect("sample driver cycle is infallible");
     }
-    coordinator.complete_cycle();
 }
 
 fn shutdown_drivers(drivers: DriverStore) -> ShutdownResult {

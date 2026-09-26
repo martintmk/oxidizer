@@ -30,7 +30,7 @@ provide interoperability between incompatible copies of the contract itself.
 ## Why the current boundary is insufficient
 
 The current [driver interface](../src/driver.rs) gives every driver the same
-maximum wait, invokes secondaries before the primary, and shares a coordinator.
+maximum wait, invokes secondaries before the primary, and uses runtime-owned coordination.
 Secondaries schedule blocking observation on background threads. This supplies:
 
 ```text
@@ -55,28 +55,29 @@ owner thread processes them:
 5. B cannot publish the task wake until the worker services B.
 ```
 
-B's background observer and the shared coordinator solve progress, but may add a
+B's background observer and runtime coordination solve progress, but may add a
 thread and cross-thread delivery. Native sharing can avoid that overhead when
 drivers are compatible.
 
 The runtime begins coordination once per logical cycle, not between driver
 calls. Registration initialization is a separate completed zero-wait cycle.
-Drivers create non-cloneable
-`PendingWork` values for work that continues off-thread. A secondary attaches the waker for
-each current background wait, uses `complete` after publishing results, and
-drops the value when work ends without results. After the primary returns, the
-runtime interrupts remaining waits and waits for all pending work before advancing.
+Drivers synchronously register each native interruption waker through
+`Cycle::start_work`, which forwards the waker to the runtime's `PendingWorkTracker`
+and returns a non-cloneable `PendingWork` value.
+A secondary moves the handle to off-thread work and completes or drops it when
+that work ends, after publishing any results. Both actions notify the runtime.
+After the primary returns, the runtime interrupts remaining waits and waits for
+all registered work before advancing. The shared crate supplies the ownership
+handle, not the runtime's synchronization or interruption implementation.
 
 Finite waits can bound this delay, but introduce polling and latency.
 Zero-duration scans avoid blocking on the wrong driver but consume CPU while
 idle. A dedicated observer solves progress at the cost of threads and possible
 cross-thread completion delivery.
 
-The [single-thread example](../examples/single_thread_runtime/runtime.rs)
-demonstrates lazy registration and peer discovery, not a native completion loop.
-Its worker receives control commands; the example drivers do not perform I/O or
-service native sources. Discovering peers alone therefore does not establish
-coordinated completion progress.
+The [single-thread example](../examples/single_thread_runtime/runtime.rs) demonstrates
+registration and peer discovery with a no-op tracker. It performs no I/O and
+does not implement the completion protocol described above.
 
 ## Native constraints
 

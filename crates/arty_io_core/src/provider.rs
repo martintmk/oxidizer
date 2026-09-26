@@ -7,13 +7,13 @@ use crate::{Driver, DriverError, DriverOptions, IoContext};
 
 /// A factory for per-worker driver and context pairs.
 ///
-/// A runtime clones and relocates the provider for each worker, then consumes the relocated clone
-/// to create that worker's pair. State shared by driver instances remains private to the provider.
+/// The runtime clones and relocates the provider to each worker, then consumes the clone to
+/// create its pair. Shared driver state remains private to the provider.
 pub trait DriverProvider: Clone + ThreadAware + Sized + 'static {
     /// Whether drivers created by this provider may receive [`DriverRole::Primary`](crate::DriverRole::Primary).
     ///
-    /// A runtime assigns the primary role only when the worker has no primary and this flag is
-    /// true. The assigned role is still available through [`DriverOptions::role`].
+    /// The runtime may assign primary only when this flag is `true` and the worker has no
+    /// primary. Read the assignment through [`DriverOptions::role`].
     const CAN_BE_PRIMARY: bool;
 
     /// The context type associated with this provider.
@@ -24,23 +24,18 @@ pub trait DriverProvider: Clone + ThreadAware + Sized + 'static {
 
     /// Creates a driver and context for the worker described by `options`.
     ///
-    /// The runtime calls this method on the worker that will own the driver. The implementation
-    /// must return promptly and must not wait for another runtime worker to make progress.
-    /// The context may outlive the driver and must reject new operations after admission is
-    /// closed.
+    /// Runs on the owning worker. Return promptly without waiting for another runtime worker.
+    /// The context may outlive the driver and must reject operations after admission closes.
     ///
-    /// [`DriverOptions::drivers`](crate::DriverOptions::drivers) contains borrowed handles to
-    /// drivers registered earlier on the same worker. The new driver may clone independently owned
-    /// state from those handles.
+    /// Earlier peers are available through [`DriverOptions::drivers`]. Their borrowed handles
+    /// may be used to clone independently owned state.
     ///
-    /// Prepare native resources without publishing the context. The runtime then invokes and
-    /// completes a separate zero-wait [`Driver::execute_cycle`] to connect notification and
-    /// finish initialization work before publishing the context or notifying peers.
+    /// Do not publish the context. The runtime first completes a zero-wait
+    /// [`Driver::execute_cycle`] to establish notification and finish initialization.
     ///
     /// # Errors
     ///
-    /// Returns an error if the driver and context cannot be initialized. On error, partially
-    /// initialized native state must be safe to drop and no usable context may have been
-    /// published. The runtime rolls back the unpublished pair.
+    /// Returns initialization failures. Partial state must be safe to drop, with no context
+    /// published; the runtime rolls back the pair.
     fn create(self, options: DriverOptions<'_>) -> Result<(Self::Driver, Self::Context), DriverError>;
 }

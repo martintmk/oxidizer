@@ -1,184 +1,112 @@
 # Requirements
 
-`arty_io_core` is the shared contract between the Arty runtime and independently
-versioned I/O drivers. It specifies interoperability, not runtime registration
-policy or a particular operating-system completion mechanism.
+`arty_io_core` specifies interoperability between runtimes and independently
+versioned I/O drivers. These are implementation obligations, not facilities
+provided by the no-op example tracker.
 
 ## R1: Stable shared vocabulary
 
-The crate is the shared, versioned API for the driver ecosystem.
-
-- A runtime and every driver it hosts name the same `arty_io_core` types.
-- Public signatures prefer standard-library types.
-- Thread placement uses `thread_aware_core` directly; this crate does not
-  re-export its types.
-- Runtime-only helpers, registries, and scheduling policy stay outside this
-  crate.
+- Runtimes and drivers use compatible `arty_io_core` types.
+- Public signatures prefer standard-library types. Placement uses
+  `thread_aware_core` directly, without re-exports.
+- Registries, scheduling policy, and native coordination stay outside core.
 
 ## R2: Lazy and independent registration
 
-The contract supports registration after runtime startup.
-
-- The requested `IoContext` type identifies its provider and driver.
-- The runtime supplies a `ProviderOptions` when creating the provider.
-- `ProviderOptions` is empty in the initial contract and can gain optional
-  runtime facilities later without changing the provider factory signature.
-- `get_context::<MyContext>()` needs no provider value or runtime configuration.
-- The first lookup returns only after every active worker has initialized the
-  associated driver and context.
-- A provider remains sufficient to create every per-worker driver and context
-  pair.
-- Registration is keyed by the context's Rust type identity.
-- Semver-incompatible versions of one driver crate can be registered together
-  because their context types have distinct identities.
-- The runtime owns registration coordination, cancellation, and rollback.
-- Later lookups clone the worker-local context stored alongside the registered
-  driver without creating more driver instances.
+- Registration is keyed by the concrete `IoContext` type, which selects its
+  provider. The runtime supplies `ProviderOptions`.
+- The first request returns only after every active worker has an initialized
+  driver/context pair. Later requests clone existing contexts.
+- Different driver versions can coexist through distinct context types.
+- Registration coordination, cancellation, and rollback belong to the runtime.
 
 ## R3: Per-worker initialization
 
-The runtime explicitly initializes a driver adapter and context for each async
-worker it serves.
-
-- A provider clone is relocated to the worker before creation.
-- `DriverOptions::thread` identifies that worker and its runtime owner.
-- A worker has at most one primary. Roles are fixed for the lifetime of their
-  drivers.
-- The runtime assigns primary only to a provider whose `CAN_BE_PRIMARY` flag is
-  true. If no primary exists, the runtime owns the worker's parking path.
-- `DriverOptions::role` identifies the primary or a secondary before creation.
-- `DriverOptions::drivers` exposes type-erased handles for drivers whose
-  registration previously completed on that worker.
-- Existing driver handles are immutable, remain on their owning worker, and are
-  available only during creation of the new driver.
-- After storing a new driver, the runtime calls `Driver::on_peer_registered`
-  on every driver registered earlier on that worker, in registration order.
-- Registration is acknowledged only after every earlier driver has received
-  the new driver's type-erased handle.
-- A relocated provider clone is consumed exactly once.
-- Before publication, the runtime invokes and completes a separate zero-wait
-  initialization cycle.
-- The provider decides whether instances share queues, memory, threads, or
-  nothing.
+- The runtime clones and relocates each provider before consuming it on the
+  owning worker. `DriverOptions` supplies that worker, its role, and earlier peers.
+- Roles are fixed. There is at most one primary, assigned only when
+  `CAN_BE_PRIMARY` is true. Without a primary, the runtime owns worker parking.
+- Peer handles are borrowed and worker-local. Drivers may clone independently
+  owned state from them, not retain the borrow.
+- Before publishing a context, the runtime completes a separate zero-wait cycle
+  with `can_block = false`.
+- After storing the pair, it notifies earlier peers in registration order.
+  All notifications finish before registration is acknowledged.
+- Providers choose whether instances share queues, memory, or threads.
 
 ## R4: Driver-owned execution strategy
 
-The runtime does not dictate how an I/O subsystem distributes work.
-
-- Completion processing takes `&mut self`, reflecting the runtime's exclusive
-  ownership of a thread-local driver without forcing implementations to add
-  interior mutability.
-- `Driver` remains dyn-compatible. A runtime may use a private owning shim to
-  store and erase the associated context type and adapt consuming shutdown to
-  boxed storage.
-- The runtime invokes every secondary driver before the primary.
-- Every driver receives the same `Cycle::max_wait`.
-- The primary may wait directly on the worker. Secondary callbacks do not block;
-  they may schedule a wait using `max_wait` on a background thread.
-- A secondary registers the waker for its current background wait each cycle and
-  uses driver-private synchronization to arm or replace that wait.
-- The runtime captures one `Instant` when it starts a completion-processing
-  cycle and passes that value unchanged to every driver visited in the cycle.
-- Drivers use the shared `Coordinator` to wake native waits and interrupt the
-  runtime cycle.
-- If an immediately serviceable batch remains after a bounded pass, the driver
-  interrupts the cycle. In-flight operations alone do not require interruption.
-- A driver may delegate work through the runtime-owned `SystemTaskSpawner` handle.
-- A driver or provider may create any number of private threads.
-- Thread pinning and native observer topology remain implementation details.
+- Driver methods run on the owning worker. Completion processing takes
+  `&mut self`; drivers need not be `Send` or `Sync`.
+- `Driver` remains dyn-compatible. A private owning shim may adapt consuming
+  shutdown for erased storage.
+- Secondaries run before the primary. Every invocation receives the same
+  `started_at` and `max_wait`.
+- Only `can_block = true` permits a worker wait. Secondaries register background
+  waits and return without joining them.
+- `Cycle` mutably borrows a runtime-provided `PendingWorkTracker`, which need
+  not be `Send` or `Sync`.
+- `Cycle::start_work` synchronously registers the native interruption waker
+  and returns one `PendingWork` handle.
+- Bounded batches with serviceable work remaining request another cycle.
+  In-flight operations alone do not indicate serviceable work.
+- Drivers may use `SystemTaskSpawner` or provider-owned threads.
 
 ## R5: Reliable wake-ups
 
-The shared coordinator has the following semantics:
-
-- An interruption raised before a blocking wait is latched for that cycle.
-- Secondary background observers can interrupt the primary worker wait.
-- A wake-up does not prevent pending completions from being processed.
-- A wake-up raised by the driver's own thread is honored.
-- Redundant wake-ups may be coalesced.
-- A wake-up is never dropped.
-- Registered wakers remain memory-safe after their driver is gone.
-- Only the runtime begins a new coordination cycle, before checking cycle work.
-- The runtime begins coordination exactly once per logical cycle, never between drivers.
-- A driver may create multiple non-cloneable `PendingWork` values for work that outlives
-  `execute_cycle`.
-- Work that publishes results uses `complete` to interrupt the cycle and
-  release the completion barrier together. Work ending without results drops its
-  value without interrupting the cycle.
-- After the primary returns, the runtime interrupts remaining waits and blocks
-  until every pending-work value is completed or dropped before beginning the next cycle.
-- Once a driver is dropped or its shutdown returns, retained wakers stop
-  interrupting runtime cycles.
-- Interruption wakers run inline on the interrupting thread and only signal;
-  they do not join tasks, drain the coordinator, or wait on locks held by the
-  completing work.
+- Interruption is latched for the cycle, including signals raised before a
+  wait or by its own thread. Redundant signals may coalesce but cannot be lost.
+- Registration enrolls work and installs its waker before returning. If already
+  interrupted, it invokes the waker before returning.
+- Wakers remain memory-safe independently of the driver. They signal promptly
+  without panicking, joining work, or waiting on locks held by completing work.
+- A driver may hold multiple non-cloneable `PendingWork` handles. Each releases
+  only its own barrier participation and retires its own registration.
+- Completing and dropping are equivalent: both notify the runtime to retire the
+  registration, interrupt peers, then release the participation. Publish any
+  results before either action.
+- Each handle invokes one runtime notification once. Cloning or dropping the
+  underlying wakers does not complete work or affect a later cycle.
+- After the primary returns, the runtime interrupts remaining waits and waits
+  for every handle before advancing. Only the runtime begins a new logical
+  cycle, once, before checking work.
+- Interrupted waits still process pending completions. After a driver is dropped
+  or shut down, its retained wakers no longer interrupt runtime cycles.
 
 ## R6: Safe and blocking shutdown
 
-Shutdown must not rely on an unsafe trait or a caller-checked inertness flag.
-
-- A driver is memory-safe to drop at every point in its lifecycle.
-- Dropping a driver closes admission if shutdown has not already started.
-- Contexts remain valid in a closed state and do not by themselves prevent
-  shutdown completion.
-- In-flight operations retain ownership of the state they access through
-  reference counts, pool leases, or equivalent safe handles.
-- If an operating system retains only a raw pointer into pooled storage, the
-  storage owner remains alive independently of the driver.
-- `Driver::shutdown` consumes the driver and blocks until graceful cleanup
-  completes or fails.
-- Shutdown closes admission before waiting for active operations and
-  operating-system callbacks to drain.
-- Shutdown may return `ShutdownError`, constructed from either a descriptive
-  message or an underlying source.
-- The driver bounds its own shutdown wait and returns `ShutdownError` rather
-  than blocking indefinitely.
-- Normal cycle coordination is no longer driven during shutdown; drivers use
-  their own synchronization for shutdown progress.
-- A driver does not wait for work that can run only after its shutdown returns,
-  including another driver serialized on the same runtime thread.
-- Returning an error does not relax the requirement that consuming and dropping
-  the driver is memory-safe.
-- Contexts may outlive drivers; later operations fail safely.
-- The stable contract has no `unsafe Driver` implementation requirement and no
-  `is_inert` query.
-- Platform-specific unsafe code remains private to the driver implementation.
-- The runtime reports shutdown failures and continues shutting down its
-  remaining drivers. Shutdown completion is not a memory-safety precondition.
-- `Driver::shutdown` is not callable through `dyn Driver`; runtimes that erase
-  drivers use a private owning shim for graceful shutdown.
+- Dropping a driver is always memory-safe and closes admission if necessary.
+  Contexts may outlive it as closed handles and do not themselves delay draining.
+- Operations and native callbacks retain their accessible state. Storage
+  referenced by native raw pointers has an owner independent of the driver.
+- `shutdown` consumes the driver, closes admission, and drains within a bounded
+  wait. Failure returns `ShutdownError`, without relaxing drop safety.
+- Shutdown uses driver-owned progress mechanisms: normal cycle coordination
+  has stopped, and no other driver on the same worker may be required to run.
+- The runtime reports failures, attempts remaining drivers, and keeps the system
+  task spawner available until all shutdown calls return.
+- Safety does not depend on successful shutdown or a caller-checked inertness
+  flag. Platform-specific unsafe code stays private to driver implementations.
 
 ## R7: Registration failure
 
-Native initialization and the initial cycle can return `DriverError`.
-
-- The runtime rolls back an unpublished driver/context pair on error.
-- A steady-state `execute_cycle` error is reported and initiates driver shutdown.
-- An existing driver panics when it cannot integrate a newly registered driver.
-- The runtime does not continue a partially connected peer registration.
-- A driver with conditional availability exposes a capability check that a
-  consumer calls before requesting its context.
+- Creation and the initial cycle may return `DriverError`; the runtime rolls
+  back the unpublished pair.
+- A normal cycle error is reported and initiates driver shutdown.
+- Peer integration failure panics; partially connected registration cannot
+  continue.
+- Drivers with conditional availability expose a capability check before a
+  consumer requests the context.
 
 ## R8: System work is named explicitly
 
-The runtime facility for synchronous I/O work uses `SystemTask` terminology.
-
-- Submitted work may block.
-- It is system work owned by an I/O driver, not an async application task.
-- It does not run on an async worker.
-- Submission returns before the work completes.
-- The facility remains available through driver shutdown.
-- `DriverOptions` exposes a crate-owned cloneable handle rather than the runtime's
-  shared-ownership implementation type.
+- `SystemTask` is blocking driver work on system threads, not an async task.
+- Submission returns after acceptance, without waiting for completion.
+- `SystemTaskSpawner` remains available through shutdown and hides the runtime's
+  shared-ownership mechanism.
 
 ## R9: Scope of the initial API
 
-The initial contract deliberately excludes:
-
-- a runtime driver registry or `get_or_init` API;
-- native observer placement beyond the primary/secondary role contract;
-- memory pools, configurable clock services, telemetry, and ecosystem-specific
-  error types;
-- batching and wake-coalescing optimizations;
-- `no_std` support;
-- a default I/O implementation.
+Core does not provide a driver registry, native observer placement, memory
+pools, configurable clocks, telemetry, ecosystem-specific errors, batching
+optimizations, `no_std` support, or a default I/O implementation.

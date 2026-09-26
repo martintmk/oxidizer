@@ -55,7 +55,7 @@ impl Driver for SampleDriver {
         }
     }
 
-    fn execute_cycle(&mut self, _cycle: Cycle<'_>) -> Result<(), DriverError> {
+    fn execute_cycle(&mut self, _cycle: &mut Cycle<'_>) -> Result<(), DriverError> {
         let _ = self.role;
         Ok(())
     }
@@ -115,7 +115,7 @@ impl Driver for EchoDriver {
 
     fn on_peer_registered(&mut self, _peer: DriverHandle<'_>) {}
 
-    fn execute_cycle(&mut self, _cycle: Cycle<'_>) -> Result<(), DriverError> {
+    fn execute_cycle(&mut self, _cycle: &mut Cycle<'_>) -> Result<(), DriverError> {
         let _ = self.role;
         Ok(())
     }

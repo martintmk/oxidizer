@@ -4,58 +4,73 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use crate::{Coordinator, PendingWork};
+use crate::{PendingWork, PendingWorkTracker};
 
-/// Runtime inputs and coordination operations for one driver completion cycle.
+/// Runtime inputs and work registration for one driver completion cycle.
 ///
-/// A cycle is worker-local and cannot be sent to another thread. Move
-/// [`PendingWork`] values to background work instead.
+/// Borrows a runtime-owned [`PendingWorkTracker`] on the owning worker. For background work,
+/// move the [`PendingWork`] returned by [`start_work`](Self::start_work), not the cycle.
 pub struct Cycle<'a> {
     started_at: Instant,
     max_wait: Duration,
-    coordinator: &'a Coordinator,
+    can_block: bool,
+    tracker: &'a mut dyn PendingWorkTracker,
     _not_send: PhantomData<Rc<()>>,
 }
 
 impl<'a> Cycle<'a> {
-    /// Creates a cycle view for one driver invocation.
+    /// Creates the inputs and registration handle for one driver invocation.
+    ///
+    /// `tracker` belongs to the current logical cycle. Set `can_block` to `false` for
+    /// initialization and secondary drivers; only the primary may receive `true`.
     #[must_use]
-    pub const fn new(started_at: Instant, max_wait: Duration, coordinator: &'a Coordinator) -> Self {
+    pub const fn new(started_at: Instant, max_wait: Duration, can_block: bool, tracker: &'a mut dyn PendingWorkTracker) -> Self {
         Self {
             started_at,
             max_wait,
-            coordinator,
+            can_block,
+            tracker,
             _not_send: PhantomData,
         }
     }
 
-    /// Returns the snapshot captured once for all drivers visited in this runtime cycle.
+    /// Returns the time snapshot shared by all drivers in this runtime cycle.
     #[must_use]
     pub const fn started_at(&self) -> Instant {
         self.started_at
     }
 
-    /// Returns the maximum duration this driver may wait in the current cycle.
+    /// Returns the maximum wait duration.
     ///
-    /// A primary may wait directly on the worker. A secondary may apply this duration only to
-    /// background work represented by [`PendingWork`] values.
+    /// Applies to the worker only when [`can_block`](Self::can_block) is `true`; otherwise it
+    /// bounds background waits represented by [`PendingWork`].
     #[must_use]
     pub const fn max_wait(&self) -> Duration {
         self.max_wait
     }
 
-    /// Creates a non-cloneable [`PendingWork`] value for work that can outlive this call.
-    ///
-    /// Drivers may create multiple values. Use [`PendingWork::on_interrupt`] to attach a native
-    /// wait's waker. After publishing work, call [`PendingWork::complete`]. If the work ends
-    /// without publishing anything, drop the value. The runtime does not begin the next cycle
-    /// until all pending work is completed or dropped.
+    /// Returns whether this invocation may block its runtime worker.
     #[must_use]
+    pub const fn can_block(&self) -> bool {
+        self.can_block
+    }
+
+    /// Registers pending work and its native interruption waker.
+    ///
+    /// Registration is synchronous. Call before entering or scheduling a native wait, using a
+    /// waker whose signal remains latched until the wait observes it. The waker may run inline
+    /// on any thread; it must return promptly without panicking, joining work, or acquiring
+    /// locks held by the completing work.
+    ///
+    /// Keep the handle until the work ends, publishing any results before completing or
+    /// dropping it. Both notify the runtime. Each call registers a separate participant in
+    /// the completion barrier. Use a no-op waker for work that does not wait.
     #[inline]
-    pub fn start_work(&self) -> PendingWork {
-        self.coordinator.start_work()
+    pub fn start_work(&mut self, interrupt: Waker) -> PendingWork {
+        self.tracker.start_work(interrupt)
     }
 }
 
@@ -64,6 +79,7 @@ impl fmt::Debug for Cycle<'_> {
         f.debug_struct("Cycle")
             .field("started_at", &self.started_at)
             .field("max_wait", &self.max_wait)
+            .field("can_block", &self.can_block)
             .finish_non_exhaustive()
     }
 }

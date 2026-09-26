@@ -3,6 +3,11 @@
 
 //! Public surface contract tests.
 
+#![allow(clippy::unwrap_used, reason = "test code")]
+
+#[path = "../examples/single_thread_runtime/coordinator.rs"]
+mod coordinator;
+
 use std::cell::Cell;
 use std::error::Error;
 use std::rc::Rc;
@@ -13,9 +18,10 @@ use std::time::{Duration, Instant};
 use std::{fmt, io, thread};
 
 use arty_io_core::{
-    Coordinator, Cycle, Driver, DriverError, DriverHandle, DriverOptions, DriverProvider, DriverRole, IoContext, ProviderOptions,
-    ShutdownError, SystemTaskSpawner,
+    Cycle, Driver, DriverError, DriverHandle, DriverOptions, DriverProvider, DriverRole, IoContext, PendingWork, PendingWorkTracker,
+    ProviderOptions, ShutdownError, SystemTaskSpawner,
 };
+use coordinator::Coordinator;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use thread_aware_core::{Thread, ThreadAware};
 
@@ -29,6 +35,28 @@ assert_impl_all!(ProviderOptions: Send, Sync, fmt::Debug);
 assert_impl_all!(DriverError: Send, Sync, fmt::Debug, fmt::Display, Error);
 assert_impl_all!(ShutdownError: Send, Sync, fmt::Debug, fmt::Display, Error);
 assert_impl_all!(SystemTaskSpawner: Clone, Send, Sync, fmt::Debug);
+
+#[derive(Default)]
+struct WakeCounter(AtomicUsize);
+
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn example_tracker_does_not_signal_interrupts() {
+    let mut tracker = Coordinator;
+    let count = Arc::new(WakeCounter::default());
+    let interrupt = Waker::from(Arc::clone(&count));
+    let mut cycle = Cycle::new(Instant::now(), Duration::ZERO, false, &mut tracker);
+
+    cycle.start_work(interrupt.clone()).complete();
+    drop(cycle.start_work(interrupt));
+
+    assert_eq!(count.0.load(Ordering::Relaxed), 0);
+}
 
 #[test]
 fn system_task_spawner_debug() {
@@ -97,9 +125,38 @@ fn driver_can_remain_thread_local() {
 
 #[test]
 fn driver_is_boxable() {
-    let driver: Box<dyn Driver> = Box::new(LocalDriver::new(Rc::default()));
+    let mut driver: Box<dyn Driver> = Box::new(LocalDriver::new(Rc::default()));
+    let mut coordinator = Coordinator;
+
+    driver
+        .execute_cycle(&mut Cycle::new(Instant::now(), Duration::ZERO, false, &mut coordinator))
+        .unwrap();
 
     assert!(driver.handle().handle().is::<LocalDriver>());
+}
+
+#[test]
+fn cycle_passes_the_native_waker_to_its_tracker() {
+    struct RecordingTracker {
+        interrupt: Option<Waker>,
+    }
+
+    impl PendingWorkTracker for RecordingTracker {
+        fn start_work(&mut self, interrupt: Waker) -> PendingWork {
+            self.interrupt = Some(interrupt);
+            PendingWork::new(Waker::noop().clone())
+        }
+    }
+
+    let mut tracker = RecordingTracker { interrupt: None };
+    let mut cycle = Cycle::new(Instant::now(), Duration::from_millis(17), false, &mut tracker);
+    let mut driver = LocalDriver::new(Rc::default());
+    driver.interrupt = Waker::from(Arc::new(WakeCounter::default()));
+    let expected = driver.interrupt.clone();
+
+    driver.execute_cycle(&mut cycle).unwrap();
+
+    assert!(tracker.interrupt.unwrap().will_wake(&expected));
 }
 
 #[test]
@@ -196,111 +253,21 @@ fn different_driver_types_have_distinct_identity() {
 }
 
 #[test]
-fn completion_processing_supports_latched_interrupt() {
-    let mut driver = LocalDriver::new(Rc::default());
-    let coordinator = Coordinator::new();
-
-    coordinator.interrupt_waker().wake_by_ref();
-    driver
-        .execute_cycle(Cycle::new(Instant::now(), Duration::MAX, &coordinator))
-        .unwrap();
-
-    assert_eq!(driver.completion_queue.waits.load(Ordering::Relaxed), 1);
-}
-
-#[test]
 fn completion_cycle_uses_one_time_snapshot() {
     let mut first_driver = LocalDriver::new(Rc::default());
     let mut second_driver = LocalDriver::new(Rc::default());
     let cycle_start = Instant::now();
-    let coordinator = Coordinator::new();
+    let mut coordinator = Coordinator;
 
     first_driver
-        .execute_cycle(Cycle::new(cycle_start, Duration::ZERO, &coordinator))
+        .execute_cycle(&mut Cycle::new(cycle_start, Duration::ZERO, false, &mut coordinator))
         .unwrap();
     second_driver
-        .execute_cycle(Cycle::new(cycle_start, Duration::ZERO, &coordinator))
+        .execute_cycle(&mut Cycle::new(cycle_start, Duration::ZERO, false, &mut coordinator))
         .unwrap();
 
-    assert_eq!(*first_driver.completion_queue.cycle_start.lock().unwrap(), Some(cycle_start));
-    assert_eq!(*second_driver.completion_queue.cycle_start.lock().unwrap(), Some(cycle_start));
-}
-
-#[test]
-fn non_blocking_completion_processing_preserves_latched_interrupt() {
-    let mut driver = LocalDriver::new(Rc::default());
-    let coordinator = Coordinator::new();
-
-    coordinator.interrupt_waker().wake_by_ref();
-    driver
-        .execute_cycle(Cycle::new(Instant::now(), Duration::ZERO, &coordinator))
-        .unwrap();
-
-    assert!(*driver.completion_queue.latch.raised.lock().unwrap());
-
-    driver
-        .execute_cycle(Cycle::new(Instant::now(), Duration::MAX, &coordinator))
-        .unwrap();
-
-    assert!(!*driver.completion_queue.latch.raised.lock().unwrap());
-}
-
-#[derive(Debug, Default)]
-struct Latch {
-    raised: Mutex<bool>,
-    changed: Condvar,
-}
-
-impl Wake for Latch {
-    fn wake(self: Arc<Self>) {
-        let mut raised = self.raised.lock().unwrap_or_else(PoisonError::into_inner);
-        *raised = true;
-        self.changed.notify_one();
-    }
-}
-
-#[derive(Debug, Default)]
-struct TestCompletionQueue {
-    latch: Arc<Latch>,
-    waits: AtomicUsize,
-    cycle_start: Mutex<Option<Instant>>,
-}
-
-impl TestCompletionQueue {
-    fn process_completions(&self, cycle: &Cycle) {
-        self.waits.fetch_add(1, Ordering::Relaxed);
-        *self.cycle_start.lock().unwrap_or_else(PoisonError::into_inner) = Some(cycle.started_at());
-
-        if cycle.max_wait().is_zero() {
-            return;
-        }
-
-        let mut raised = self.latch.raised.lock().unwrap_or_else(PoisonError::into_inner);
-
-        if *raised {
-            *raised = false;
-            return;
-        }
-
-        if cycle.max_wait() == Duration::MAX {
-            while !*raised {
-                raised = self.latch.changed.wait(raised).unwrap_or_else(PoisonError::into_inner);
-            }
-        } else {
-            let (next, _) = self
-                .latch
-                .changed
-                .wait_timeout(raised, cycle.max_wait())
-                .unwrap_or_else(PoisonError::into_inner);
-            raised = next;
-        }
-
-        *raised = false;
-    }
-
-    fn waker(&self) -> Waker {
-        Waker::from(Arc::clone(&self.latch))
-    }
+    assert_eq!(first_driver.cycle_start, Some(cycle_start));
+    assert_eq!(second_driver.cycle_start, Some(cycle_start));
 }
 
 #[derive(Debug, Default)]
@@ -312,7 +279,8 @@ struct ShutdownState {
 #[derive(Debug)]
 struct LocalDriver {
     state: Rc<ShutdownState>,
-    completion_queue: TestCompletionQueue,
+    cycle_start: Option<Instant>,
+    interrupt: Waker,
     owned_resource: Option<Box<()>>,
     registered_driver_count: usize,
 }
@@ -321,7 +289,8 @@ impl LocalDriver {
     fn new(state: Rc<ShutdownState>) -> Self {
         Self {
             state,
-            completion_queue: TestCompletionQueue::default(),
+            cycle_start: None,
+            interrupt: Waker::noop().clone(),
             owned_resource: Some(Box::new(())),
             registered_driver_count: 0,
         }
@@ -346,10 +315,9 @@ impl Driver for LocalDriver {
         }
     }
 
-    fn execute_cycle(&mut self, cycle: Cycle<'_>) -> Result<(), DriverError> {
-        let mut token = cycle.start_work();
-        token.on_interrupt(self.completion_queue.waker());
-        self.completion_queue.process_completions(&cycle);
+    fn execute_cycle(&mut self, cycle: &mut Cycle<'_>) -> Result<(), DriverError> {
+        let _work = cycle.start_work(self.interrupt.clone());
+        self.cycle_start = Some(cycle.started_at());
         Ok(())
     }
 
@@ -500,7 +468,7 @@ impl Driver for LeaseDriver {
 
     fn on_peer_registered(&mut self, _peer: DriverHandle<'_>) {}
 
-    fn execute_cycle(&mut self, _cycle: Cycle<'_>) -> Result<(), DriverError> {
+    fn execute_cycle(&mut self, _cycle: &mut Cycle<'_>) -> Result<(), DriverError> {
         Ok(())
     }
 

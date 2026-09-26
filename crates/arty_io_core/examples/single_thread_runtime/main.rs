@@ -1,8 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Lazily initializes two I/O drivers in a fixed single-thread runtime.
+//! Demonstrates lazy driver registration and peer discovery on one runtime worker.
+//!
+//! The sample drivers do not perform I/O; their work tracker is a no-op.
 
+mod coordinator;
 mod drivers;
 mod runtime;
 

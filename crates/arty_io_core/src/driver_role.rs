@@ -1,29 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-/// A driver's fixed runtime-assigned waiting role on one worker.
+/// A driver's fixed waiting role on its runtime worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriverRole {
-    /// The single driver whose cycle may block the runtime worker.
+    /// The driver allowed to block the runtime worker.
     ///
-    /// A worker has at most one primary. The runtime assigns this role only to a provider whose
-    /// [`DriverProvider::CAN_BE_PRIMARY`](crate::DriverProvider::CAN_BE_PRIMARY) flag is true,
-    /// invokes it after every secondary, and permits it to apply
-    /// [`Cycle::max_wait`](crate::Cycle::max_wait) directly to its worker wait.
+    /// A worker has at most one primary, assigned only when
+    /// [`DriverProvider::CAN_BE_PRIMARY`](crate::DriverProvider::CAN_BE_PRIMARY) is `true`.
+    /// It runs after all secondaries and may wait when [`Cycle::can_block`](crate::Cycle::can_block)
+    /// permits it.
     Primary,
-    /// A driver whose worker-local cycle must remain non-blocking.
+    /// A driver whose worker-local cycle must not block.
     ///
-    /// The runtime invokes a secondary before the primary so it can arm off-worker observation
-    /// before the worker may block. It receives the same [`Cycle::max_wait`](crate::Cycle::max_wait)
-    /// as the primary; that value is a timeout for an off-worker wait, not permission to block or
-    /// join from [`Driver::execute_cycle`](crate::Driver::execute_cycle). It claims the cycle's
-    /// [`PendingWork`](crate::PendingWork) value for background work and completes that
-    /// value before the runtime advances. If the observer publishes work, it calls
-    /// [`PendingWork::complete`](crate::PendingWork::complete); otherwise it
-    /// drops the value without interrupting the cycle.
+    /// Runs before the primary with [`Cycle::can_block`](crate::Cycle::can_block) set to `false`.
+    /// It may apply [`Cycle::max_wait`](crate::Cycle::max_wait) only to background waits
+    /// registered through [`Cycle::start_work`](crate::Cycle::start_work).
     ///
-    /// Potentially indefinite observation needs independent execution capacity. Do not occupy a
-    /// bounded shared system-task pool unless the runtime guarantees enough workers for every
-    /// simultaneously blocked observer.
+    /// Indefinite waits need independent execution capacity. A bounded system-task pool is
+    /// suitable only if it has capacity for every simultaneously blocked observer.
     Secondary,
 }

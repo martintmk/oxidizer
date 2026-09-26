@@ -31,7 +31,6 @@ allowed_external_types = [
 default = []
 
 [dependencies]
-performables = { workspace = true }
 thread_aware_core = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
