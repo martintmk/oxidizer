@@ -13,6 +13,8 @@ entry-point body is cancelled during shutdown. Explicit runtime construction
 returns an error where possible, although worker creation and initialization
 can still panic.
 
-Synchronous waiting APIs panic when called on an asynchronous Arty worker.
+Calling `JoinHandle::wait` on an async Arty worker panics.
+`RuntimeScheduler::block_on` and `Runtime::stop` return an error instead of
+waiting in that context.
 A blocking callback cannot wait for its own runtime to shut down; dropping the
 runtime owner there requests shutdown without waiting for the callback itself.

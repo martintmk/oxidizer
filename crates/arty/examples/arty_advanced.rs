@@ -11,7 +11,7 @@ fn main() -> Result<(), ohno::AppError> {
     let runtime = Runtime::builder().processor_count(ProcessorCount::at_most(2)).build()?;
     let answer = runtime
         .scheduler()
-        .spawn_anywhere(async |cx| {
+        .spawn_anywhere((), |cx, ()| async move {
             cx.clock().delay(Duration::from_millis(1)).await;
             // This scheduler keeps the child on the parent's worker.
             cx.scheduler().spawn(async |_| 42).await

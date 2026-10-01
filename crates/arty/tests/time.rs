@@ -70,7 +70,7 @@ fn many_timers_ensure_advanced() {
         .map(|_| {
             runtime
                 .scheduler()
-                .spawn_anywhere(async |builtins| builtins.clock().delay(Duration::from_millis(1)).await)
+                .spawn_anywhere((), |builtins, ()| async move { builtins.clock().delay(Duration::from_millis(1)).await })
         })
         .collect();
 

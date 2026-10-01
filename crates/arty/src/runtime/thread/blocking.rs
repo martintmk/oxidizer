@@ -5,7 +5,7 @@
 //! convenience purposes when called from a non-runtime thread. They are not safe to call from
 //! threads that are marked as non-blocking threads and attempting to do so will panic.
 //!
-//! Arty marks all asynchronous worker threads as non-blocking threads. Runtime internals may
+//! Arty marks all async worker threads as non-blocking threads. Runtime internals may
 //! wait for notifications, but public API entry points meant for intentional
 //! blocking on results are forbidden on these threads.
 
