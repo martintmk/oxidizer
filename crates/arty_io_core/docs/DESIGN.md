@@ -5,8 +5,8 @@
 Independently developed I/O libraries should work on one runtime without
 requiring one common I/O implementation or a separate runtime per library.
 
-The shared problem is cooperation: when may the worker sleep, what wakes it
-when any library has work, and how can everything stop safely?
+The shared problem is cooperation: when may the worker sleep, how do drivers
+share its execution time, and how can everything stop safely?
 
 `arty_io_core` defines that agreement, not an implementation. Driver authors
 keep control of native I/O; runtime authors keep control of scheduling.
@@ -20,13 +20,12 @@ Application code uses a handle rather than calling the worker's driver directly.
 
 | Part | What it is for |
 | --- | --- |
-| `IoContext` | The application's handle to the I/O library's operations. |
-| `DriverProvider` | Creates the library's driver and context on each worker. |
+| `IoContext` | The application's handle to the I/O library's operations and factory for worker-local drivers. |
 | `Driver` | The worker-local part that processes submissions and completions. |
 | Runtime | Gives drivers turns and coordinates when the worker may wait or continue. |
 
 Contexts can outlive drivers. The runtime calls each driver with exclusive
-access on its owning worker; providers decide whether workers share queues, memory, or
+access on its owning worker; contexts decide whether workers share queues, memory, or
 threads. Context relocation is an optimization, not a correctness requirement.
 
 ## A walkthrough: two libraries, one worker
@@ -46,42 +45,22 @@ registrations, allowing different driver versions to coexist.
 ### Give every driver a turn before sleeping
 
 A logical cycle is one coordinated pass across the drivers, with a shared time
-snapshot and wait bound. At registration, the runtime may select one eligible
-driver as **primary**. **Secondaries** run first without blocking the worker;
-the primary runs last and may wait up to the runtime's wait bound. A zero bound
-means no waiting. Without a primary, parking remains the runtime's responsibility.
+snapshot and wait bound. At registration, the runtime tells the context which
+roles remain available, and the returned driver instance selects one. A worker
+has at most one **primary**. **Secondaries** run first without blocking the
+worker; the primary runs last and may wait up to the runtime's wait bound. A
+zero bound means no waiting. Without a primary, parking remains the runtime's
+responsibility.
 
 Bounded batches keep one driver from monopolizing the worker. Immediately
-serviceable work requests another cycle; unfinished I/O alone does not, avoiding
-a busy loop while waiting for the operating system.
-
-### Let either library wake the worker
-
-Suppose the file driver has a background wait while the primary network driver
-waits on the worker. A file completion must end that network wait, rather than
-depend on an unrelated network event.
-
-Before waiting, each driver registers an interruption waker through
-`Cycle::start_work` and receives a `PendingWork` handle. It keeps the handle
-until the work ends, publishes results, then completes or drops the handle.
-That notification interrupts other waits, including the primary's.
-
-After the primary returns, the runtime interrupts remaining waits and waits
-for all registered work to end before advancing. Asking a wait to stop is not
-proof that it has stopped; the handles provide that completion barrier.
-
-Signals also stay latched across wait entry. A completion arriving just before
-another driver sleeps must not be lost. Coordination starts before checking
-work and is never reset between driver calls. The exact wake-up protocol is
-specified in [R5](REQUIREMENTS.md#r5-reliable-wake-ups).
+serviceable work uses the owner waker to request another cycle; unfinished I/O
+alone does not, avoiding a busy loop while waiting for the operating system.
+Each driver also exposes a waker that lets the runtime interrupt a pending
+completion wait.
 
 ### Keep scheduling decisions in the runtime
 
-The runtime implements `PendingWorkTracker` because it knows when the worker
-has other work and how it should park. Drivers supply native interruption;
-each side owns its synchronization.
-
-Blocking observers can use `SystemTaskSpawner` or provider-owned threads.
+Blocking observers can use `SystemTaskSpawner` or context-owned threads.
 These are not async application tasks: indefinitely blocked observers need
 independent execution capacity, or an undersized pool can prevent progress.
 

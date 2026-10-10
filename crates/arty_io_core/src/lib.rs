@@ -9,42 +9,35 @@
 
 //! Stable contracts for integrating I/O drivers into thread-aware runtimes.
 //!
-//! Drivers provide I/O; runtimes provide scheduling and work coordination. This crate defines
+//! Drivers provide I/O; runtimes provide scheduling. This crate defines
 //! the interfaces between them, but provides neither a runtime nor an I/O implementation.
 //!
 //! # How drivers work
 //!
-//! Applications access a driver's I/O operations through an [`IoContext`]. Its [`DriverProvider`]
-//! creates a context and a worker-local [`Driver`] for each runtime worker. The driver processes
-//! submissions and completions in bounded calls to [`Driver::execute_cycle`].
-//!
-//! Before entering or scheduling a native wait, the driver calls [`Cycle::start_work`] with an
-//! interruption waker whose signal remains latched until the wait observes it. It keeps the
-//! returned [`PendingWork`] until the work ends and publishes any results before completing or
-//! dropping the handle. Both actions notify the runtime.
+//! Applications access a driver's I/O operations through an [`IoContext`]. It creates a
+//! worker-local [`Driver`] for each runtime worker. The driver processes submissions and
+//! completions in bounded calls to [`Driver::execute_cycle`].
 //!
 //! ## Primary and secondary drivers
 //!
-//! A worker has at most one [`Primary`](DriverRole::Primary) driver, assigned only to a provider
-//! that opts in through [`DriverProvider::CAN_BE_PRIMARY`]. It may wait on the worker for up to
-//! [`Cycle::max_wait`]; a zero wait bound means no waiting.
+//! A worker has at most one [`Primary`](DriverRole::Primary) driver. [`DriverOptions`] lists the
+//! roles available during creation, and [`DriverInstance`] returns the selected role. A primary
+//! may wait on the worker for up to [`Cycle::max_wait`]; a zero wait bound means no waiting.
 //!
 //! [`Secondary`](DriverRole::Secondary) drivers must not block the worker. They may schedule
-//! background waits represented by [`PendingWork`] within the same wait bound; indefinite waits
-//! require independent execution capacity.
+//! background waits on independent execution capacity.
 //!
 //! # Runtime responsibilities
 //!
-//! The runtime clones and relocates providers to their workers, assigns driver roles, and
+//! The runtime clones and relocates contexts to its workers, assigns driver roles, and
 //! supplies [`DriverOptions`]. It completes a non-blocking, zero-wait initialization cycle
 //! before publishing a context.
-//! It also supplies a [`SystemTaskSpawner`] for blocking system work.
+//! It also supplies an owner waker for requesting another cycle and a [`SystemTaskSpawner`] for
+//! blocking system work. Each driver supplies a waker that interrupts its pending completion wait.
 //!
 //! Each logical cycle uses a shared time snapshot and wait bound. The runtime invokes
-//! secondaries before the primary and implements [`PendingWorkTracker`] to register work,
-//! latch interruption, and track completion. After the primary returns, it interrupts remaining
-//! waits and waits for every pending-work handle before advancing. If there is no primary,
-//! the runtime retains responsibility for parking the worker.
+//! secondaries before the primary. If there is no primary, the runtime retains responsibility
+//! for parking the worker.
 //!
 //! # Shutdown
 //!
@@ -64,28 +57,24 @@
 //!
 //! [single-thread runtime example]: https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core/examples/single_thread_runtime
 
+mod context_options;
 mod cycle;
 mod driver;
 mod driver_error;
+mod driver_instance;
 mod driver_options;
 mod driver_role;
 mod io_context;
-mod pending_work;
-mod pending_work_tracker;
-mod provider;
-mod provider_options;
 mod shutdown_error;
 mod system_task_spawner;
 
+pub use context_options::ContextOptions;
 pub use cycle::Cycle;
 pub use driver::Driver;
 pub use driver_error::DriverError;
+pub use driver_instance::DriverInstance;
 pub use driver_options::DriverOptions;
 pub use driver_role::DriverRole;
 pub use io_context::IoContext;
-pub use pending_work::PendingWork;
-pub use pending_work_tracker::PendingWorkTracker;
-pub use provider::DriverProvider;
-pub use provider_options::ProviderOptions;
 pub use shutdown_error::ShutdownError;
 pub use system_task_spawner::{SystemTask, SystemTaskSpawner};
