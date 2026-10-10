@@ -1,24 +1,31 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::fmt;
+use std::task::Waker;
 
 use thread_aware_core::Thread;
 
-use crate::{DriverRole, SystemTaskSpawner};
+use crate::{BlockingTaskSpawner, DriverRole};
 
-/// Per-worker inputs to [`DriverProvider::create`](crate::DriverProvider::create).
+#[derive(Debug)]
+/// Per-worker inputs to [`IoContext::create_driver`](crate::IoContext::create_driver).
 pub struct DriverOptions {
     thread: Thread,
-    spawner: SystemTaskSpawner,
-    role: DriverRole,
+    owner_waker: Waker,
+    spawner: BlockingTaskSpawner,
+    allowed_roles: Vec<DriverRole>,
 }
 
 impl DriverOptions {
     /// Creates options for a driver on `thread`.
     #[must_use]
-    pub fn new(thread: Thread, spawner: SystemTaskSpawner, role: DriverRole) -> Self {
-        Self { thread, spawner, role }
+    pub fn new(thread: Thread, owner_waker: Waker, spawner: BlockingTaskSpawner, allowed_roles: Vec<DriverRole>) -> Self {
+        Self {
+            thread,
+            owner_waker,
+            spawner,
+            allowed_roles,
+        }
     }
 
     /// Returns the worker that will own the driver.
@@ -27,26 +34,21 @@ impl DriverOptions {
         &self.thread
     }
 
+    /// Returns the waker for requesting another cycle from the runtime.
+    #[must_use]
+    pub const fn owner_waker(&self) -> &Waker {
+        &self.owner_waker
+    }
+
     /// Returns the spawner for blocking system work.
     #[must_use]
-    pub const fn spawner(&self) -> &SystemTaskSpawner {
+    pub const fn spawner(&self) -> &BlockingTaskSpawner {
         &self.spawner
     }
 
-    /// Returns this driver's runtime-assigned waiting role.
-    ///
-    /// The role is fixed for the driver's lifetime. See [`DriverRole`] for waiting rules.
+    /// Returns the waiting roles the runtime can accept from this driver.
     #[must_use]
-    pub const fn role(&self) -> DriverRole {
-        self.role
-    }
-}
-
-impl fmt::Debug for DriverOptions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DriverOptions")
-            .field("thread", &self.thread)
-            .field("role", &self.role)
-            .finish_non_exhaustive()
+    pub fn allowed_roles(&self) -> &[DriverRole] {
+        &self.allowed_roles
     }
 }
