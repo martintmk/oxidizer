@@ -20,11 +20,16 @@ use crate::runtime::worker::protocol::AsyncWorkerCommand;
 use crate::runtime::worker::signal::WorkerSignal;
 use crate::task::{Builtins, Scheduler};
 
-/// If we have nothing to do, we wait for something to happen for this long before executing
-/// another executor cycle (just in case something has showed up that we did not notice).
-const SUSPEND_SLEEP_DURATION: Duration = Duration::from_millis(1);
+/// Maximum idle wait before a fail-safe executor cycle.
+const SUSPEND_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const COMMANDS_PER_CYCLE: usize = 256;
+
+fn suspend_wait(next_timer: Option<Instant>, now: Instant) -> Duration {
+    next_timer
+        .map_or(SUSPEND_POLL_INTERVAL, |deadline| deadline.saturating_duration_since(now))
+        .min(SUSPEND_POLL_INTERVAL)
+}
 
 /// The async worker has exclusive use of a runtime thread, one per processor selected by
 /// the configured processor-count policy. The worker executes async tasks that are
@@ -122,13 +127,14 @@ where
         TSFF: FnOnce(TaskSet, Clock) -> TSF + 'static,
         TSF: Future<Output = TS>,
     {
-        let (clock, clock_driver) = clock.activate();
+        let worker_waker = WorkerSignal::waker(&signal);
+        let (clock, clock_driver) = clock.activate(worker_waker.clone());
 
         // SAFETY: We must go through the proper shutdown process before dropping this.
         // We guarantee this via our own safety requirement (it happens in `run()`). We know that
         // the caller has the chance to fulfill their safety guarantee because none of the code
         // between this point and end of the current function can panic.
-        let executor = unsafe { Executor::builder().owner_waker(WorkerSignal::waker(&signal)).build() };
+        let executor = unsafe { Executor::builder().owner_waker(worker_waker).build() };
         let tasks = executor.tasks();
 
         let thread_state = Rc::new(OnceCell::new());
@@ -187,13 +193,13 @@ where
             self.executor = None;
         }
 
-        // Advances the timers registered with the clock.
-        _ = self.clock_driver.advance_timers(Instant::now());
+        let next_timer = self.clock_driver.advance_timers(Instant::now()).ok().flatten();
 
         match cycle_outcome {
-            // Retain the donor's timer cadence, including externally controlled clocks.
             // A notification arriving before this wait is retained by WorkerSignal.
-            CycleOutcome::Suspend if !batch_exhausted => self.signal.wait(SUSPEND_SLEEP_DURATION),
+            CycleOutcome::Suspend if !batch_exhausted => {
+                self.signal.wait(suspend_wait(next_timer, Instant::now()));
+            }
             CycleOutcome::Continue | CycleOutcome::Suspend => {}
             // This is the only way to exit the loop, guaranteeing safe shutdown of the
             // executor. The storage has already been retired before timer callbacks run.
@@ -368,7 +374,7 @@ mod tests {
             let factory_invocations = Arc::new(AtomicUsize::new(0));
             let forbidden_factory_invocations = Arc::new(AtomicUsize::new(0));
             let shutdown_signal = Arc::new(AtomicBool::new(false));
-            let signal = Arc::new(WorkerSignal::default());
+            let signal = WorkerSignal::new();
             let task_observer = Arc::clone(&task_done);
             let timer_observer = Arc::clone(&timer_done);
 
@@ -592,7 +598,7 @@ mod tests {
                 },
                 BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
                 control.clone().into(),
-                Arc::new(WorkerSignal::default()),
+                WorkerSignal::new(),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
             )
@@ -617,10 +623,23 @@ mod tests {
     }
 
     #[test]
+    fn suspend_wait_uses_timer_deadline_and_caps_fail_safe_polling() {
+        let now = Instant::now();
+
+        assert_eq!(suspend_wait(None, now), SUSPEND_POLL_INTERVAL);
+        assert_eq!(
+            suspend_wait(Some(now + SUSPEND_POLL_INTERVAL + Duration::from_secs(1)), now),
+            SUSPEND_POLL_INTERVAL
+        );
+        assert_eq!(suspend_wait(Some(now + Duration::from_millis(20)), now), Duration::from_millis(20));
+        assert_eq!(suspend_wait(Some(now - Duration::from_millis(1)), now), Duration::ZERO);
+    }
+
+    #[test]
     fn a_full_command_batch_skips_waiting_for_the_worker_signal() {
         let (command_tx, command_rx) = channel::unbounded();
         let (ready_tx, ready_rx) = channel::unbounded();
-        let signal = Arc::new(WorkerSignal::default());
+        let signal = WorkerSignal::new();
 
         // SAFETY: the shutdown command below drives this worker to completion before it is dropped.
         let mut worker = unsafe {
@@ -638,9 +657,9 @@ mod tests {
         ready_rx.recv().unwrap();
 
         WorkerSignal::waker(&signal).wake_by_ref();
-        assert!(signal.is_notified());
+        let start = Instant::now();
         assert!(worker.execute_step().is_continue());
-        assert!(!signal.is_notified());
+        assert!(start.elapsed() < SUSPEND_POLL_INTERVAL);
 
         for _ in 0..COMMANDS_PER_CYCLE {
             command_tx
@@ -650,9 +669,10 @@ mod tests {
                 .unwrap();
         }
         WorkerSignal::waker(&signal).wake_by_ref();
-        assert!(signal.is_notified());
         assert!(worker.execute_step().is_continue());
-        assert!(signal.is_notified());
+        let start = Instant::now();
+        assert!(worker.execute_step().is_continue());
+        assert!(start.elapsed() < SUSPEND_POLL_INTERVAL);
 
         command_tx.send(AsyncWorkerCommand::Shutdown).unwrap();
         worker.run();
@@ -679,7 +699,7 @@ mod tests {
                 async move |_, clock| clock_tx.send(clock).unwrap(),
                 BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
                 InactiveClock::default(),
-                Arc::new(WorkerSignal::default()),
+                WorkerSignal::new(),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
             )
@@ -709,7 +729,7 @@ mod tests {
             let async_worker_thread = thread::spawn(move || {
                 let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop());
 
-                let signal = Arc::new(WorkerSignal::default());
+                let signal = WorkerSignal::new();
 
                 // SAFETY: We are required to call `run()` and must not drop the worker before that.
                 // Okay. We are calling `run()` right now, so we are all good on that front.
@@ -778,7 +798,7 @@ mod tests {
 
             let (command_tx, command_rx) = channel::unbounded();
             let worker_thread = thread::spawn(move || {
-                let signal = Arc::new(WorkerSignal::default());
+                let signal = WorkerSignal::new();
 
                 // SAFETY: We are required to call `run()` and must not drop the worker before that.
                 // Okay. We are calling `run()` right now, so we are all good on that front.
@@ -838,7 +858,7 @@ mod tests {
         let (command_tx, command_rx) = channel::unbounded();
 
         let async_worker_thread = thread::spawn(move || {
-            let signal = Arc::new(WorkerSignal::default());
+            let signal = WorkerSignal::new();
 
             // SAFETY: We are required to call `run()` and must not drop the worker before that.
             // Okay. We are calling `run()` right now, so we are all good on that front.
@@ -893,7 +913,7 @@ mod tests {
                 async |_, _| (),
                 BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
                 InactiveClock::default(),
-                Arc::new(WorkerSignal::default()),
+                WorkerSignal::new(),
                 Arc::clone(&shutdown_signal),
                 ready_tx,
             )
@@ -931,7 +951,7 @@ mod tests {
                 },
                 Arc::clone(&blocking_worker),
                 InactiveClock::default(),
-                Arc::new(WorkerSignal::default()),
+                WorkerSignal::new(),
                 Arc::new(AtomicBool::new(false)),
                 channel::unbounded().0,
             )

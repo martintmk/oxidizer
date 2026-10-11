@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::marker::PhantomData;
+use std::task::Waker;
 
 use thread_aware::{Thread, ThreadAware};
 
@@ -42,8 +43,8 @@ pub struct Shared;
 ///   [`ThreadAware`].
 ///
 /// To begin using the clock, call [`InactiveClock::activate`] to get a working [`Clock`] instance and
-/// its associated [`ClockDriver`]. The driver is responsible for advancing timers and must
-/// be called periodically by the runtime.
+/// its associated [`ClockDriver`]. The runtime advances the driver, parks until the returned
+/// deadline, and uses the activation waker to interrupt that wait when an earlier timer arrives.
 ///
 /// # Examples
 ///
@@ -51,12 +52,12 @@ pub struct Shared;
 /// use tick::runtime::InactiveClock;
 ///
 /// let inactive = InactiveClock::default();
-/// let (clock, driver) = inactive.activate();
+/// let (clock, driver) = inactive.activate(std::task::Waker::noop().clone());
 ///
 /// // Use the clock for time operations
 /// let now = clock.instant();
 ///
-/// // Driver must be advanced periodically (typically by the runtime)
+/// // The runtime advances the driver and parks until its next deadline.
 /// // driver.advance_timers(std::time::Instant::now());
 /// ```
 ///
@@ -120,7 +121,11 @@ impl<S> InactiveClock<S> {
     /// Activates the clock for time operations.
     ///
     /// Consumes this inactive clock and returns a working [`Clock`] instance along with
-    /// its [`ClockDriver`]. The driver must be called periodically to advance timers.
+    /// its [`ClockDriver`]. The driver must be called to advance timers.
+    ///
+    /// Registering a system timer that precedes the current earliest deadline invokes
+    /// `driver_waker`. Runtimes should use it to interrupt a driver parked until the previous
+    /// deadline. Controlled clocks are externally advanced and do not invoke this waker.
     ///
     /// # Returns
     ///
@@ -128,7 +133,8 @@ impl<S> InactiveClock<S> {
     /// - [`Clock`] - The activated clock instance for time operations
     /// - [`ClockDriver`] - Driver that advances timers (must be polled by caller)
     #[must_use]
-    pub fn activate(self) -> (Clock, ClockDriver) {
+    pub fn activate(self, driver_waker: Waker) -> (Clock, ClockDriver) {
+        self.state.set_driver_waker(driver_waker);
         let state = self.state;
         let clock = Clock::new(state.clone());
         let driver = ClockDriver::new(state);
@@ -165,7 +171,7 @@ mod tests {
     #[test]
     fn activate_ok() {
         let inactive_clock = InactiveClock::default();
-        let (clock, driver) = inactive_clock.activate();
+        let (clock, driver) = inactive_clock.activate(Waker::noop().clone());
         assert!(matches!(clock.clock_state(), ClockState::System(_)));
         assert!(matches!(&driver.state, &ClockState::System(_)));
     }
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn activate_shared_ok() {
         let inactive_clock = InactiveClock::new_shared();
-        let (clock, driver) = inactive_clock.activate();
+        let (clock, driver) = inactive_clock.activate(Waker::noop().clone());
         assert!(matches!(clock.clock_state(), ClockState::System(_)));
         assert!(matches!(&driver.state, &ClockState::System(_)));
     }
@@ -181,7 +187,7 @@ mod tests {
     #[test]
     fn activate_with_fake_clock_ok() {
         let inactive_clock = InactiveClock::from(ClockControl::new());
-        let (clock, driver) = inactive_clock.activate();
+        let (clock, driver) = inactive_clock.activate(Waker::noop().clone());
         assert!(matches!(clock.clock_state(), ClockState::ClockControl(_)));
         assert!(matches!(&driver.state, &ClockState::ClockControl(_)));
     }

@@ -45,6 +45,7 @@ pub(crate) struct Timers {
     /// The [`Waker`] represents the task awaiting the timer.
     wakers: BTreeMap<TimerKey, Waker>,
     last_discriminator: u32,
+    driver_waker: Option<Waker>,
 
     // Determines whether the timers are currently being advanced.
     // This value is `false` if timers have not yet been advanced.
@@ -69,6 +70,12 @@ impl Timers {
     ///
     /// Returns a unique [`TimerKey`] that can be used to unregister the timer.
     pub(crate) fn register(&mut self, when: Instant, waker: Waker) -> TimerKey {
+        self.register_and_driver_waker(when, waker).0
+    }
+
+    pub(crate) fn register_and_driver_waker(&mut self, when: Instant, waker: Waker) -> (TimerKey, Option<Waker>) {
+        let previous_next = self.next_timer();
+
         // We can wrap the discriminator because it's only used to distinguish timers with the same instant,
         // and the actual value can start from 0 again.
         self.last_discriminator = self.last_discriminator.wrapping_add(1);
@@ -76,7 +83,16 @@ impl Timers {
 
         self.wakers.insert(key, waker);
 
-        key
+        let driver_waker = previous_next
+            .is_none_or(|previous| when < previous)
+            .then(|| self.driver_waker.clone())
+            .flatten();
+
+        (key, driver_waker)
+    }
+
+    pub(crate) fn set_driver_waker(&mut self, waker: Waker) {
+        self.driver_waker = Some(waker);
     }
 
     /// Unregisters a timer with the given key.

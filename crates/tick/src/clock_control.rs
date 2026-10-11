@@ -433,10 +433,6 @@ impl ClockControl {
         self.with_state(|s| s.timers.unregister(key));
     }
 
-    pub(super) fn next_timer(&self) -> Option<Instant> {
-        self.with_state(|s| s.timers.next_timer())
-    }
-
     pub(super) fn timers_len(&self) -> usize {
         self.with_state(|s| s.timers.len())
     }
@@ -716,16 +712,6 @@ mod tests {
         assert_eq!(control.timers_len(), 1);
         control.unregister_timer(key);
         assert_eq!(control.timers_len(), 0);
-    }
-
-    #[test]
-    fn next_timer_ok() {
-        let control = ClockControl::new();
-
-        assert_eq!(control.next_timer(), None);
-
-        let key = control.register_timer(Instant::now(), Waker::noop().clone());
-        assert_eq!(control.next_timer().unwrap(), key.tick());
     }
 
     #[test]
