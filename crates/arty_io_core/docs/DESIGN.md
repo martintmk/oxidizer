@@ -113,5 +113,5 @@ current API.
 ## What the example demonstrates
 
 The [single-thread example](../examples/single_thread_runtime/main.rs) demonstrates
-registration and driver roles only. Its drivers perform no I/O and its tracker
-is a no-op, not a reference implementation of completion coordination.
+registration and driver roles only. Its drivers perform no I/O and omit native
+completion coordination.

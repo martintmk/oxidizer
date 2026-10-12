@@ -19,13 +19,18 @@ type Operation = Box<dyn FnOnce(&Thread, &mut DriverStore) + Send>;
 type ShutdownResult = Result<(), DriverError>;
 type RuntimeResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+enum Command {
+    Operation(Operation),
+    Shutdown,
+}
+
 struct OwnerWake {
-    commands: mpsc::Sender<Operation>,
+    commands: mpsc::Sender<Command>,
 }
 
 impl Wake for OwnerWake {
     fn wake(self: Arc<Self>) {
-        _ = self.commands.send(Box::new(|_, _| {}));
+        _ = self.commands.send(Command::Operation(Box::new(|_, _| {})));
     }
 }
 
@@ -56,7 +61,7 @@ impl<D: Driver> ErasedDriver for RegisteredDriver<D> {
 
 pub(super) struct Runtime {
     contexts: Mutex<HashMap<TypeId, ContextEntry>>,
-    commands: mpsc::Sender<Operation>,
+    commands: mpsc::Sender<Command>,
     thread: JoinHandle<RuntimeResult>,
 }
 
@@ -143,21 +148,25 @@ impl Runtime {
 
     fn run(&self, operation: impl FnOnce(&Thread, &mut DriverStore) + Send + 'static) -> Result<(), DriverError> {
         self.commands
-            .send(Box::new(operation))
+            .send(Command::Operation(Box::new(operation)))
             .map_err(|error| DriverError::from_message(format!("runtime worker has stopped: {error}")))
     }
 
     pub(super) fn shutdown(self) -> RuntimeResult {
-        drop(self.commands);
+        _ = self.commands.send(Command::Shutdown);
         self.thread.join().expect("runtime operations and driver callbacks must not panic")
     }
 }
 
-fn run_worker(worker: &Thread, commands: &mpsc::Receiver<Operation>) -> RuntimeResult {
+fn run_worker(worker: &Thread, commands: &mpsc::Receiver<Command>) -> RuntimeResult {
     let mut drivers = DriverStore::new();
 
     let cycle_result = loop {
-        let Ok(operation) = commands.recv() else {
+        let command = match commands.recv() {
+            Ok(command) => command,
+            Err(_) => break Ok(()),
+        };
+        let Command::Operation(operation) = command else {
             break Ok(());
         };
         operation(worker, &mut drivers);
@@ -226,6 +235,7 @@ fn shutdown_drivers(drivers: DriverStore) -> ShutdownResult {
 mod tests {
     use std::any::TypeId;
     use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::task::Waker;
     use std::thread;
     use std::time::Duration;
 

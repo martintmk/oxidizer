@@ -35,9 +35,8 @@
 //! It also supplies an owner waker for requesting another cycle. Each driver supplies a waker that
 //! interrupts its pending completion wait.
 //!
-//! Each logical cycle uses a shared time snapshot and wait bound. The runtime invokes
-//! secondaries before the primary. If there is no primary, the runtime retains responsibility
-//! for parking the worker.
+//! Each logical cycle uses a shared wait bound. The runtime invokes secondaries before the
+//! primary. If there is no primary, the runtime retains responsibility for parking the worker.
 //!
 //! # Shutdown
 //!
@@ -49,8 +48,7 @@
 //! # Example and reference
 //!
 //! The [single-thread runtime example] demonstrates registration and driver roles. Its sample
-//! drivers perform no I/O and use a no-op tracker; a runtime serving native I/O must implement
-//! the coordination described above.
+//! drivers perform no I/O and omit native completion coordination.
 //!
 //! - [Requirements](https://github.com/microsoft/oxidizer/blob/main/crates/arty_io_core/docs/REQUIREMENTS.md)
 //! - [Design](https://github.com/microsoft/oxidizer/blob/main/crates/arty_io_core/docs/DESIGN.md)

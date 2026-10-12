@@ -2,7 +2,7 @@
 
 These contracts govern independently versioned I/O drivers and thread-aware
 runtimes. `arty_io_core` provides neither implementation. [Design](DESIGN.md)
-describes the lifecycle; the no-op example tracker does not implement coordination.
+describes the lifecycle; the example omits native completion coordination.
 
 ## R1: Stable shared vocabulary
 

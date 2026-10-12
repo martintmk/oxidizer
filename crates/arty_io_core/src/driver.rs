@@ -27,10 +27,10 @@ pub trait Driver: 'static {
 
     /// Processes submissions and completions, optionally waiting for I/O.
     ///
-    /// The runtime invokes secondaries before the primary, sharing [`Cycle::started_at`] and
-    /// [`Cycle::max_wait`]. Only the primary may wait on the worker, for up to that duration;
-    /// a zero wait bound means no waiting. Secondaries may arm background waits within the same
-    /// bound but must not wait for them to finish.
+    /// The runtime invokes secondaries before the primary with the same [`Cycle::max_wait`].
+    /// Only the primary may wait on the worker, for up to that duration; a zero wait bound means
+    /// no waiting. Secondaries may arm background waits within the same bound but must not wait
+    /// for them to finish.
     ///
     /// Before publishing a context, the runtime runs a zero-wait cycle. In this initial call,
     /// the driver must establish native notification and recheck work queued during construction.

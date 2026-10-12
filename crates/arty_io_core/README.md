@@ -41,9 +41,8 @@ before publishing a context.
 It also supplies an owner waker for requesting another cycle. Each driver supplies a waker that
 interrupts its pending completion wait.
 
-Each logical cycle uses a shared time snapshot and wait bound. The runtime invokes
-secondaries before the primary. If there is no primary, the runtime retains responsibility
-for parking the worker.
+Each logical cycle uses a shared wait bound. The runtime invokes secondaries before the
+primary. If there is no primary, the runtime retains responsibility for parking the worker.
 
 ## Shutdown
 
@@ -55,8 +54,7 @@ closed handles.
 ## Example and reference
 
 The [single-thread runtime example][__link11] demonstrates registration and driver roles. Its sample
-drivers perform no I/O and use a no-op tracker; a runtime serving native I/O must implement
-the coordination described above.
+drivers perform no I/O and omit native completion coordination.
 
 * [Requirements][__link12]
 * [Design][__link13]
@@ -67,7 +65,7 @@ the coordination described above.
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbV9_dQ_geaywbmnkrCC9P8swb030QkHXaBzkb6VOHwbBwOZFhZIGCbGFydHlfaW9fY29yZWUwLjIuMA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQb-W8bXblIE1UbNooGG77FovIbUOy9tYiN6SwbyA8tt2-KFpZhZIGCbGFydHlfaW9fY29yZWUwLjIuMA
  [__link0]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=IoContext
  [__link1]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=Driver
  [__link10]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=DriverError

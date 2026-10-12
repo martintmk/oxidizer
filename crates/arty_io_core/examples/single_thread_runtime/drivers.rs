@@ -28,12 +28,19 @@ impl IoContext for SampleContext {
             DriverRole::Secondary
         };
         println!("initializing sample driver as {role:?}");
-        Ok(DriverInstance::new(SampleDriver { role }, role))
+        Ok(DriverInstance::new(
+            SampleDriver {
+                role,
+                _owner_waker: options.owner_waker().clone(),
+            },
+            role,
+        ))
     }
 }
 
 pub(super) struct SampleDriver {
     role: DriverRole,
+    _owner_waker: Waker,
 }
 
 impl Driver for SampleDriver {
