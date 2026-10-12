@@ -309,6 +309,32 @@ mod tests {
     }
 
     #[test]
+    fn contexts_reject_empty_allowed_roles() {
+        let owner = thread_aware_core::__private::v1::new_owner();
+        let numa_node = thread_aware_core::__private::v1::new_numa_node(0);
+        let worker = thread_aware_core::__private::v1::new_thread(owner, thread::current().id(), numa_node);
+
+        let mut sample = SampleContext::context(());
+        let sample_error = sample
+            .driver(DriverOptions::new(worker.clone(), Waker::noop().clone(), Vec::new()))
+            .err()
+            .unwrap();
+        let mut echo = EchoContext::context(());
+        let echo_error = echo
+            .driver(DriverOptions::new(worker, Waker::noop().clone(), Vec::new()))
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            (sample_error.to_string(), echo_error.to_string()),
+            (
+                "sample driver supports none of the allowed roles".to_string(),
+                "echo driver requires the secondary role".to_string(),
+            )
+        );
+    }
+
+    #[test]
     fn shutdown_attempts_remaining_drivers_and_returns_the_first_error() {
         let runtime = Runtime::start();
         let shutdowns = Arc::new(Mutex::new(Vec::new()));

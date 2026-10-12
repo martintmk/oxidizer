@@ -35,9 +35,9 @@ pub trait Driver: 'static {
     /// Before publishing a context, the runtime runs a zero-wait cycle. In this initial call,
     /// the driver must establish native notification and recheck work queued during construction.
     ///
-    /// The driver must process a bounded batch. If serviceable work remains, it must complete
-    /// promptly enough for the runtime to schedule another cycle. In-flight operations alone
-    /// do not indicate serviceable work.
+    /// The driver must process a bounded batch. If serviceable work remains, it must wake the
+    /// owner through the waker supplied in [`DriverOptions`](crate::DriverOptions) before
+    /// returning. In-flight operations alone do not indicate serviceable work.
     ///
     /// # Errors
     ///

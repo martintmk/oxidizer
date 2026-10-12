@@ -38,6 +38,9 @@ pub trait IoContext: Clone + ThreadAware + 'static {
     /// The context must not be published yet. The runtime first completes a zero-wait
     /// [`Driver::execute_cycle`] to establish notification and finish initialization.
     ///
+    /// A successful instance must select a role listed by [`DriverOptions::allowed_roles`].
+    /// Return an error when the driver supports none of the allowed roles.
+    ///
     /// # Errors
     ///
     /// Returns an error if initialization fails. Partial state must be safe to drop, with no

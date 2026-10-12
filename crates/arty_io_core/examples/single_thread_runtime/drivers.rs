@@ -22,11 +22,10 @@ impl IoContext for SampleContext {
     }
 
     fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
-        let role = if options.allowed_roles().contains(&DriverRole::Primary) {
-            DriverRole::Primary
-        } else {
-            DriverRole::Secondary
-        };
+        let role = [DriverRole::Primary, DriverRole::Secondary]
+            .into_iter()
+            .find(|role| options.allowed_roles().contains(role))
+            .ok_or_else(|| DriverError::from_message("sample driver supports none of the allowed roles"))?;
         println!("initializing sample driver as {role:?}");
         Ok(DriverInstance::new(
             SampleDriver {
@@ -74,7 +73,10 @@ impl IoContext for EchoContext {
         Self
     }
 
-    fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+        if !options.allowed_roles().contains(&DriverRole::Secondary) {
+            return Err(DriverError::from_message("echo driver requires the secondary role"));
+        }
         let role = DriverRole::Secondary;
         println!("initializing echo driver as {role:?}");
         Ok(DriverInstance::new(EchoDriver { role }, role))
