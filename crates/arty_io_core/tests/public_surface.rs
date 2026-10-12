@@ -14,9 +14,7 @@ use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 use std::{fmt, io, thread};
 
-use arty_io_core::{
-    BlockingTaskSpawner, Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions, ShutdownError,
-};
+use arty_io_core::{BlockingTaskSpawner, Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use thread_aware_core::{Thread, ThreadAware};
 
@@ -25,7 +23,6 @@ assert_not_impl_any!(Cycle: Send, Sync);
 assert_impl_all!(DriverRole: Copy, Send, Sync, fmt::Debug, Eq);
 assert_impl_all!(IoContextOptions: Send, Sync, fmt::Debug);
 assert_impl_all!(DriverError: Send, Sync, fmt::Debug, fmt::Display, Error);
-assert_impl_all!(ShutdownError: Send, Sync, fmt::Debug, fmt::Display, Error);
 assert_impl_all!(BlockingTaskSpawner: Clone, Send, Sync, fmt::Debug);
 
 #[derive(Default)]
@@ -165,22 +162,6 @@ fn dropping_driver_closes_context_admission() {
 }
 
 #[test]
-fn shutdown_error_can_be_created_from_message() {
-    let error = ShutdownError::from_message("driver drain timed out");
-
-    assert!(error.to_string().contains("timed out"));
-    assert!(error.source().is_none());
-}
-
-#[test]
-fn shutdown_error_can_be_created_from_source() {
-    let error = ShutdownError::from_source(io::Error::other("completion queue failed"));
-
-    assert!(error.to_string().contains("shutdown"));
-    assert!(error.source().is_some_and(|cause| cause.to_string().contains("completion queue")));
-}
-
-#[test]
 fn driver_error_can_be_created_from_message_and_source() {
     let error = DriverError::from_message("native driver failed");
     assert_eq!(error.to_string(), "native driver failed");
@@ -235,7 +216,7 @@ impl Driver for LocalDriver {
         Ok(())
     }
 
-    fn shutdown(mut self) -> Result<(), ShutdownError> {
+    fn shutdown(mut self) -> Result<(), DriverError> {
         let _ = self.owned_resource.take();
         self.state.shutdown_calls.update(|calls| calls + 1);
         Ok(())
@@ -359,7 +340,7 @@ impl Driver for LeaseDriver {
         Ok(())
     }
 
-    fn shutdown(self) -> Result<(), ShutdownError> {
+    fn shutdown(self) -> Result<(), DriverError> {
         const TIMEOUT: Duration = Duration::from_secs(1);
 
         let mut lifecycle = self.state.lifecycle.lock().unwrap_or_else(PoisonError::into_inner);
@@ -370,7 +351,7 @@ impl Driver for LeaseDriver {
         while lifecycle.active_operations != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(ShutdownError::from_message(
+                return Err(DriverError::from_message(
                     "active operations did not drain before the shutdown deadline",
                 ));
             }
@@ -383,7 +364,7 @@ impl Driver for LeaseDriver {
             lifecycle = next;
 
             if wait_result.timed_out() && lifecycle.active_operations != 0 {
-                return Err(ShutdownError::from_message(
+                return Err(DriverError::from_message(
                     "active operations did not drain before the shutdown deadline",
                 ));
             }

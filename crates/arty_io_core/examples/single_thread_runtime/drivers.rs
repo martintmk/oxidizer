@@ -3,7 +3,7 @@
 
 use std::task::Waker;
 
-use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions, ShutdownError};
+use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions};
 use thread_aware_core::{Thread, ThreadAware};
 
 #[derive(Clone)]
@@ -45,7 +45,7 @@ impl Driver for SampleDriver {
         Ok(())
     }
 
-    fn shutdown(self) -> Result<(), ShutdownError> {
+    fn shutdown(self) -> Result<(), DriverError> {
         println!("shutting down sample driver");
         Ok(())
     }
@@ -86,7 +86,7 @@ impl Driver for EchoDriver {
         Ok(())
     }
 
-    fn shutdown(self) -> Result<(), ShutdownError> {
+    fn shutdown(self) -> Result<(), DriverError> {
         println!("shutting down echo driver");
         Ok(())
     }

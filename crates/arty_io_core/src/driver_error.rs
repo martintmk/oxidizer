@@ -4,7 +4,7 @@
 use std::error::Error;
 use std::fmt;
 
-/// A failure to initialize, host, or service an I/O driver.
+/// A failure to initialize, host, service, or shut down an I/O driver.
 ///
 /// An individual failed I/O operation belongs in that operation's result, not here.
 #[derive(Debug)]

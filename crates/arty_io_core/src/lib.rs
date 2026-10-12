@@ -42,7 +42,7 @@
 //! # Shutdown
 //!
 //! The runtime stops normal cycles and calls [`Driver::shutdown`] for every driver, continuing
-//! after a [`ShutdownError`]. Each driver closes admission and drains its resources within a
+//! after a [`DriverError`]. Each driver closes admission and drains its resources within a
 //! bounded wait, independently of other drivers on the same worker. Contexts remain valid as
 //! closed handles.
 //!
@@ -66,7 +66,6 @@ mod driver_options;
 mod driver_role;
 mod io_context;
 mod io_context_options;
-mod shutdown_error;
 
 pub use blocking_task_spawner::{BlockingTask, BlockingTaskSpawner};
 pub use cycle::Cycle;
@@ -77,4 +76,3 @@ pub use driver_options::DriverOptions;
 pub use driver_role::DriverRole;
 pub use io_context::IoContext;
 pub use io_context_options::IoContextOptions;
-pub use shutdown_error::ShutdownError;

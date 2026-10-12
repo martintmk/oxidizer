@@ -48,7 +48,7 @@ for parking the worker.
 ## Shutdown
 
 The runtime stops normal cycles and calls [`Driver::shutdown`][__link10] for every driver, continuing
-after a [`ShutdownError`][__link11]. Each driver closes admission and drains its resources within a
+after a [`DriverError`][__link11]. Each driver closes admission and drains its resources within a
 bounded wait, independently of other drivers on the same worker. Contexts remain valid as
 closed handles.
 
@@ -67,11 +67,11 @@ the coordination described above.
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbTIVTqzaBFvobBNZ8qXbxY7gb2IrO4vv_8gEbd6veZ4Bp505hZIGCbGFydHlfaW9fY29yZWUwLjIuMA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbNu4_nTcl1SQby466TvkF9hUb7A_FX9L32G8bDdqq5wDGAFphZIGCbGFydHlfaW9fY29yZWUwLjIuMA
  [__link0]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=IoContext
  [__link1]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=Driver
  [__link10]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=Driver::shutdown
- [__link11]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=ShutdownError
+ [__link11]: https://docs.rs/arty_io_core/0.2.0/arty_io_core/?search=DriverError
  [__link12]: https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core/examples/single_thread_runtime
  [__link13]: https://github.com/microsoft/oxidizer/blob/main/crates/arty_io_core/docs/REQUIREMENTS.md
  [__link14]: https://github.com/microsoft/oxidizer/blob/main/crates/arty_io_core/docs/DESIGN.md

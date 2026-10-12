@@ -82,7 +82,7 @@ calls return and continues cleanup after an error.
 
 Initialization errors roll back the unpublished pair. Infrastructure errors
 during normal cycles shut down the worker's drivers. Shutdown failure returns
-`ShutdownError` without relaxing memory safety.
+`DriverError` without relaxing memory safety.
 
 These are infrastructure failures, distinct from individual I/O errors.
 

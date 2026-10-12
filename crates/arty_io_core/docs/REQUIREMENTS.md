@@ -55,7 +55,7 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
 - Operations and native callbacks retain their accessible state. Storage
   referenced by native raw pointers has an owner independent of the driver.
 - `shutdown` consumes the driver, closes admission, and drains within a bounded
-  wait, or returns `ShutdownError` without relaxing drop safety.
+  wait, or returns `DriverError` without relaxing drop safety.
 - Shutdown uses driver-owned progress mechanisms: normal cycle coordination
   has stopped, and no other driver on the same worker may be required to run.
 - The runtime reports failures, attempts remaining drivers, and keeps the system

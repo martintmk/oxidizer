@@ -3,7 +3,7 @@
 
 use std::task::Waker;
 
-use crate::{Cycle, DriverError, ShutdownError};
+use crate::{Cycle, DriverError};
 
 /// A worker-local I/O driver.
 ///
@@ -64,7 +64,7 @@ pub trait Driver: 'static {
     /// # Errors
     ///
     /// Returns an error if graceful cleanup cannot be completed.
-    fn shutdown(self) -> Result<(), ShutdownError>
+    fn shutdown(self) -> Result<(), DriverError>
     where
         Self: Sized;
 }

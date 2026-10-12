@@ -9,16 +9,14 @@ use std::task::{Wake, Waker};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use arty_io_core::{
-    BlockingTaskSpawner, Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext, IoContextOptions, ShutdownError,
-};
+use arty_io_core::{BlockingTaskSpawner, Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext, IoContextOptions};
 use thread_aware_core::Thread;
 
 type ContextBox = Box<dyn Any + Send>;
 type ContextEntry = Arc<Mutex<Option<ContextBox>>>;
 type DriverStore = Vec<Box<dyn ErasedDriver>>;
 type Operation = Box<dyn FnOnce(&Thread, &BlockingTaskSpawner, &mut DriverStore) + Send>;
-type ShutdownResult = Result<(), ShutdownError>;
+type ShutdownResult = Result<(), DriverError>;
 type RuntimeResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 struct OwnerWake {
@@ -34,7 +32,7 @@ impl Wake for OwnerWake {
 trait ErasedDriver {
     fn role(&self) -> DriverRole;
     fn execute_cycle(&mut self, cycle: &mut Cycle) -> Result<(), DriverError>;
-    fn shutdown(self: Box<Self>) -> Result<(), ShutdownError>;
+    fn shutdown(self: Box<Self>) -> Result<(), DriverError>;
 }
 
 struct RegisteredDriver<D> {
@@ -51,7 +49,7 @@ impl<D: Driver> ErasedDriver for RegisteredDriver<D> {
         self.driver.execute_cycle(cycle)
     }
 
-    fn shutdown(self: Box<Self>) -> Result<(), ShutdownError> {
+    fn shutdown(self: Box<Self>) -> Result<(), DriverError> {
         Driver::shutdown(self.driver)
     }
 }
@@ -232,7 +230,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions, ShutdownError};
+    use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions};
     use thread_aware_core::{Thread, ThreadAware};
 
     use super::{Runtime, register_driver};
@@ -290,10 +288,10 @@ mod tests {
             }
         }
 
-        fn shutdown(self) -> Result<(), ShutdownError> {
+        fn shutdown(self) -> Result<(), DriverError> {
             self.shutdowns.lock().unwrap().push(self.name);
             if self.fail_shutdown {
-                Err(ShutdownError::from_message(self.name))
+                Err(DriverError::from_message(self.name))
             } else {
                 Ok(())
             }
