@@ -99,6 +99,17 @@ impl DispatcherClient {
     {
         self.core.spawn_everywhere(make_factory)
     }
+
+    pub(crate) fn prepare_io_everywhere<C>(&self) -> bool
+    where
+        C: arty_io_core::IoContext,
+    {
+        self.core.prepare_io_everywhere::<C>()
+    }
+
+    pub(crate) fn access_io(&self, worker_index: WorkerIndex, access: Box<dyn FnOnce(&Builtins) + Send>) -> bool {
+        self.core.access_io(worker_index, access)
+    }
 }
 
 impl DispatcherClient {

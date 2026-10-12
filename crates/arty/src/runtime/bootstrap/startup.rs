@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::rc::Rc;
+use std::sync::Arc as StdArc;
 use std::sync::atomic::AtomicBool;
 use std::task::Waker;
 use std::thread;
@@ -16,6 +17,7 @@ use performables::sync::channel::{OneshotReceiver, Sender};
 use thread_aware::{Thread, ThreadAware, ThreadBuilder};
 use tick::runtime::InactiveClock;
 
+use crate::io::{DriverHost, Io, IoRuntime};
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::bootstrap::pools::BlockingPools;
 use crate::runtime::config::RuntimeConfig;
@@ -69,6 +71,7 @@ pub(in crate::runtime) fn build(
 
     let worker_count = processors.len();
     let shutdown_started = Arc::new(AtomicBool::new(false));
+    let io_runtime = StdArc::new(IoRuntime::default());
     let blocking_pools = processor_config.blocking_pool_policy.into_pools().inspect_err(|_| {
         emit!(
             &sink,
@@ -99,6 +102,7 @@ pub(in crate::runtime) fn build(
                 thread_builder: thread_builder.clone(),
                 blocking_pools: blocking_pools.clone(),
                 shutdown_started: Arc::clone(&shutdown_started),
+                io_runtime: StdArc::clone(&io_runtime),
                 sink: sink.clone(),
             }
             .start(),
@@ -123,6 +127,7 @@ pub(in crate::runtime) fn build(
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown_started,
+        StdArc::clone(&io_runtime),
     ));
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
@@ -167,6 +172,7 @@ struct AsyncWorkerStartInfo {
     thread_builder: ThreadBuilder,
     blocking_pools: BlockingPools,
     shutdown_started: Arc<AtomicBool>,
+    io_runtime: StdArc<IoRuntime>,
     sink: Sink,
 }
 
@@ -194,6 +200,7 @@ impl AsyncWorkerStartInfo {
             thread_builder,
             blocking_pools,
             shutdown_started,
+            io_runtime,
             sink,
         } = self;
 
@@ -228,10 +235,18 @@ impl AsyncWorkerStartInfo {
 
         let dispatcher = Rc::new(start_signal.dispatcher);
         let shutdown_signal = dispatcher.shutdown_signal();
+        let io = Io::new(StdArc::clone(&io_runtime), dispatcher.as_ref().clone(), current.clone());
+        DriverHost::install(
+            io_runtime,
+            dispatcher.as_ref().clone(),
+            current.clone(),
+            Arc::clone(&signal),
+            sink.clone(),
+        );
 
         let thread_state_constructor = {
             async move |tasks: TaskSet, clock| {
-                let builtins = Builtins::sync_init(RuntimeBuiltins::new(&dispatcher, clock, current, sink));
+                let builtins = Builtins::sync_init(RuntimeBuiltins::new(&dispatcher, clock, io, current, sink));
                 Scheduler::register_current(builtins.clone(), tasks);
                 builtins
             }

@@ -3,6 +3,9 @@
 
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
+use std::sync::Arc;
+
+use arty_io_core::DriverError;
 
 /// An error constructing or operating a runtime.
 ///
@@ -51,6 +54,18 @@ impl Error {
         Self::new(RuntimeValidation::ShutdownWaitFromBlockingCallback)
     }
 
+    pub(crate) fn io_outside_worker() -> Self {
+        Self::new(RuntimeValidation::IoOutsideWorker)
+    }
+
+    pub(crate) fn runtime_shutting_down() -> Self {
+        Self::new(RuntimeValidation::RuntimeShuttingDown)
+    }
+
+    pub(crate) fn io_failure(error: Arc<DriverError>) -> Self {
+        Self::new(IoFailure(error))
+    }
+
     #[cfg(any(test, feature = "macros"))]
     pub(crate) fn into_source(self) -> Box<dyn StdError + Send + Sync> {
         self.source
@@ -94,6 +109,8 @@ pub(crate) enum RuntimeValidation {
     BlockOnFromWorker,
     ShutdownWaitFromWorker,
     ShutdownWaitFromBlockingCallback,
+    IoOutsideWorker,
+    RuntimeShuttingDown,
 }
 
 impl Display for RuntimeValidation {
@@ -104,11 +121,28 @@ impl Display for RuntimeValidation {
             Self::BlockOnFromWorker => "block_on cannot be called from an async Arty worker",
             Self::ShutdownWaitFromWorker => "an async Arty worker cannot wait for runtime shutdown",
             Self::ShutdownWaitFromBlockingCallback => "a runtime blocking callback cannot wait for its own shutdown",
+            Self::IoOutsideWorker => "I/O context access cannot synchronously cross between Arty workers",
+            Self::RuntimeShuttingDown => "the runtime is shutting down",
         })
     }
 }
 
 impl StdError for RuntimeValidation {}
+
+#[derive(Debug)]
+struct IoFailure(Arc<DriverError>);
+
+impl Display for IoFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(self.0.as_ref(), f)
+    }
+}
+
+impl StdError for IoFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

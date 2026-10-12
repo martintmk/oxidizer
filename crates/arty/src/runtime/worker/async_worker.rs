@@ -15,6 +15,7 @@ use performables::sync::channel;
 use tick::Clock;
 use tick::runtime::{ClockDriver, InactiveClock};
 
+use crate::io::DriverHost;
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::worker::protocol::AsyncWorkerCommand;
 use crate::runtime::worker::signal::WorkerSignal;
@@ -194,11 +195,22 @@ where
         }
 
         let next_timer = self.clock_driver.advance_timers(Instant::now()).ok().flatten();
+        let can_suspend = matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted;
+        let max_wait = if can_suspend {
+            suspend_wait(next_timer, Instant::now())
+        } else {
+            Duration::ZERO
+        };
+        let cycle_started = Instant::now();
+        if DriverHost::drivers_active() && DriverHost::execute_current(max_wait).is_err() {
+            self.begin_shutdown();
+            return ControlFlow::Continue(());
+        }
 
         match cycle_outcome {
             // A notification arriving before this wait is retained by WorkerSignal.
             CycleOutcome::Suspend if !batch_exhausted => {
-                self.signal.wait(suspend_wait(next_timer, Instant::now()));
+                self.signal.wait(max_wait.saturating_sub(cycle_started.elapsed()));
             }
             CycleOutcome::Continue | CycleOutcome::Suspend => {}
             // This is the only way to exit the loop, guaranteeing safe shutdown of the
@@ -242,6 +254,20 @@ where
                             }
                             future_factory.take().expect("queued task factory is consumed exactly once")(thread_state.clone(), &self.tasks);
                         }
+                        AsyncWorkerCommand::PrepareIo { preparation } => {
+                            if self.shutdown_signal.load(Ordering::Acquire) {
+                                self.begin_shutdown();
+                                return false;
+                            }
+                            preparation.take().expect("queued I/O preparation is consumed exactly once")(thread_state);
+                        }
+                        AsyncWorkerCommand::AccessIo { access } => {
+                            if self.shutdown_signal.load(Ordering::Acquire) {
+                                self.begin_shutdown();
+                                return false;
+                            }
+                            access.take().expect("queued I/O access is consumed exactly once")(thread_state);
+                        }
                         AsyncWorkerCommand::Shutdown => {
                             self.begin_shutdown();
 
@@ -264,6 +290,7 @@ where
     #[cfg_attr(test, mutants::skip)] // If mutated, shutdown process will never finish - will hang.
     fn begin_shutdown(&mut self) {
         Scheduler::clear_current();
+        DriverHost::shutdown_current();
         // Drop the thread state, as it may hold references to resources that
         // block executor shutdown (via various futures, waiters, etc).
         self.thread_state = None;

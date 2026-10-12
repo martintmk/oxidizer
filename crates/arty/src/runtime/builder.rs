@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::fmt;
 use std::num::NonZeroUsize;
 
 use observed::Sink;
@@ -33,7 +34,6 @@ use crate::runtime::handle::Runtime;
 /// assert_eq!(runtime.scheduler().block_on(async |_| 42)?, 42);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug)]
 pub struct RuntimeBuilder {
     processor_config: RuntimeConfig,
     clock: InactiveClock,
@@ -179,8 +179,9 @@ impl RuntimeBuilder {
     /// # Errors
     ///
     /// Returns [`Error`] if the worker count or shared blocking-pool limit is
-    /// zero, or if the worker policy cannot be satisfied, such as an
-    /// [`exactly`](WorkersPolicy::exactly) request exceeding available processors.
+    /// zero, if the worker policy cannot be satisfied, such as an
+    /// [`exactly`](WorkersPolicy::exactly) request exceeding available
+    /// processors.
     ///
     /// # Panics
     ///
@@ -209,6 +210,16 @@ impl RuntimeBuilder {
             processor_config: RuntimeConfig::default(),
             sink: Sink::noop(),
         }
+    }
+}
+
+impl fmt::Debug for RuntimeBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeBuilder")
+            .field("processor_config", &self.processor_config)
+            .field("clock", &self.clock)
+            .field("sink", &self.sink)
+            .finish()
     }
 }
 

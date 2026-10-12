@@ -58,6 +58,7 @@ pub use error::Error;
 pub use handle::Runtime;
 #[doc(inline)]
 pub use operations::RuntimeOperations;
+pub(crate) use worker::signal::WorkerSignal;
 
 /// Implementation details for the runtime entry-point macros.
 #[cfg(feature = "macros")]
