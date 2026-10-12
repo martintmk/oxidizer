@@ -14,10 +14,10 @@ impl ThreadAware for SampleContext {
 }
 
 impl IoContext for SampleContext {
-    type Options = ();
+    type ContextOptions = ();
     type Driver = SampleDriver;
 
-    fn context((): Self::Options) -> Self {
+    fn context((): Self::ContextOptions) -> Self {
         Self
     }
 
@@ -60,10 +60,10 @@ impl ThreadAware for EchoContext {
 }
 
 impl IoContext for EchoContext {
-    type Options = ();
+    type ContextOptions = ();
     type Driver = EchoDriver;
 
-    fn context((): Self::Options) -> Self {
+    fn context((): Self::ContextOptions) -> Self {
         Self
     }
 

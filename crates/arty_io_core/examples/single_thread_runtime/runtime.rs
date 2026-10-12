@@ -86,7 +86,7 @@ impl Runtime {
         }
     }
 
-    pub(super) fn get_context<C>(&self, options: C::Options) -> Result<C, DriverError>
+    pub(super) fn get_context<C>(&self, options: C::ContextOptions) -> Result<C, DriverError>
     where
         C: IoContext,
     {
@@ -111,7 +111,7 @@ impl Runtime {
             .clone())
     }
 
-    fn initialize_context<C>(&self, options: C::Options) -> Result<C, DriverError>
+    fn initialize_context<C>(&self, options: C::ContextOptions) -> Result<C, DriverError>
     where
         C: IoContext,
     {
@@ -256,10 +256,10 @@ mod tests {
     }
 
     impl IoContext for BlockingCloneContext {
-        type Options = ();
+        type ContextOptions = ();
         type Driver = SampleDriver;
 
-        fn context((): Self::Options) -> Self {
+        fn context((): Self::ContextOptions) -> Self {
             panic!("the fixture context is inserted directly into the cache");
         }
 

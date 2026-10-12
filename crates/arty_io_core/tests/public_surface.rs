@@ -75,7 +75,7 @@ fn cycle_exposes_max_wait() {
 
 #[test]
 fn context_and_driver_creation_use_both_options() {
-    fn context<C: IoContext>(options: C::Options) -> C {
+    fn context<C: IoContext>(options: C::ContextOptions) -> C {
         C::context(options)
     }
 
@@ -208,10 +208,10 @@ impl ThreadAware for TestContext {
 }
 
 impl IoContext for TestContext {
-    type Options = u8;
+    type ContextOptions = u8;
     type Driver = LocalDriver;
 
-    fn context(options: Self::Options) -> Self {
+    fn context(options: Self::ContextOptions) -> Self {
         Self(options)
     }
 
@@ -245,10 +245,10 @@ impl ThreadAware for LeaseContext {
 }
 
 impl IoContext for LeaseContext {
-    type Options = ();
+    type ContextOptions = ();
     type Driver = LeaseDriver;
 
-    fn context((): Self::Options) -> Self {
+    fn context((): Self::ContextOptions) -> Self {
         let state = Arc::default();
         Self { state }
     }

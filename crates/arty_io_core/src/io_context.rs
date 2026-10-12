@@ -17,7 +17,7 @@ use crate::{Driver, DriverError, DriverInstance, DriverOptions};
 /// [single-worker runtime example]: https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core/examples/single_thread_runtime
 pub trait IoContext: Clone + ThreadAware + 'static {
     /// Configuration used to create the context.
-    type Options;
+    type ContextOptions;
 
     /// The driver type created by this context.
     type Driver: Driver;
@@ -27,7 +27,7 @@ pub trait IoContext: Clone + ThreadAware + 'static {
     /// The runtime calls this method at most once per registered context type, passing
     /// `options`. Repeated calls should return equivalent contexts.
     #[must_use]
-    fn context(options: Self::Options) -> Self;
+    fn context(options: Self::ContextOptions) -> Self;
 
     /// Creates a driver for the worker described by `options`.
     ///

@@ -14,7 +14,7 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
 ## R2: Lazy and independent registration
 
 - The runtime keys registration by concrete `IoContext` type and supplies the
-  context's associated `Options` when creating it.
+  context's associated `ContextOptions` when creating it.
 - The first request returns only after every active worker has an initialized
   driver/context pair. Later requests clone existing contexts.
 - Different driver versions can coexist through distinct context types.
