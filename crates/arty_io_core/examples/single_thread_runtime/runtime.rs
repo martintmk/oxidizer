@@ -9,13 +9,13 @@ use std::task::{Wake, Waker};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use arty_io_core::{BlockingTaskSpawner, Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext, IoContextOptions};
+use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext};
 use thread_aware_core::Thread;
 
 type ContextBox = Box<dyn Any + Send>;
 type ContextEntry = Arc<Mutex<Option<ContextBox>>>;
 type DriverStore = Vec<Box<dyn ErasedDriver>>;
-type Operation = Box<dyn FnOnce(&Thread, &BlockingTaskSpawner, &mut DriverStore) + Send>;
+type Operation = Box<dyn FnOnce(&Thread, &mut DriverStore) + Send>;
 type ShutdownResult = Result<(), DriverError>;
 type RuntimeResult = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -25,7 +25,7 @@ struct OwnerWake {
 
 impl Wake for OwnerWake {
     fn wake(self: Arc<Self>) {
-        _ = self.commands.send(Box::new(|_, _, _| {}));
+        _ = self.commands.send(Box::new(|_, _| {}));
     }
 }
 
@@ -63,7 +63,6 @@ pub(super) struct Runtime {
 impl Runtime {
     pub(super) fn start() -> Self {
         let owner = thread_aware_core::__private::v1::new_owner();
-        let spawner = BlockingTaskSpawner::from_fn(|task| drop(thread::spawn(task)));
         let (commands_tx, commands_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
 
@@ -75,7 +74,7 @@ impl Runtime {
                 return Ok(());
             }
 
-            run_worker(&worker, &spawner, &commands_rx)
+            run_worker(&worker, &commands_rx)
         });
 
         ready_rx.recv().expect("runtime worker must report that startup completed");
@@ -87,7 +86,7 @@ impl Runtime {
         }
     }
 
-    pub(super) fn get_context<C>(&self) -> Result<C, DriverError>
+    pub(super) fn get_context<C>(&self, options: C::Options) -> Result<C, DriverError>
     where
         C: IoContext,
     {
@@ -104,7 +103,7 @@ impl Runtime {
         // Serialize registration and cloning for this context without holding the cache-map lock.
         let context = match &mut *context {
             Some(context) => context,
-            empty @ None => empty.insert(Box::new(self.initialize_context::<C>()?)),
+            empty @ None => empty.insert(Box::new(self.initialize_context::<C>(options)?)),
         };
         Ok(context
             .downcast_ref::<C>()
@@ -112,20 +111,20 @@ impl Runtime {
             .clone())
     }
 
-    fn initialize_context<C>(&self) -> Result<C, DriverError>
+    fn initialize_context<C>(&self, options: C::Options) -> Result<C, DriverError>
     where
         C: IoContext,
     {
+        let mut context = C::context(options);
         let (reply_tx, reply_rx) = mpsc::channel();
         let owner_waker = Waker::from(Arc::new(OwnerWake {
             commands: self.commands.clone(),
         }));
-        self.run(move |worker, spawner, drivers| {
-            let mut context = C::create_context(IoContextOptions::new());
+        self.run(move |worker, drivers| {
             let allowed_roles = allowed_roles(drivers);
-            let options = DriverOptions::new(worker.clone(), owner_waker, spawner.clone(), allowed_roles.clone());
+            let options = DriverOptions::new(worker.clone(), owner_waker, allowed_roles.clone());
             context.relocate(None, options.thread());
-            let result = context.create_driver(options).and_then(|instance| {
+            let result = context.driver(options).and_then(|instance| {
                 let role = instance.role;
                 if !allowed_roles.contains(&role) {
                     return Err(DriverError::from_message(format!("driver selected disallowed role {role:?}")));
@@ -142,7 +141,7 @@ impl Runtime {
             .map_err(|error| DriverError::from_message(format!("runtime worker stopped before completing context registration: {error}")))?
     }
 
-    fn run(&self, operation: impl FnOnce(&Thread, &BlockingTaskSpawner, &mut DriverStore) + Send + 'static) -> Result<(), DriverError> {
+    fn run(&self, operation: impl FnOnce(&Thread, &mut DriverStore) + Send + 'static) -> Result<(), DriverError> {
         self.commands
             .send(Box::new(operation))
             .map_err(|error| DriverError::from_message(format!("runtime worker has stopped: {error}")))
@@ -154,14 +153,14 @@ impl Runtime {
     }
 }
 
-fn run_worker(worker: &Thread, spawner: &BlockingTaskSpawner, commands: &mpsc::Receiver<Operation>) -> RuntimeResult {
+fn run_worker(worker: &Thread, commands: &mpsc::Receiver<Operation>) -> RuntimeResult {
     let mut drivers = DriverStore::new();
 
     let cycle_result = loop {
         let Ok(operation) = commands.recv() else {
             break Ok(());
         };
-        operation(worker, spawner, &mut drivers);
+        operation(worker, &mut drivers);
         if let Err(error) = execute_driver_cycle(&mut drivers) {
             eprintln!("driver cycle failed: {error}");
             break Err(error);
@@ -230,7 +229,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions};
+    use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
     use thread_aware_core::{Thread, ThreadAware};
 
     use super::{Runtime, register_driver};
@@ -257,13 +256,14 @@ mod tests {
     }
 
     impl IoContext for BlockingCloneContext {
+        type Options = ();
         type Driver = SampleDriver;
 
-        fn create_context(_options: IoContextOptions) -> Self {
+        fn context((): Self::Options) -> Self {
             panic!("the fixture context is inserted directly into the cache");
         }
 
-        fn create_driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
             panic!("the fixture context is inserted directly into the cache");
         }
     }
@@ -304,7 +304,7 @@ mod tests {
         let shutdowns = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&shutdowns);
         runtime
-            .run(move |_, _, drivers| {
+            .run(move |_, drivers| {
                 for (name, role) in [("primary", DriverRole::Primary), ("secondary", DriverRole::Secondary)] {
                     register_driver(
                         drivers,
@@ -336,7 +336,7 @@ mod tests {
                 let shutdowns = Arc::new(Mutex::new(Vec::new()));
                 let recorded = Arc::clone(&shutdowns);
                 runtime
-                    .run(move |_, _, drivers| {
+                    .run(move |_, drivers| {
                         for (name, role) in [
                             ("primary", DriverRole::Primary),
                             ("secondary", DriverRole::Secondary),
@@ -376,7 +376,7 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         runtime
-            .run(move |_, _, drivers| {
+            .run(move |_, drivers| {
                 register_driver(
                     drivers,
                     ShutdownProbe {
@@ -394,14 +394,14 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
         let (queued_tx, queued_rx) = mpsc::channel();
-        runtime.run(move |_, _, _| queued_tx.send(()).unwrap()).unwrap();
+        runtime.run(move |_, _| queued_tx.send(()).unwrap()).unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(
             queued_rx.recv_timeout(Duration::from_secs(10)),
             Err(mpsc::RecvTimeoutError::Disconnected)
         );
         assert_eq!(
-            runtime.get_context::<SampleContext>().err().unwrap().to_string(),
+            runtime.get_context::<SampleContext>(()).err().unwrap().to_string(),
             "runtime worker has stopped: sending on a closed channel"
         );
         assert!(
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn blocked_clone_does_not_block_another_cached_context() {
         let runtime = Runtime::start();
-        let _ = runtime.get_context::<EchoContext>().unwrap();
+        let _ = runtime.get_context::<EchoContext>(()).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let context = BlockingCloneContext {
@@ -436,13 +436,13 @@ mod tests {
         thread::scope(|scope| {
             let runtime = &runtime;
             scope.spawn(move || {
-                let _ = runtime.get_context::<BlockingCloneContext>().unwrap();
+                let _ = runtime.get_context::<BlockingCloneContext>(()).unwrap();
             });
             started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
             let (done_tx, done_rx) = mpsc::channel();
             scope.spawn(move || {
-                let _ = runtime.get_context::<EchoContext>().unwrap();
+                let _ = runtime.get_context::<EchoContext>(()).unwrap();
                 done_tx.send(()).unwrap();
             });
 
@@ -457,11 +457,11 @@ mod tests {
     #[test]
     fn cached_context_does_not_wait_for_the_worker() {
         let runtime = Runtime::start();
-        let _ = runtime.get_context::<SampleContext>().unwrap();
+        let _ = runtime.get_context::<SampleContext>(()).unwrap();
         let (blocked_tx, blocked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         runtime
-            .run(move |_, _, _| {
+            .run(move |_, _| {
                 blocked_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             })
@@ -472,7 +472,7 @@ mod tests {
             let (done_tx, done_rx) = mpsc::channel();
             let runtime = &runtime;
             scope.spawn(move || {
-                let _ = runtime.get_context::<SampleContext>().unwrap();
+                let _ = runtime.get_context::<SampleContext>(()).unwrap();
                 done_tx.send(()).unwrap();
             });
 
@@ -493,15 +493,15 @@ mod tests {
             for _ in 0..4 {
                 scope.spawn(|| {
                     ready.wait();
-                    let _ = runtime.get_context::<SampleContext>().unwrap();
-                    let _ = runtime.get_context::<EchoContext>().unwrap();
+                    let _ = runtime.get_context::<SampleContext>(()).unwrap();
+                    let _ = runtime.get_context::<EchoContext>(()).unwrap();
                 });
             }
         });
 
         let (count_tx, count_rx) = mpsc::channel();
         runtime
-            .run(move |_, _, drivers| {
+            .run(move |_, drivers| {
                 count_tx.send(drivers.len()).unwrap();
             })
             .unwrap();

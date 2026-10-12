@@ -5,25 +5,23 @@ use std::task::Waker;
 
 use thread_aware_core::Thread;
 
-use crate::{BlockingTaskSpawner, DriverRole};
+use crate::DriverRole;
 
 #[derive(Debug)]
-/// Per-worker inputs to [`IoContext::create_driver`](crate::IoContext::create_driver).
+/// Per-worker inputs to [`IoContext::driver`](crate::IoContext::driver).
 pub struct DriverOptions {
     thread: Thread,
     owner_waker: Waker,
-    spawner: BlockingTaskSpawner,
     allowed_roles: Vec<DriverRole>,
 }
 
 impl DriverOptions {
     /// Creates options for a driver on `thread`.
     #[must_use]
-    pub fn new(thread: Thread, owner_waker: Waker, spawner: BlockingTaskSpawner, allowed_roles: Vec<DriverRole>) -> Self {
+    pub fn new(thread: Thread, owner_waker: Waker, allowed_roles: Vec<DriverRole>) -> Self {
         Self {
             thread,
             owner_waker,
-            spawner,
             allowed_roles,
         }
     }
@@ -38,12 +36,6 @@ impl DriverOptions {
     #[must_use]
     pub const fn owner_waker(&self) -> &Waker {
         &self.owner_waker
-    }
-
-    /// Returns the spawner for blocking system work.
-    #[must_use]
-    pub const fn spawner(&self) -> &BlockingTaskSpawner {
-        &self.spawner
     }
 
     /// Returns the waiting roles the runtime can accept from this driver.

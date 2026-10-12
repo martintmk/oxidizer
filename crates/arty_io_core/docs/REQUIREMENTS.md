@@ -13,8 +13,8 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
 
 ## R2: Lazy and independent registration
 
-- The runtime keys registration by concrete `IoContext` type and supplies
-  `IoContextOptions` when creating it.
+- The runtime keys registration by concrete `IoContext` type and supplies the
+  context's associated `Options` when creating it.
 - The first request returns only after every active worker has an initialized
   driver/context pair. Later requests clone existing contexts.
 - Different driver versions can coexist through distinct context types.
@@ -24,7 +24,7 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
 
 - The runtime clones and relocates the context to each owning worker before
   creating its driver. `DriverOptions` supplies that worker, its allowed roles,
-  the owner waker used to request another cycle, and the system task spawner.
+  and the owner waker used to request another cycle.
 - `DriverOptions::allowed_roles` lists the roles available during creation.
   `DriverInstance` returns the selected fixed role, which must be allowed.
   Each worker has at most one primary. Without one, the runtime owns worker parking.
@@ -46,7 +46,7 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
   same bound but return without joining them.
 - Bounded batches with serviceable work remaining request another cycle.
   In-flight operations alone do not indicate serviceable work.
-- Drivers may use `BlockingTaskSpawner` or context-owned threads.
+- Drivers may use context-owned threads or another implementation-owned mechanism.
 
 ## R5: Safe and blocking shutdown
 
@@ -58,8 +58,7 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
   wait, or returns `DriverError` without relaxing drop safety.
 - Shutdown uses driver-owned progress mechanisms: normal cycle coordination
   has stopped, and no other driver on the same worker may be required to run.
-- The runtime reports failures, attempts remaining drivers, and keeps the system
-  task spawner available until all shutdown calls return.
+- The runtime reports failures and attempts remaining drivers.
 - Safety does not depend on successful shutdown or a caller-checked inertness
   flag. Platform-specific unsafe code stays private to driver implementations.
 
@@ -71,14 +70,7 @@ describes the lifecycle; the no-op example tracker does not implement coordinati
 - Drivers with conditional availability expose a capability check before a
   consumer requests the context.
 
-## R7: System work is named explicitly
-
-- `BlockingTask` is blocking driver work on system threads, not an async task.
-- Submission returns after acceptance, without waiting for completion.
-- `BlockingTaskSpawner` remains available through shutdown and hides the runtime's
-  shared-ownership mechanism.
-
-## R8: Scope of the initial API
+## R7: Scope of the initial API
 
 Core does not provide peer-driver discovery, a driver registry, native observer
 placement, memory pools, configurable clocks, telemetry, ecosystem-specific

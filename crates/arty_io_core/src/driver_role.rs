@@ -13,8 +13,7 @@ pub enum DriverRole {
     ///
     /// The runtime invokes this driver before the primary, and it must not wait on the worker.
     ///
-    /// Indefinite waits require independent execution capacity. A bounded pool behind
-    /// [`BlockingTaskSpawner`](crate::BlockingTaskSpawner) is suitable only if it has capacity
-    /// for every simultaneously blocked observer.
+    /// Indefinite waits require independent execution capacity for every simultaneously blocked
+    /// observer.
     Secondary,
 }

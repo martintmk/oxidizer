@@ -3,7 +3,7 @@
 
 use std::task::Waker;
 
-use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions};
+use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
 use thread_aware_core::{Thread, ThreadAware};
 
 #[derive(Clone)]
@@ -14,13 +14,14 @@ impl ThreadAware for SampleContext {
 }
 
 impl IoContext for SampleContext {
+    type Options = ();
     type Driver = SampleDriver;
 
-    fn create_context(_options: IoContextOptions) -> Self {
+    fn context((): Self::Options) -> Self {
         Self
     }
 
-    fn create_driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
         let role = if options.allowed_roles().contains(&DriverRole::Primary) {
             DriverRole::Primary
         } else {
@@ -59,13 +60,14 @@ impl ThreadAware for EchoContext {
 }
 
 impl IoContext for EchoContext {
+    type Options = ();
     type Driver = EchoDriver;
 
-    fn create_context(_options: IoContextOptions) -> Self {
+    fn context((): Self::Options) -> Self {
         Self
     }
 
-    fn create_driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
         let role = DriverRole::Secondary;
         println!("initializing echo driver as {role:?}");
         Ok(DriverInstance::new(EchoDriver { role }, role))

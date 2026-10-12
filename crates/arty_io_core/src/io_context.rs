@@ -3,7 +3,7 @@
 
 use thread_aware_core::ThreadAware;
 
-use crate::{Driver, DriverError, DriverInstance, DriverOptions, IoContextOptions};
+use crate::{Driver, DriverError, DriverInstance, DriverOptions};
 
 /// A consumer-facing I/O handle that creates worker-local drivers.
 ///
@@ -16,6 +16,9 @@ use crate::{Driver, DriverError, DriverInstance, DriverOptions, IoContextOptions
 ///
 /// [single-worker runtime example]: https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core/examples/single_thread_runtime
 pub trait IoContext: Clone + ThreadAware + 'static {
+    /// Configuration used to create the context.
+    type Options;
+
     /// The driver type created by this context.
     type Driver: Driver;
 
@@ -24,7 +27,7 @@ pub trait IoContext: Clone + ThreadAware + 'static {
     /// The runtime calls this method at most once per registered context type, passing
     /// `options`. Repeated calls should return equivalent contexts.
     #[must_use]
-    fn create_context(options: IoContextOptions) -> Self;
+    fn context(options: Self::Options) -> Self;
 
     /// Creates a driver for the worker described by `options`.
     ///
@@ -39,5 +42,5 @@ pub trait IoContext: Clone + ThreadAware + 'static {
     ///
     /// Returns an error if initialization fails. Partial state must be safe to drop, with no
     /// context published; the runtime rolls back the driver.
-    fn create_driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError>;
+    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError>;
 }

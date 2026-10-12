@@ -32,8 +32,8 @@
 //! The runtime clones and relocates contexts to its workers, assigns driver roles, and
 //! supplies [`DriverOptions`]. It completes a non-blocking, zero-wait initialization cycle
 //! before publishing a context.
-//! It also supplies an owner waker for requesting another cycle and a [`BlockingTaskSpawner`] for
-//! blocking system work. Each driver supplies a waker that interrupts its pending completion wait.
+//! It also supplies an owner waker for requesting another cycle. Each driver supplies a waker that
+//! interrupts its pending completion wait.
 //!
 //! Each logical cycle uses a shared time snapshot and wait bound. The runtime invokes
 //! secondaries before the primary. If there is no primary, the runtime retains responsibility
@@ -57,7 +57,6 @@
 //!
 //! [single-thread runtime example]: https://github.com/microsoft/oxidizer/tree/main/crates/arty_io_core/examples/single_thread_runtime
 
-mod blocking_task_spawner;
 mod cycle;
 mod driver;
 mod driver_error;
@@ -65,9 +64,7 @@ mod driver_instance;
 mod driver_options;
 mod driver_role;
 mod io_context;
-mod io_context_options;
 
-pub use blocking_task_spawner::{BlockingTask, BlockingTaskSpawner};
 pub use cycle::Cycle;
 pub use driver::Driver;
 pub use driver_error::DriverError;
@@ -75,4 +72,3 @@ pub use driver_instance::DriverInstance;
 pub use driver_options::DriverOptions;
 pub use driver_role::DriverRole;
 pub use io_context::IoContext;
-pub use io_context_options::IoContextOptions;

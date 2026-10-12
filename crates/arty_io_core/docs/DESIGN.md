@@ -60,9 +60,9 @@ completion wait.
 
 ### Keep scheduling decisions in the runtime
 
-Blocking observers can use `BlockingTaskSpawner` or context-owned threads.
-These are not async application tasks: indefinitely blocked observers need
-independent execution capacity, or an undersized pool can prevent progress.
+Blocking observers use context-owned threads or another implementation-owned mechanism.
+These are not async application tasks: indefinitely blocked observers need independent
+execution capacity.
 
 ## Stop safely, even when cleanup fails
 
@@ -75,8 +75,7 @@ That memory needs ownership independent of the driver, and dropping the driver
 must remain safe even when shutdown fails.
 
 Normal cycles have stopped, so shutdown must progress without another driver
-on the same worker. The runtime keeps system tasks available until all shutdown
-calls return and continues cleanup after an error.
+on the same worker. The runtime continues cleanup after an error.
 
 ## Make failures explicit
 

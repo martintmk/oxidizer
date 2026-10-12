@@ -14,16 +14,14 @@ use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 use std::{fmt, io, thread};
 
-use arty_io_core::{BlockingTaskSpawner, Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext, IoContextOptions};
+use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use thread_aware_core::{Thread, ThreadAware};
 
 assert_impl_all!(DriverOptions: Send, Sync, fmt::Debug);
 assert_not_impl_any!(Cycle: Send, Sync);
 assert_impl_all!(DriverRole: Copy, Send, Sync, fmt::Debug, Eq);
-assert_impl_all!(IoContextOptions: Send, Sync, fmt::Debug);
 assert_impl_all!(DriverError: Send, Sync, fmt::Debug, fmt::Display, Error);
-assert_impl_all!(BlockingTaskSpawner: Clone, Send, Sync, fmt::Debug);
 
 #[derive(Default)]
 struct WakeCounter(AtomicUsize);
@@ -35,39 +33,18 @@ impl Wake for WakeCounter {
 }
 
 #[test]
-fn blocking_task_spawner_debug() {
-    let spawner = BlockingTaskSpawner::from_fn(|task| task());
-
-    assert_eq!(format!("{spawner:?}"), "BlockingTaskSpawner { .. }");
-}
-
-#[test]
 fn public_options_expose_runtime_facilities() {
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let accepted_by_callback = Arc::clone(&accepted);
-    let spawner = BlockingTaskSpawner::from_fn(move |task| {
-        accepted_by_callback.fetch_add(1, Ordering::Relaxed);
-        task();
-    });
     let worker = worker_thread();
     let wake_counter = Arc::new(WakeCounter::default());
     let owner_waker = Waker::from(Arc::clone(&wake_counter));
-    let options = DriverOptions::new(
-        worker.clone(),
-        owner_waker,
-        spawner,
-        vec![DriverRole::Primary, DriverRole::Secondary],
-    );
+    let options = DriverOptions::new(worker.clone(), owner_waker, vec![DriverRole::Primary, DriverRole::Secondary]);
 
     options.owner_waker().wake_by_ref();
-    options.spawner().spawn(|| {});
 
     assert_eq!(options.thread(), &worker);
     assert_eq!(options.allowed_roles(), [DriverRole::Primary, DriverRole::Secondary]);
     assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
-    assert_eq!(accepted.load(Ordering::Relaxed), 1);
     assert!(format!("{options:?}").contains("DriverOptions"));
-    assert!(format!("{:?}", IoContextOptions::new()).contains("IoContextOptions"));
 }
 
 #[test]
@@ -98,12 +75,12 @@ fn cycle_exposes_max_wait() {
 
 #[test]
 fn context_and_driver_creation_use_both_options() {
-    fn create_context<C: IoContext>(options: IoContextOptions) -> C {
-        C::create_context(options)
+    fn context<C: IoContext>(options: C::Options) -> C {
+        C::context(options)
     }
 
-    let mut context: TestContext = create_context::<TestContext>(IoContextOptions::new());
-    let instance = context.create_driver(driver_options()).unwrap();
+    let mut context: TestContext = context::<TestContext>(7);
+    let instance = context.driver(driver_options()).unwrap();
     assert_eq!(instance.role, DriverRole::Primary);
     let role = instance.role;
     let driver: LocalDriver = instance.driver;
@@ -126,8 +103,8 @@ fn shutdown_consumes_the_driver() {
 
 #[test]
 fn shutdown_waits_for_active_operations_not_contexts() {
-    let mut context = LeaseContext::create_context(IoContextOptions::new());
-    let driver = context.create_driver(driver_options()).unwrap().driver;
+    let mut context = LeaseContext::context(());
+    let driver = context.driver(driver_options()).unwrap().driver;
     let operation = context.begin_operation().expect("admission is open before shutdown");
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
@@ -153,8 +130,8 @@ fn shutdown_waits_for_active_operations_not_contexts() {
 
 #[test]
 fn dropping_driver_closes_context_admission() {
-    let mut context = LeaseContext::create_context(IoContextOptions::new());
-    let driver = context.create_driver(driver_options()).unwrap().driver;
+    let mut context = LeaseContext::context(());
+    let driver = context.driver(driver_options()).unwrap().driver;
 
     drop(driver);
 
@@ -231,13 +208,14 @@ impl ThreadAware for TestContext {
 }
 
 impl IoContext for TestContext {
+    type Options = u8;
     type Driver = LocalDriver;
 
-    fn create_context(_options: IoContextOptions) -> Self {
-        Self(7)
+    fn context(options: Self::Options) -> Self {
+        Self(options)
     }
 
-    fn create_driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
         Ok(DriverInstance::new(LocalDriver::new(Rc::default()), DriverRole::Primary))
     }
 }
@@ -267,14 +245,15 @@ impl ThreadAware for LeaseContext {
 }
 
 impl IoContext for LeaseContext {
+    type Options = ();
     type Driver = LeaseDriver;
 
-    fn create_context(_options: IoContextOptions) -> Self {
+    fn context((): Self::Options) -> Self {
         let state = Arc::default();
         Self { state }
     }
 
-    fn create_driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
         Ok(DriverInstance::new(
             LeaseDriver::new(Arc::clone(&self.state)),
             DriverRole::Secondary,
@@ -378,7 +357,6 @@ fn driver_options() -> DriverOptions {
     DriverOptions::new(
         worker_thread(),
         Waker::noop().clone(),
-        BlockingTaskSpawner::from_fn(|task| task()),
         vec![DriverRole::Primary, DriverRole::Secondary],
     )
 }

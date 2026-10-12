@@ -57,9 +57,8 @@ pub trait Driver: 'static {
     /// Dropping must remain memory-safe after either result. Cancellation alone does not prove
     /// that native code has stopped accessing operation storage.
     ///
-    /// The runtime keeps [`BlockingTaskSpawner`](crate::BlockingTaskSpawner) available until all
-    /// shutdown calls return and attempts remaining drivers after an error. It may shut down
-    /// secondaries before the primary.
+    /// The runtime attempts remaining drivers after an error. It may shut down secondaries before
+    /// the primary.
     ///
     /// # Errors
     ///

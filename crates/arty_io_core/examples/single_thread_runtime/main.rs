@@ -20,8 +20,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("runtime started");
 
     let registration = runtime
-        .get_context::<SampleContext>()
-        .and_then(|sample| runtime.get_context::<EchoContext>().map(|echo| (sample, echo)));
+        .get_context::<SampleContext>(())
+        .and_then(|sample| runtime.get_context::<EchoContext>(()).map(|echo| (sample, echo)));
 
     let shutdown = runtime.shutdown();
     let (_sample, _echo) = registration?;
