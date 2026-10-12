@@ -240,7 +240,7 @@ impl Clock {
         // set. We use the `Shared` inactive-clock variant which intentionally does not support
         // cloning or per-core relocation, since both would create configurations the single
         // background driver could not advance correctly.
-        let (clock, mut driver) = crate::runtime::InactiveClock::new_shared().activate();
+        let (clock, mut driver) = crate::runtime::InactiveClock::new_shared().activate(Waker::noop().clone());
 
         let join_handle = tokio::spawn(async move {
             loop {
@@ -514,7 +514,7 @@ impl Clock {
         match self.clock_state() {
             #[cfg(any(feature = "test-util", test))]
             ClockState::ClockControl(control) => control.register_timer(when, waker),
-            ClockState::System(timers) => timers.with_timers(|t| t.register(when, waker)),
+            ClockState::System(timers) => timers.register_timer(when, waker),
         }
     }
 
@@ -632,6 +632,8 @@ mod tests {
         let precise_clock = Clock::new_system_frozen();
         let fast_clock = precise_clock.clone().with_fast_instant(true);
 
+        assert!(!precise_clock.simple_clock().uses_fast_instant());
+        assert!(fast_clock.simple_clock().uses_fast_instant());
         _ = precise_clock.instant();
         _ = fast_clock.instant();
     }
@@ -745,7 +747,7 @@ mod tests {
 
     #[test]
     fn owners_count() {
-        let (clock, driver) = InactiveClock::default().activate();
+        let (clock, driver) = InactiveClock::default().activate(Waker::noop().clone());
 
         assert!(!clock.state.is_unique());
         drop(clock);
@@ -754,7 +756,7 @@ mod tests {
 
     #[test]
     fn owners_count_clock_control() {
-        let (clock, driver) = InactiveClock::from(ClockControl::default()).activate();
+        let (clock, driver) = InactiveClock::from(ClockControl::default()).activate(Waker::noop().clone());
 
         assert!(!driver.state.is_unique());
         drop(clock);
@@ -773,8 +775,8 @@ mod tests {
         let thread_1 = source.as_ref().unwrap();
         inactive_1.relocate(source.as_ref(), thread_1);
 
-        let (clock_1, mut driver_1) = inactive_1.activate();
-        let (clock_2, mut driver_2) = inactive_2.activate();
+        let (clock_1, mut driver_1) = inactive_1.activate(Waker::noop().clone());
+        let (clock_2, mut driver_2) = inactive_2.activate(Waker::noop().clone());
 
         // register the timer on clock 1
         let mut fut_1 = Box::pin(clock_1.delay(Duration::from_secs(100)));
@@ -826,8 +828,8 @@ mod tests {
         let thread_1 = source.as_ref().unwrap();
         inactive_1.relocate(source.as_ref(), thread_1);
 
-        let (clock_1, driver_1) = inactive_1.activate();
-        let (clock_2, driver_2) = inactive_2.activate();
+        let (clock_1, driver_1) = inactive_1.activate(Waker::noop().clone());
+        let (clock_2, driver_2) = inactive_2.activate(Waker::noop().clone());
 
         // register the timer on clock 1 also affects clock 2 because clock control is shared
         let mut fut_1 = Box::pin(clock_1.delay(Duration::from_secs(100)));

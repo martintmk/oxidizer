@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::task::Waker;
 use std::time::Instant;
 
 use performables::arc::{Arc, PerThread};
@@ -55,6 +56,12 @@ impl ClockState {
             #[cfg(any(feature = "test-util", test))]
             Self::ClockControl(_) => true,
             Self::System(timers) => timers.with_timers(|t| t.alive()),
+        }
+    }
+
+    pub(crate) fn set_driver_waker(&self, waker: Waker) {
+        if let Self::System(timers) = self {
+            timers.with_timers(|timers| timers.set_driver_waker(waker));
         }
     }
 
@@ -117,10 +124,18 @@ impl SynchronizedTimers {
     {
         let mut timers = match self {
             #[cfg(any(feature = "rt-shared", test))]
-            Self::Shared(timers) => timers.lock_sync(),
-            Self::Isolated(timers) => timers.lock_sync(),
+            Self::Shared(timers) => timers.lock(),
+            Self::Isolated(timers) => timers.lock(),
         };
         f(&mut timers)
+    }
+
+    pub(crate) fn register_timer(&self, when: Instant, waker: Waker) -> crate::timers::TimerKey {
+        let (key, driver_waker) = self.with_timers(|timers| timers.register_and_driver_waker(when, waker));
+        if let Some(driver_waker) = driver_waker {
+            driver_waker.wake();
+        }
+        key
     }
 
     #[cfg_attr(test, mutants::skip)] // Causes test timeout.
@@ -146,5 +161,17 @@ mod tests {
     #[test]
     fn clock_state_send_and_sync() {
         static_assertions::assert_impl_all!(ClockState: Send, Sync);
+    }
+
+    #[test]
+    fn shared_timer_uniqueness_tracks_clones() {
+        let timers = SynchronizedTimers::new_shared();
+        assert!(timers.is_unique());
+
+        let clone = timers.clone();
+        assert!(!timers.is_unique());
+
+        drop(clone);
+        assert!(timers.is_unique());
     }
 }

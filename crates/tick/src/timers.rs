@@ -45,6 +45,7 @@ pub(crate) struct Timers {
     /// The [`Waker`] represents the task awaiting the timer.
     wakers: BTreeMap<TimerKey, Waker>,
     last_discriminator: u32,
+    driver_waker: Option<Waker>,
 
     // Determines whether the timers are currently being advanced.
     // This value is `false` if timers have not yet been advanced.
@@ -69,6 +70,12 @@ impl Timers {
     ///
     /// Returns a unique [`TimerKey`] that can be used to unregister the timer.
     pub(crate) fn register(&mut self, when: Instant, waker: Waker) -> TimerKey {
+        self.register_and_driver_waker(when, waker).0
+    }
+
+    pub(crate) fn register_and_driver_waker(&mut self, when: Instant, waker: Waker) -> (TimerKey, Option<Waker>) {
+        let previous_next = self.next_timer();
+
         // We can wrap the discriminator because it's only used to distinguish timers with the same instant,
         // and the actual value can start from 0 again.
         self.last_discriminator = self.last_discriminator.wrapping_add(1);
@@ -76,7 +83,16 @@ impl Timers {
 
         self.wakers.insert(key, waker);
 
-        key
+        let driver_waker = previous_next
+            .is_none_or(|previous| when < previous)
+            .then(|| self.driver_waker.clone())
+            .flatten();
+
+        (key, driver_waker)
+    }
+
+    pub(crate) fn set_driver_waker(&mut self, waker: Waker) {
+        self.driver_waker = Some(waker);
     }
 
     /// Unregisters a timer with the given key.
@@ -151,6 +167,34 @@ mod tests {
 
         timers.advance_timers(when + Duration::from_secs(1));
         assert_eq!(timers.len(), 0);
+    }
+
+    #[test]
+    fn timer_discriminators_are_sequential() {
+        let mut timers = Timers::default();
+        let when = Instant::now();
+
+        let first = timers.register(when, Waker::noop().clone());
+        let second = timers.register(when, Waker::noop().clone());
+
+        assert_eq!(first.discriminator, 1);
+        assert_eq!(second.discriminator, 2);
+    }
+
+    #[test]
+    fn timer_one_nanosecond_after_now_stays_pending() {
+        for last_discriminator in [0, u32::MAX] {
+            let mut timers = Timers {
+                last_discriminator,
+                ..Timers::default()
+            };
+            let now = Instant::now();
+            let next = now + Duration::from_nanos(1);
+            let key = timers.register(next, Waker::noop().clone());
+
+            assert_eq!(timers.advance_timers(now), Some(next));
+            assert!(timers.contains(key));
+        }
     }
 
     #[test]

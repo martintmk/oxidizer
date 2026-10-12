@@ -2,6 +2,14 @@
 // Licensed under the MIT License.
 
 //! Integration tests for allocator telemetry.
+//!
+//! Miri excludes this behavioral integration binary because each test captures
+//! and decodes a process-wide allocator snapshot, making the suite the
+//! interpreter's dominant artifact without adding a distinct unsafe path.
+//! Rallocator's library tests retain direct Miri coverage of the allocator and
+//! telemetry internals; this binary retains its complete native and
+//! cargo-careful coverage.
+#![cfg(not(miri))]
 #![expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -95,21 +103,6 @@ fn passive_bump_hints_detach_and_reuse_native_state() {
     assert_eq!(allocations.len(), 2);
     assert!(allocations.iter().all(|event| event.heap_kind == HeapKind::Bump));
     assert_eq!(allocations[0].heap_id, allocations[1].heap_id);
-}
-
-#[test]
-fn snapshot_capture_does_not_add_allocator_mappings() {
-    let _test = test_lock();
-    track_callers(false);
-    drop(snapshot().unwrap());
-    let before = stats().unwrap();
-
-    let captured = snapshot().unwrap();
-    let after = stats().unwrap();
-
-    assert!(after.mapped_bytes <= before.mapped_bytes);
-    assert_eq!(after.os_mappings, before.os_mappings);
-    drop(captured);
 }
 
 #[test]

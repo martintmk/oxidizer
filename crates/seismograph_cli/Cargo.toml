@@ -3,7 +3,7 @@
 
 [package]
 name = "seismograph_cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Command-line tools for inspecting seismograph telemetry."
 readme = "README.md"
 keywords = ["allocator", "memory", "telemetry", "diagnostics"]
@@ -16,6 +16,11 @@ license.workspace = true
 homepage.workspace = true
 include.workspace = true
 repository = "https://github.com/microsoft/oxidizer/tree/main/crates/seismograph_cli"
+
+# The CLI is a safe integration layer. Native tests and cargo-careful cover its
+# behavior; Miri remains focused on seismograph's unsafe recorder and snapshot.
+[package.metadata.anvil.miri]
+exclude = true
 
 [[bin]]
 name = "seismograph"
@@ -32,6 +37,9 @@ seismograph.workspace = true
 seismograph_protocol.workspace = true
 seismograph_rallocator.workspace = true
 seismograph_runtime.workspace = true
+
+[dev-dependencies]
+mutants.workspace = true
 
 # >>> anvil-managed: anvil-lints
 [lints]

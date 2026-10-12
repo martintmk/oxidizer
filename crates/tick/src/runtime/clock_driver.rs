@@ -31,6 +31,9 @@ impl ClockDriver {
     /// This method processes all timers scheduled to fire at or before the
     /// specified `now` time, waking their associated tasks.
     ///
+    /// Returns the next system-clock deadline suitable for parking. Controlled clocks return
+    /// `None` because their time advances externally rather than with [`Instant`].
+    ///
     /// # Errors
     ///
     /// Returns `Err(ClockGone)` if the all clocks are gone, all timers are fired and
@@ -41,7 +44,7 @@ impl ClockDriver {
         let next_timer = match &self.state {
             ClockState::System(timers) => timers.try_advance_timers(now),
             #[cfg(any(feature = "test-util", test))]
-            ClockState::ClockControl(control) => control.next_timer(),
+            ClockState::ClockControl(_) => None,
         };
 
         match next_timer {
@@ -56,6 +59,8 @@ impl ClockDriver {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Waker};
     use std::time::Duration;
 
@@ -65,6 +70,14 @@ mod tests {
     use crate::clock_control::ClockControl;
     use crate::runtime::InactiveClock;
     use crate::state::SynchronizedTimers;
+
+    struct CountingWake(AtomicUsize);
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn assert_types() {
@@ -92,7 +105,7 @@ mod tests {
 
     #[test]
     fn clock_gone_error_reported() {
-        let (clock, mut driver) = InactiveClock::default().activate();
+        let (clock, mut driver) = InactiveClock::default().activate(Waker::noop().clone());
 
         driver.advance_timers(Instant::now()).unwrap();
         drop(clock);
@@ -104,7 +117,7 @@ mod tests {
     #[test]
     fn clock_gone_but_timers_left_not_dropped() {
         let now = Instant::now();
-        let (clock, mut driver) = InactiveClock::default().activate();
+        let (clock, mut driver) = InactiveClock::default().activate(Waker::noop().clone());
         driver.advance_timers(now).unwrap();
         let mut future = Box::pin(clock.delay(Duration::from_secs(1)));
         let mut context = Context::from_waker(Waker::noop());
@@ -125,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_timers_with_clock_control_does_not_advance() {
+    fn advance_timers_with_clock_control_has_no_system_deadline() {
         let control = ClockControl::new();
         let clock_state = ClockState::ClockControl(control.clone());
         let when = control.instant() + Duration::from_secs(1);
@@ -140,6 +153,34 @@ mod tests {
         // Verify timers are not advanced (still registered)
         assert_eq!(control.timers_len(), 1);
         // Verify next timer time is returned
-        assert_eq!(next, Some(when));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn earlier_system_timer_wakes_driver() {
+        let wake_count = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let driver_waker = Waker::from(Arc::clone(&wake_count));
+        let (clock, _driver) = InactiveClock::default().activate(driver_waker);
+        let now = Instant::now();
+
+        clock.register_timer(now + Duration::from_secs(2), Waker::noop().clone());
+        clock.register_timer(now + Duration::from_secs(3), Waker::noop().clone());
+        clock.register_timer(now + Duration::from_secs(1), Waker::noop().clone());
+
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn parking_deadline_uses_only_system_time() {
+        let now = Instant::now();
+        let (clock, mut system_driver) = InactiveClock::default().activate(Waker::noop().clone());
+        clock.register_timer(now + Duration::from_secs(1), Waker::noop().clone());
+        assert_eq!(system_driver.advance_timers(now).unwrap(), Some(now + Duration::from_secs(1)));
+
+        let control = ClockControl::new();
+        let controlled_clock = control.to_clock();
+        controlled_clock.register_timer(control.instant() + Duration::from_secs(1), Waker::noop().clone());
+        let mut controlled_driver = ClockDriver::new(ClockState::ClockControl(control));
+        assert_eq!(controlled_driver.advance_timers(now).unwrap(), None);
     }
 }
