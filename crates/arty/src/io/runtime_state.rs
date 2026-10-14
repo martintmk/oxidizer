@@ -196,29 +196,28 @@ impl IoRuntime {
                     Self::recursive_registration::<C>();
                 }
                 registry = self.registration_changed.wait(registry);
-                continue;
-            }
-
-            let reserved_primary = registry.primary.is_none() && registry.primary_reservation.is_none();
-            if reserved_primary {
-                registry.primary_reservation = Some(context_type);
-            }
-            registry.constructing.insert(context_type, current_thread);
-            let allowed_roles = if reserved_primary {
-                vec![DriverRole::Primary, DriverRole::Secondary]
             } else {
-                vec![DriverRole::Secondary]
-            };
-            return Resolution::Register {
-                allowed_roles: allowed_roles.clone(),
-                reservation: RegistrationReservation {
-                    runtime: self,
-                    context_type,
-                    allowed_roles,
-                    reserved_primary,
-                    published: false,
-                },
-            };
+                let reserved_primary = registry.primary.is_none() && registry.primary_reservation.is_none();
+                if reserved_primary {
+                    registry.primary_reservation = Some(context_type);
+                }
+                registry.constructing.insert(context_type, current_thread);
+                let allowed_roles = if reserved_primary {
+                    vec![DriverRole::Primary, DriverRole::Secondary]
+                } else {
+                    vec![DriverRole::Secondary]
+                };
+                return Resolution::Register {
+                    allowed_roles: allowed_roles.clone(),
+                    reservation: RegistrationReservation {
+                        runtime: self,
+                        context_type,
+                        allowed_roles,
+                        reserved_primary,
+                        published: false,
+                    },
+                };
+            }
         }
     }
 
@@ -347,6 +346,8 @@ pub(crate) mod tests {
 
     #[derive(Clone)]
     pub(crate) struct Context;
+    #[derive(Clone)]
+    struct OtherContext;
 
     impl ThreadAware for Context {
         fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
@@ -362,6 +363,23 @@ pub(crate) mod tests {
 
         fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
             Ok(DriverInstance::new(TestDriver, DriverRole::Primary))
+        }
+    }
+
+    impl ThreadAware for OtherContext {
+        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+    }
+
+    impl IoContext for OtherContext {
+        type ContextOptions = ();
+        type Driver = TestDriver;
+
+        fn context((): Self::ContextOptions) -> Self {
+            Self
+        }
+
+        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+            Ok(DriverInstance::new(TestDriver, DriverRole::Secondary))
         }
     }
 
@@ -403,6 +421,29 @@ pub(crate) mod tests {
             panic!("abandoned registration must be reservable again");
         };
         assert_eq!(allowed_roles, [DriverRole::Primary, DriverRole::Secondary]);
+    }
+
+    #[test]
+    fn abandoning_secondary_reservation_preserves_primary_registration() {
+        let runtime = IoRuntime::default();
+        let destination = thread();
+        let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
+            panic!("first resolution must reserve registration");
+        };
+        reservation.publish(&Context, &destination);
+        runtime.complete_driver::<Context>(thread::current().id(), DriverRole::Primary);
+
+        let Resolution::Register {
+            allowed_roles,
+            reservation,
+        } = runtime.resolve::<OtherContext>(&destination)
+        else {
+            panic!("second context must reserve registration");
+        };
+        assert_eq!(allowed_roles, [DriverRole::Secondary]);
+        drop(reservation);
+
+        assert!(runtime.is_registered::<Context>());
     }
 
     #[test]

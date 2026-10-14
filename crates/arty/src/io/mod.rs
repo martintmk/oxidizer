@@ -83,7 +83,6 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use arty_io_core::DriverError;
 pub(crate) use driver_host::DriverHost;
 use performables::sync::channel;
 pub(crate) use runtime_state::IoRuntime;
@@ -217,9 +216,7 @@ impl Io {
             }));
             _ = result_tx.send(result);
         });
-        if !self.dispatcher.access_io(worker_index, access) {
-            return Err(self.runtime_error().unwrap_or_else(Error::runtime_shutting_down));
-        }
+        _ = self.dispatcher.access_io(worker_index, access);
         match result_rx
             .recv()
             .map_err(|disconnected| self.runtime_error().unwrap_or_else(|| Error::new(disconnected)))?
@@ -259,14 +256,8 @@ impl Io {
         if self.dispatcher.prepare_io_everywhere::<C>() {
             return Ok(());
         }
-        if let Some(error) = self.runtime_error() {
-            return Err(error);
-        }
-        let error = self.runtime.record_failure(DriverError::from_message(
-            "runtime worker stopped before I/O registration was delivered",
-        ));
         self.dispatcher.stop();
-        Err(Error::io_failure(error))
+        Err(self.runtime_error().unwrap_or_else(Error::runtime_shutting_down))
     }
 
     fn runtime_error(&self) -> Option<Error> {
@@ -294,5 +285,35 @@ impl ThreadAware for Io {
         if self.dispatcher.owns(destination) {
             self.thread = destination.clone();
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_worker_reports_shutdown_for_external_access_and_initialization() {
+        let (dispatcher, thread) = crate::runtime::dispatch::disconnected_test_dispatcher();
+        let worker_index = dispatcher.worker_index(thread.id()).unwrap();
+        let io = Io::new(Arc::new(IoRuntime::new(1)), dispatcher, thread);
+
+        let access_error = match io.try_context_from_external_thread::<TestIoContext>(worker_index, Some(())) {
+            Ok(_) => panic!("disconnected worker access must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(access_error.to_string(), "channel is closed");
+
+        let initialization_error = io.initialize_everywhere::<TestIoContext>().unwrap_err();
+        assert_eq!(initialization_error.to_string(), "the runtime is shutting down");
+    }
+
+    #[test]
+    fn debug_includes_bound_thread() {
+        let (dispatcher, thread) = crate::runtime::dispatch::disconnected_test_dispatcher();
+        let io = Io::new(Arc::new(IoRuntime::new(1)), dispatcher, thread);
+
+        assert!(format!("{io:?}").contains("thread"));
     }
 }
