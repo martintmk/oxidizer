@@ -173,7 +173,9 @@ mod tests {
         }
 
         impl Wake for TrackedWake {
-            fn wake(self: StdArc<Self>) {}
+            fn wake(self: StdArc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
         }
 
         let signal = WorkerSignal::default();

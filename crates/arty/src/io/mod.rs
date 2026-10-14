@@ -299,9 +299,8 @@ mod tests {
         let worker_index = dispatcher.worker_index(thread.id()).unwrap();
         let io = Io::new(Arc::new(IoRuntime::new(1)), dispatcher, thread);
 
-        let access_error = match io.try_context_from_external_thread::<TestIoContext>(worker_index, Some(())) {
-            Ok(_) => panic!("disconnected worker access must fail"),
-            Err(error) => error,
+        let Err(access_error) = io.try_context_from_external_thread::<TestIoContext>(worker_index, Some(())) else {
+            panic!("disconnected worker access must fail");
         };
         assert_eq!(access_error.to_string(), "channel is closed");
 
