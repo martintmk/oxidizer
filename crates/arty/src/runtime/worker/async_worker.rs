@@ -119,7 +119,6 @@ where
         signal: Arc<WorkerSignal>,
         shutdown_signal: Arc<AtomicBool>,
         thread_state_constructed_tx: channel::Sender<()>,
-        driver_host: Option<Rc<DriverHost>>,
     ) -> Self
     where
         TSFF: FnOnce(TaskSet, Clock) -> TSF + 'static,
@@ -159,9 +158,14 @@ where
             clock_driver,
             blocking_worker,
             signal,
-            driver_host,
+            driver_host: None,
             _single_threaded: PhantomData,
         }
+    }
+
+    pub(in crate::runtime) fn with_driver_host(mut self, driver_host: Rc<DriverHost>) -> Self {
+        self.driver_host = Some(driver_host);
+        self
     }
 
     /// Worker thread entry point, invoked by bootstrap after startup coordination completes.
@@ -199,11 +203,11 @@ where
         let can_suspend = matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted;
         let max_wait = if can_suspend { SUSPEND_SLEEP_DURATION } else { Duration::ZERO };
         let cycle_started = Instant::now();
-        if let Some(driver_host) = &self.driver_host {
-            if driver_host.execute_cycle(max_wait).is_err() {
-                self.begin_shutdown();
-                return ControlFlow::Continue(());
-            }
+        if let Some(driver_host) = &self.driver_host
+            && driver_host.execute_cycle(max_wait).is_err()
+        {
+            self.begin_shutdown();
+            return ControlFlow::Continue(());
         }
 
         match cycle_outcome {
@@ -420,7 +424,6 @@ mod tests {
                     Arc::clone(&signal),
                     Arc::clone(&shutdown_signal),
                     ready_tx,
-                    None,
                 )
             };
             let mut scenario = Self {
@@ -624,7 +627,6 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
-                None,
             )
         };
         let executor = worker.executor.as_ref().unwrap();
@@ -662,7 +664,6 @@ mod tests {
                 Arc::clone(&signal),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
-                None,
             )
         };
         assert!(worker.execute_step().is_continue());
@@ -713,7 +714,6 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
-                None,
             )
         };
         let _ = worker.executor.as_ref().unwrap().execute_cycle();
@@ -754,7 +754,6 @@ mod tests {
                         signal,
                         Arc::new(AtomicBool::new(false)),
                         channel::unbounded().0,
-                        None,
                     )
                 };
                 worker.run();
@@ -827,7 +826,6 @@ mod tests {
                         signal,
                         Arc::new(AtomicBool::new(false)),
                         constructed_tx,
-                        None,
                     )
                 };
 
@@ -885,7 +883,6 @@ mod tests {
                     signal,
                     Arc::new(AtomicBool::new(false)),
                     channel::unbounded().0,
-                    None,
                 )
             };
             worker.run();
@@ -931,7 +928,6 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::clone(&shutdown_signal),
                 ready_tx,
-                None,
             )
         };
         let _ = worker.executor.as_ref().unwrap().execute_cycle();
@@ -970,7 +966,6 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::new(AtomicBool::new(false)),
                 channel::unbounded().0,
-                None,
             )
         };
 

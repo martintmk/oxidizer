@@ -266,8 +266,8 @@ impl AsyncWorkerStartInfo {
                 signal,
                 shutdown_signal,
                 success_tx,
-                Some(driver_host),
             )
+            .with_driver_host(driver_host)
         };
 
         emit!(

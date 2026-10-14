@@ -55,7 +55,7 @@ use crate::task::{RuntimeScheduler, Scheduler};
 #[derive(Debug)]
 pub struct Runtime {
     scheduler: RuntimeScheduler,
-    io_runtime: PArc<IoRuntime>,
+    io: PArc<IoRuntime>,
     shutdown_on_drop: bool,
 }
 
@@ -185,13 +185,13 @@ impl Runtime {
             return Err(Error::shutdown_wait_from_blocking_callback());
         }
         self.scheduler.dispatcher.wait()?;
-        self.io_runtime.failure().map_or(Ok(()), Err)
+        self.io.failure().map_or(Ok(()), Err)
     }
 
     pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient, io_runtime: PArc<IoRuntime>) -> Self {
         Self {
             scheduler: RuntimeScheduler::new(dispatcher),
-            io_runtime,
+            io: io_runtime,
             shutdown_on_drop: true,
         }
     }
