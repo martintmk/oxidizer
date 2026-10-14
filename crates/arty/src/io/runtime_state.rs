@@ -14,15 +14,13 @@ use thread_aware::Thread;
 
 use crate::runtime::Error;
 
+const PRIMARY_ROLE: &[DriverRole] = &[DriverRole::Primary];
+const SECONDARY_ROLE: &[DriverRole] = &[DriverRole::Secondary];
+const PRIMARY_OR_SECONDARY: &[DriverRole] = &[DriverRole::Primary, DriverRole::Secondary];
+
 pub(crate) enum Resolution<'a, C> {
-    Existing {
-        context: C,
-        allowed_roles: Vec<DriverRole>,
-    },
-    Register {
-        allowed_roles: Vec<DriverRole>,
-        reservation: RegistrationReservation<'a>,
-    },
+    Existing { context: C, allowed_roles: &'static [DriverRole] },
+    Register(RegistrationReservation<'a>),
 }
 
 trait ErasedRegistration: Send {
@@ -47,17 +45,29 @@ where
 
 struct RegistrationState {
     registration: Box<dyn ErasedRegistration>,
-    allowed_roles: Vec<DriverRole>,
     role: Option<DriverRole>,
     initialized_workers: HashSet<ThreadId>,
-    reserved_primary: bool,
+    primary_candidate: bool,
+}
+
+impl RegistrationState {
+    fn prepare<C>(&self, destination: &Thread) -> (C, &'static [DriverRole])
+    where
+        C: IoContext,
+    {
+        let context = self
+            .registration
+            .clone_context(destination)
+            .downcast::<C>()
+            .expect("I/O contexts are stored under their own TypeId");
+        (*context, allowed_roles(self.role, self.primary_candidate))
+    }
 }
 
 #[derive(Default)]
 struct Registry {
     registrations: HashMap<TypeId, RegistrationState>,
     primary: Option<TypeId>,
-    primary_reservation: Option<TypeId>,
     constructing: HashMap<TypeId, ThreadId>,
     failure: Option<Arc<DriverError>>,
 }
@@ -73,13 +83,12 @@ pub(crate) struct IoRuntime {
 pub(crate) struct RegistrationReservation<'a> {
     runtime: &'a IoRuntime,
     context_type: TypeId,
-    allowed_roles: Vec<DriverRole>,
-    reserved_primary: bool,
+    primary_candidate: bool,
     published: bool,
 }
 
 impl RegistrationReservation<'_> {
-    pub(crate) fn publish<C>(mut self, context: &C, thread: &Thread)
+    pub(crate) fn publish<C>(mut self, context: &C, thread: &Thread) -> &'static [DriverRole]
     where
         C: IoContext,
     {
@@ -95,10 +104,9 @@ impl RegistrationReservation<'_> {
                     self.context_type,
                     RegistrationState {
                         registration: Box::new(registration),
-                        allowed_roles: self.allowed_roles.clone(),
                         role: None,
                         initialized_workers: HashSet::default(),
-                        reserved_primary: self.reserved_primary,
+                        primary_candidate: self.primary_candidate,
                     },
                 )
                 .is_none(),
@@ -112,17 +120,7 @@ impl RegistrationReservation<'_> {
         self.published = true;
         drop(registry);
         self.runtime.registration_changed.notify_all();
-    }
-
-    fn release(&self, registry: &mut Registry) {
-        registry.constructing.remove(&self.context_type);
-        if self.reserved_primary {
-            assert_eq!(
-                registry.primary_reservation.take(),
-                Some(self.context_type),
-                "the primary reservation belongs to the constructing context"
-            );
-        }
+        allowed_roles(None, self.primary_candidate)
     }
 }
 
@@ -132,7 +130,14 @@ impl Drop for RegistrationReservation<'_> {
             return;
         }
         let mut registry = self.runtime.registry();
-        self.release(&mut registry);
+        registry.constructing.remove(&self.context_type);
+        if self.primary_candidate {
+            assert_eq!(
+                registry.primary.take(),
+                Some(self.context_type),
+                "the primary reservation belongs to the constructing context"
+            );
+        }
         drop(registry);
         self.runtime.registration_changed.notify_all();
     }
@@ -180,18 +185,8 @@ impl IoRuntime {
         let mut registry = self.registry();
         loop {
             if let Some(registration) = registry.registrations.get(&context_type) {
-                let context = registration
-                    .registration
-                    .clone_context(destination)
-                    .downcast::<C>()
-                    .expect("I/O contexts are stored under their own TypeId");
-                let allowed_roles = registration
-                    .role
-                    .map_or_else(|| registration.allowed_roles.clone(), |role| vec![role]);
-                return Resolution::Existing {
-                    context: *context,
-                    allowed_roles,
-                };
+                let (context, allowed_roles) = registration.prepare(destination);
+                return Resolution::Existing { context, allowed_roles };
             }
             if let Some(constructing_thread) = registry.constructing.get(&context_type) {
                 if *constructing_thread == current_thread {
@@ -201,88 +196,75 @@ impl IoRuntime {
                 #[cfg(test)]
                 self.report_resolution_waiting();
                 registry = self.registration_changed.wait(registry);
-            } else {
-                let reserved_primary = registry.primary.is_none() && registry.primary_reservation.is_none();
-                if reserved_primary {
-                    registry.primary_reservation = Some(context_type);
-                }
-                registry.constructing.insert(context_type, current_thread);
-                let allowed_roles = if reserved_primary {
-                    vec![DriverRole::Primary, DriverRole::Secondary]
-                } else {
-                    vec![DriverRole::Secondary]
-                };
-                return Resolution::Register {
-                    allowed_roles: allowed_roles.clone(),
-                    reservation: RegistrationReservation {
-                        runtime: self,
-                        context_type,
-                        allowed_roles,
-                        reserved_primary,
-                        published: false,
-                    },
-                };
+                continue;
             }
+
+            let primary_candidate = registry.primary.is_none();
+            if primary_candidate {
+                registry.primary = Some(context_type);
+            }
+            registry.constructing.insert(context_type, current_thread);
+            return Resolution::Register(RegistrationReservation {
+                runtime: self,
+                context_type,
+                primary_candidate,
+                published: false,
+            });
         }
     }
 
-    pub(crate) fn prepared<C>(&self, destination: &Thread) -> Option<(C, Vec<DriverRole>)>
+    pub(crate) fn prepared<C>(&self, destination: &Thread) -> Option<(C, &'static [DriverRole])>
     where
         C: IoContext,
     {
         let registry = self.registry();
-        let registration = registry.registrations.get(&TypeId::of::<C>())?;
-        let context = registration
-            .registration
-            .clone_context(destination)
-            .downcast::<C>()
-            .expect("I/O contexts are stored under their own TypeId");
-        let allowed_roles = registration
-            .role
-            .map_or_else(|| registration.allowed_roles.clone(), |role| vec![role]);
-        Some((*context, allowed_roles))
+        registry
+            .registrations
+            .get(&TypeId::of::<C>())
+            .map(|registration| registration.prepare(destination))
     }
 
-    pub(crate) fn complete_driver<C>(&self, worker: ThreadId, role: DriverRole)
+    pub(crate) fn complete_driver<C>(&self, worker: ThreadId, role: DriverRole) -> Result<(), DriverError>
     where
         C: IoContext,
     {
         let context_type = TypeId::of::<C>();
         let mut registry = self.registry();
-        let registration = registry
-            .registrations
-            .get_mut(&context_type)
-            .expect("driver completion requires a published I/O registration");
-        if let Some(expected) = registration.role {
-            assert_eq!(role, expected, "driver role was constrained by the published registration");
-        } else {
-            registration.role = Some(role);
-            let reserved_primary = registration.reserved_primary;
-            if reserved_primary {
-                assert_eq!(
-                    registry.primary_reservation.take(),
-                    Some(context_type),
-                    "the primary reservation belongs to the completing context"
-                );
-            }
-            if role == DriverRole::Primary {
-                assert!(reserved_primary, "only the reserved registration may select the primary role");
-                assert!(
-                    registry.primary.replace(context_type).is_none(),
-                    "a runtime has at most one primary I/O context"
-                );
+        let primary_candidate = {
+            let registration = registry
+                .registrations
+                .get_mut(&context_type)
+                .expect("driver completion requires a published I/O registration");
+            let primary_candidate = if let Some(expected) = registration.role {
+                if role != expected {
+                    return Err(DriverError::from_message(format!(
+                        "I/O driver selected {role:?}, but the registration uses {expected:?}"
+                    )));
+                }
+                false
+            } else {
+                registration.role = Some(role);
+                registration.primary_candidate
+            };
+            assert!(
+                registration.initialized_workers.insert(worker),
+                "each worker initializes a context driver at most once"
+            );
+            primary_candidate
+        };
+        if primary_candidate {
+            assert_eq!(
+                registry.primary,
+                Some(context_type),
+                "the primary reservation belongs to the completing context"
+            );
+            if role == DriverRole::Secondary {
+                registry.primary = None;
             }
         }
-        let registration = registry
-            .registrations
-            .get_mut(&context_type)
-            .expect("the completed registration remains present");
-        assert!(
-            registration.initialized_workers.insert(worker),
-            "each worker initializes a context driver at most once"
-        );
         drop(registry);
         self.registration_changed.notify_all();
+        Ok(())
     }
 
     pub(crate) fn is_ready<C>(&self) -> Result<bool, Error>
@@ -419,19 +401,15 @@ pub(crate) mod tests {
     fn abandoned_reservation_releases_primary_role() {
         let runtime = IoRuntime::default();
         let destination = thread();
-        let Resolution::Register {
-            allowed_roles,
-            reservation,
-        } = runtime.resolve::<Context>(&destination)
-        else {
+        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
             panic!("first resolution must reserve registration");
         };
-        assert_eq!(allowed_roles, [DriverRole::Primary, DriverRole::Secondary]);
         drop(reservation);
 
-        let Resolution::Register { allowed_roles, .. } = runtime.resolve::<Context>(&destination) else {
+        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
             panic!("abandoned registration must be reservable again");
         };
+        let allowed_roles = reservation.publish(&Context, &destination);
         assert_eq!(allowed_roles, [DriverRole::Primary, DriverRole::Secondary]);
     }
 
@@ -439,20 +417,18 @@ pub(crate) mod tests {
     fn abandoning_secondary_reservation_preserves_primary_registration() {
         let runtime = IoRuntime::default();
         let destination = thread();
-        let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
+        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
             panic!("first resolution must reserve registration");
         };
         reservation.publish(&Context, &destination);
-        runtime.complete_driver::<Context>(thread::current().id(), DriverRole::Primary);
+        runtime
+            .complete_driver::<Context>(thread::current().id(), DriverRole::Primary)
+            .unwrap();
 
-        let Resolution::Register {
-            allowed_roles,
-            reservation,
-        } = runtime.resolve::<OtherContext>(&destination)
-        else {
+        let Resolution::Register(reservation) = runtime.resolve::<OtherContext>(&destination) else {
             panic!("second context must reserve registration");
         };
-        assert_eq!(allowed_roles, [DriverRole::Secondary]);
+        assert!(!reservation.primary_candidate);
         drop(reservation);
 
         assert!(runtime.is_registered::<Context>());
@@ -462,12 +438,19 @@ pub(crate) mod tests {
     fn completed_registration_accepts_the_published_role() {
         let runtime = IoRuntime::new(2);
         let destination = thread();
-        let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
+        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
             panic!("first resolution must reserve registration");
         };
         reservation.publish(&Context, &destination);
-        runtime.complete_driver::<Context>(thread::current().id(), DriverRole::Primary);
-        runtime.complete_driver::<Context>(std::thread::spawn(|| thread::current().id()).join().unwrap(), DriverRole::Primary);
+        runtime
+            .complete_driver::<Context>(thread::current().id(), DriverRole::Primary)
+            .unwrap();
+        runtime
+            .complete_driver::<Context>(
+                std::thread::spawn(|| thread::current().id()).join().unwrap(),
+                DriverRole::Primary,
+            )
+            .unwrap();
 
         assert!(runtime.is_ready::<Context>().unwrap());
     }
@@ -476,7 +459,7 @@ pub(crate) mod tests {
     fn concurrent_resolution_waits_for_publication() {
         let runtime = Arc::new(IoRuntime::default());
         let destination = thread();
-        let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
+        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
             panic!("first resolution must reserve registration");
         };
         let waiting_runtime = Arc::clone(&runtime);
@@ -516,5 +499,13 @@ pub(crate) mod tests {
     #[test]
     fn debug_reports_worker_count() {
         assert!(format!("{:?}", IoRuntime::new(3)).contains("worker_count: 3"));
+    }
+}
+
+fn allowed_roles(role: Option<DriverRole>, primary_candidate: bool) -> &'static [DriverRole] {
+    match role {
+        None if primary_candidate => PRIMARY_OR_SECONDARY,
+        Some(DriverRole::Primary) => PRIMARY_ROLE,
+        Some(DriverRole::Secondary) | None => SECONDARY_ROLE,
     }
 }

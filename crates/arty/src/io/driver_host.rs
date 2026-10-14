@@ -175,33 +175,20 @@ impl DriverHost {
             return Ok((context, false));
         }
 
-        match self.runtime.resolve::<C>(&self.thread) {
-            Resolution::Existing {
-                mut context,
-                allowed_roles,
-            } => {
-                let (driver, role) = self
-                    .initialize_driver::<C>(&mut context, &allowed_roles)
-                    .map_err(|error| self.fail(error))?;
-                self.insert_local::<C>(context.clone(), driver, role);
-                Ok((context, false))
-            }
-            Resolution::Register {
-                allowed_roles,
-                reservation,
-            } => {
+        let (mut context, allowed_roles, registered) = match self.runtime.resolve::<C>(&self.thread) {
+            Resolution::Existing { context, allowed_roles } => (context, allowed_roles, false),
+            Resolution::Register(reservation) => {
                 let mut context = C::context(options());
                 context.relocate(None, &self.thread);
-                reservation.publish(&context, &self.thread);
-                let initialization = self.initialize_driver::<C>(&mut context, &allowed_roles);
-                let (driver, role) = match initialization {
-                    Ok(initialization) => initialization,
-                    Err(error) => return Err(self.fail(error)),
-                };
-                self.insert_local::<C>(context.clone(), driver, role);
-                Ok((context, true))
+                let allowed_roles = reservation.publish(&context, &self.thread);
+                (context, allowed_roles, true)
             }
-        }
+        };
+        let (driver, role) = self
+            .initialize_driver::<C>(&mut context, allowed_roles)
+            .map_err(|error| self.fail(error))?;
+        self.insert_local::<C>(context.clone(), driver, role);
+        Ok((context, registered))
     }
 
     pub(crate) fn prepare<C>(&self)
@@ -217,7 +204,7 @@ impl DriverHost {
         let Some((mut context, allowed_roles)) = self.runtime.prepared::<C>(&self.thread) else {
             return;
         };
-        match self.initialize_driver::<C>(&mut context, &allowed_roles) {
+        match self.initialize_driver::<C>(&mut context, allowed_roles) {
             Ok((driver, role)) => self.insert_local::<C>(context, driver, role),
             Err(error) => {
                 self.fail(error);
@@ -282,7 +269,17 @@ impl DriverHost {
             Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
             return Err(error);
         }
-        self.runtime.complete_driver::<C>(thread::current().id(), role);
+        if let Err(error) = self.runtime.complete_driver::<C>(thread::current().id(), role) {
+            emit!(
+                &self.sink,
+                IoDriverInitializationFailed {
+                    context: IoContextName(type_name::<C>()),
+                    error: IoDriverErrorMessage::new(&error),
+                }
+            );
+            Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
+            return Err(error);
+        }
         if role == DriverRole::Primary {
             self.signal.set_primary_waker(driver.waker());
         }
