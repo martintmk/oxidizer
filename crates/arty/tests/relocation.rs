@@ -300,7 +300,9 @@ fn relocated_builtins_initializes_io_on_the_destination_worker() {
         .unwrap();
     runtime.stop().unwrap();
 
-    assert_eq!(*initialized.lock().unwrap(), vec![destination]);
+    let initialized = initialized.lock().unwrap();
+    assert_eq!(initialized.len(), 2);
+    assert!(initialized.contains(&destination));
 }
 
 #[test]

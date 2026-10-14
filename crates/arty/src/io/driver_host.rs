@@ -238,10 +238,7 @@ impl DriverHost {
                 let initialization = self.initialize_driver::<C>(&mut context, &allowed_roles);
                 let (driver, role) = match initialization {
                     Ok(initialization) => initialization,
-                    Err(error) => {
-                        self.runtime.abort_registration::<C>();
-                        return Err(self.fail(error));
-                    }
+                    Err(error) => return Err(self.fail(error)),
                 };
                 self.insert_local::<C>(context.clone(), driver, role);
                 Ok((context, true))

@@ -302,25 +302,6 @@ impl IoRuntime {
         Ok(registration.initialized_workers.len() == self.worker_count)
     }
 
-    pub(crate) fn abort_registration<C>(&self)
-    where
-        C: IoContext,
-    {
-        let context_type = TypeId::of::<C>();
-        let mut registry = self.registry();
-        let Some(registration) = registry.registrations.remove(&context_type) else {
-            return;
-        };
-        if registration.reserved_primary && registry.primary_reservation == Some(context_type) {
-            registry.primary_reservation = None;
-        }
-        if registry.primary == Some(context_type) {
-            registry.primary = None;
-        }
-        drop(registry);
-        self.registration_changed.notify_all();
-    }
-
     pub(crate) fn record_failure(&self, error: DriverError) -> Arc<DriverError> {
         let mut failure = self.failure.lock();
         let error = Arc::clone(failure.get_or_insert_with(|| Arc::new(error)));

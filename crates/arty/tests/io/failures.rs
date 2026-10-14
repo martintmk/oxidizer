@@ -170,8 +170,8 @@ fn concurrent_worker_initialization_failure_is_reported_consistently() {
     let runtime = runtime(CONCURRENT_WORKERS);
     let workers = worker_schedulers(&runtime, CONCURRENT_WORKERS);
     let scenario = Scenario::options(RolePlan::PreferPrimary);
-    scenario.block_driver_at.store(2, Ordering::SeqCst);
-    scenario.fail_driver_at.store(3, Ordering::SeqCst);
+    scenario.block_driver_at.store(3, Ordering::SeqCst);
+    scenario.fail_driver_at.store(2, Ordering::SeqCst);
 
     let (outcome_tx, outcome_rx) = mpsc::channel();
     let blocked_initialization = workers[0].spawn({
@@ -185,12 +185,12 @@ fn concurrent_worker_initialization_failure_is_reported_consistently() {
         }
     });
     scenario.wait_until_driver_blocked();
-    scenario.release_driver();
 
     assert_eq!(
         outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
         "driver construction failed"
     );
+    scenario.release_driver();
     let _ = blocked_initialization.join();
     assert_eq!(runtime.stop().unwrap_err().to_string(), "driver construction failed");
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 2);

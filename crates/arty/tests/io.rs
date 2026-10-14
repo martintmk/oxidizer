@@ -375,6 +375,10 @@ impl<M: Marker> IoContext for TestContext<M> {
         let attempt = self.scenario.driver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         self.scenario.block_driver_if_configured(attempt);
         if self.scenario.fail_driver_at.load(Ordering::SeqCst) == attempt {
+            let blocked_attempt = self.scenario.block_driver_at.load(Ordering::SeqCst);
+            if blocked_attempt != 0 && blocked_attempt != attempt {
+                self.scenario.wait_until_driver_blocked();
+            }
             return Err(DriverError::from_message(*self.scenario.driver_failure_message.lock().unwrap()));
         }
 
