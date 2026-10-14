@@ -194,7 +194,7 @@ where
         let can_suspend = matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted;
         let max_wait = if can_suspend { SUSPEND_SLEEP_DURATION } else { Duration::ZERO };
         let cycle_started = Instant::now();
-        if DriverHost::drivers_active() && DriverHost::execute_current(max_wait).is_err() {
+        if DriverHost::execute_current(max_wait).is_err() {
             self.begin_shutdown();
             return ControlFlow::Continue(());
         }

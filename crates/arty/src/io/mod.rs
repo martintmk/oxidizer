@@ -178,13 +178,11 @@ impl Io {
 
         if DriverHost::is_current(&self.runtime, &self.thread) {
             let destination = self.thread.clone();
-            let Some(result) = DriverHost::try_context_current(&self.runtime, &self.thread, || {
+            let result = DriverHost::try_context_current(&self.runtime, &self.thread, || {
                 let mut options = options.clone();
                 options.relocate(None, &destination);
                 options
-            }) else {
-                return Err(Error::io_outside_worker());
-            };
+            });
             let result = result?;
             return self.finish_context(result);
         }
@@ -233,7 +231,7 @@ impl Io {
         C: arty_io_core::IoContext,
         C::ContextOptions: Clone + ThreadAware,
     {
-        let result = DriverHost::try_context_current(&self.runtime, &self.thread, options).ok_or_else(Error::io_outside_worker)??;
+        let result = DriverHost::try_context_current(&self.runtime, &self.thread, options)?;
         self.finish_context(result)
     }
 

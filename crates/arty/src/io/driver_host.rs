@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::any::{Any, TypeId, type_name};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -26,7 +26,6 @@ use crate::runtime::{Error, WorkerSignal};
 
 thread_local! {
     static CURRENT: RefCell<Option<Rc<DriverHost>>> = const { RefCell::new(None) };
-    static DRIVERS_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 trait ErasedDriver {
@@ -63,7 +62,7 @@ impl Drop for LocalInitialization<'_> {
 
 struct LocalContext {
     context: Box<dyn Any>,
-    driver: Option<Box<dyn ErasedDriver>>,
+    driver: Box<dyn ErasedDriver>,
     role: DriverRole,
     context_name: &'static str,
 }
@@ -110,17 +109,16 @@ impl DriverHost {
         runtime: &Arc<IoRuntime>,
         thread: &Thread,
         options: impl FnOnce() -> C::ContextOptions,
-    ) -> Option<Result<(C, bool), Error>>
+    ) -> Result<(C, bool), Error>
     where
         C: IoContext,
         C::ContextOptions: Clone,
     {
         CURRENT.with_borrow(|current| {
-            let host = current.as_ref()?;
-            if !Arc::ptr_eq(&host.runtime, runtime) || host.thread != *thread {
-                return None;
-            }
-            Some(host.try_context(options))
+            let host = current.as_ref().ok_or_else(Error::io_outside_worker)?;
+            debug_assert!(Arc::ptr_eq(&host.runtime, runtime));
+            debug_assert_eq!(host.thread, *thread);
+            host.try_context(options)
         })
     }
 
@@ -137,12 +135,11 @@ impl DriverHost {
         C: IoContext,
     {
         CURRENT.with_borrow(|current| {
-            let Some(host) = current.as_ref() else {
-                return;
-            };
-            if !Arc::ptr_eq(&host.runtime, runtime) || host.thread != *thread {
-                return;
-            }
+            let host = current
+                .as_ref()
+                .expect("I/O initialization commands run only on active runtime workers");
+            debug_assert!(Arc::ptr_eq(&host.runtime, runtime));
+            debug_assert_eq!(host.thread, *thread);
             host.prepare::<C>();
         });
     }
@@ -161,26 +158,19 @@ impl DriverHost {
     {
         CURRENT.with_borrow(|current| {
             let host = current.as_ref().ok_or_else(Error::io_outside_worker)?;
-            if !Arc::ptr_eq(&host.runtime, runtime) || host.thread != *thread {
-                return Err(Error::io_outside_worker());
-            }
+            debug_assert!(Arc::ptr_eq(&host.runtime, runtime));
+            debug_assert_eq!(host.thread, *thread);
             host.wait_until_ready::<C>()
         })
     }
 
     pub(crate) fn execute_current(max_wait: Duration) -> Result<(), ()> {
         CURRENT.with_borrow(|current| {
-            let Some(host) = current.as_ref() else {
-                return Ok(());
-            };
+            let Some(host) = current.as_ref() else { return Ok(()) };
             host.execute_cycle(max_wait).map_err(|error| {
                 host.fail(error);
             })
         })
-    }
-
-    pub(crate) fn drivers_active() -> bool {
-        DRIVERS_ACTIVE.get()
     }
 
     pub(crate) fn shutdown_current() {
@@ -256,9 +246,10 @@ impl DriverHost {
         if self.contexts.borrow().contains_key(&TypeId::of::<C>()) {
             return;
         }
-        let Some((mut context, allowed_roles)) = self.runtime.prepared::<C>(&self.thread) else {
-            return;
-        };
+        let (mut context, allowed_roles) = self
+            .runtime
+            .prepared::<C>(&self.thread)
+            .expect("I/O initialization is dispatched only after registration is published");
         match self.initialize_driver::<C>(&mut context, &allowed_roles) {
             Ok((driver, role)) => self.insert_local::<C>(context, driver, role),
             Err(error) => {
@@ -287,7 +278,7 @@ impl DriverHost {
             match self.command_rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(command) => command(),
                 Err(error) if error.is_timeout() => {}
-                Err(_) => return Err(self.runtime.failure().unwrap_or_else(Error::runtime_shutting_down)),
+                Err(error) => panic!("I/O command channel closed while its dispatcher is retained: {error}"),
             }
         }
     }
@@ -336,7 +327,6 @@ impl DriverHost {
         if role == DriverRole::Primary {
             self.signal.set_primary_waker(driver.waker());
         }
-        DRIVERS_ACTIVE.set(true);
         emit!(
             &self.sink,
             IoDriverInitialized {
@@ -358,7 +348,7 @@ impl DriverHost {
                     TypeId::of::<C>(),
                     LocalContext {
                         context: Box::new(context),
-                        driver: Some(driver),
+                        driver,
                         role,
                         context_name: type_name::<C>(),
                     },
@@ -391,10 +381,7 @@ impl DriverHost {
     }
 
     fn execute_driver(local: &mut LocalContext, max_wait: Duration, sink: &Sink) -> Result<(), DriverError> {
-        let Some(driver) = local.driver.as_mut() else {
-            return Ok(());
-        };
-        driver.execute_cycle(&mut Cycle::new(max_wait)).inspect_err(|error| {
+        local.driver.execute_cycle(&mut Cycle::new(max_wait)).inspect_err(|error| {
             emit!(
                 sink,
                 IoDriverCycleFailed {
@@ -423,23 +410,19 @@ impl DriverHost {
     }
 
     fn shutdown(&self) {
-        DRIVERS_ACTIVE.set(false);
         self.signal.clear_primary_waker();
 
         let mut primary = None;
         let mut secondaries = Vec::new();
-        for (_, mut local) in self.contexts.borrow_mut().drain() {
-            let Some(driver) = local.driver.take() else {
-                continue;
-            };
+        for (_, local) in self.contexts.borrow_mut().drain() {
             match local.role {
                 DriverRole::Primary => {
                     assert!(
-                        primary.replace((driver, local.context_name)).is_none(),
+                        primary.replace((local.driver, local.context_name)).is_none(),
                         "a worker has at most one primary I/O driver"
                     );
                 }
-                DriverRole::Secondary => secondaries.push((driver, local.context_name)),
+                DriverRole::Secondary => secondaries.push((local.driver, local.context_name)),
             }
         }
 
