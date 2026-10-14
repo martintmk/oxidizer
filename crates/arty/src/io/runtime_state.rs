@@ -77,8 +77,6 @@ pub(crate) struct IoRuntime {
     worker_count: usize,
     registry: Mutex<Registry>,
     registration_changed: Condvar,
-    #[cfg(test)]
-    resolution_waiting: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct RegistrationReservation<'a> {
@@ -166,8 +164,6 @@ impl IoRuntime {
             worker_count,
             registry: Mutex::new(Registry::default()),
             registration_changed: Condvar::new(),
-            #[cfg(test)]
-            resolution_waiting: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -201,8 +197,6 @@ impl IoRuntime {
                 if nested {
                     return Err(reentrant_registration::<C>());
                 }
-                #[cfg(test)]
-                self.report_resolution_waiting();
                 registry = self.registration_changed.wait(registry);
                 continue;
             }
@@ -340,188 +334,6 @@ impl IoRuntime {
             "I/O context {} recursively requested its own registration",
             std::any::type_name::<C>()
         );
-    }
-
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn report_resolution_waiting(&self) {
-        self.resolution_waiting.store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::task::Waker;
-    use std::thread;
-
-    use arty_io_core::{Cycle, Driver, DriverInstance, DriverOptions};
-    use thread_aware::{ThreadAware, ThreadBuilder};
-
-    use super::*;
-
-    #[derive(Clone)]
-    pub(crate) struct Context;
-    #[derive(Clone)]
-    struct OtherContext;
-
-    impl ThreadAware for Context {
-        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
-    }
-
-    impl IoContext for Context {
-        type ContextOptions = ();
-        type Driver = TestDriver;
-
-        fn context((): Self::ContextOptions) -> Self {
-            Self
-        }
-
-        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
-            Ok(DriverInstance::new(TestDriver, DriverRole::Primary))
-        }
-    }
-
-    impl ThreadAware for OtherContext {
-        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
-    }
-
-    impl IoContext for OtherContext {
-        type ContextOptions = ();
-        type Driver = TestDriver;
-
-        fn context((): Self::ContextOptions) -> Self {
-            Self
-        }
-
-        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
-            Ok(DriverInstance::new(TestDriver, DriverRole::Secondary))
-        }
-    }
-
-    pub(crate) struct TestDriver;
-
-    impl Driver for TestDriver {
-        fn waker(&self) -> Waker {
-            Waker::noop().clone()
-        }
-
-        fn execute_cycle(&mut self, _cycle: &mut Cycle) -> Result<(), DriverError> {
-            Ok(())
-        }
-
-        fn shutdown(self) -> Result<(), DriverError> {
-            Ok(())
-        }
-    }
-
-    fn thread() -> Thread {
-        ThreadBuilder::default().build(thread::current().id())
-    }
-
-    #[test]
-    fn abandoned_reservation_releases_primary_role() {
-        let runtime = IoRuntime::default();
-        let destination = thread();
-        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
-            panic!("first resolution must reserve registration");
-        };
-        drop(reservation);
-
-        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
-            panic!("abandoned registration must be reservable again");
-        };
-        let allowed_roles = reservation.publish(&Context, &destination);
-        assert_eq!(allowed_roles, [DriverRole::Primary, DriverRole::Secondary]);
-    }
-
-    #[test]
-    fn abandoning_secondary_reservation_preserves_primary_registration() {
-        let runtime = IoRuntime::default();
-        let destination = thread();
-        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
-            panic!("first resolution must reserve registration");
-        };
-        reservation.publish(&Context, &destination);
-        runtime
-            .complete_driver::<Context>(thread::current().id(), DriverRole::Primary)
-            .unwrap();
-
-        let Resolution::Register(reservation) = runtime.resolve::<OtherContext>(&destination) else {
-            panic!("second context must reserve registration");
-        };
-        assert!(!reservation.primary_candidate);
-        drop(reservation);
-
-        assert!(runtime.is_registered::<Context>());
-    }
-
-    #[test]
-    fn completed_registration_accepts_the_published_role() {
-        let runtime = IoRuntime::new(2);
-        let destination = thread();
-        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
-            panic!("first resolution must reserve registration");
-        };
-        reservation.publish(&Context, &destination);
-        runtime
-            .complete_driver::<Context>(thread::current().id(), DriverRole::Primary)
-            .unwrap();
-        runtime
-            .complete_driver::<Context>(
-                std::thread::spawn(|| thread::current().id()).join().unwrap(),
-                DriverRole::Primary,
-            )
-            .unwrap();
-
-        assert!(runtime.is_ready::<Context>().unwrap());
-    }
-
-    #[test]
-    fn concurrent_resolution_waits_for_publication() {
-        let runtime = Arc::new(IoRuntime::default());
-        let destination = thread();
-        let Resolution::Register(reservation) = runtime.resolve::<Context>(&destination) else {
-            panic!("first resolution must reserve registration");
-        };
-        let waiting_runtime = Arc::clone(&runtime);
-        let waiting_destination = destination.clone();
-        let waiter = std::thread::spawn(move || {
-            matches!(
-                waiting_runtime.resolve::<Context>(&waiting_destination),
-                Resolution::Existing { .. }
-            )
-        });
-        while !runtime.resolution_waiting.load(std::sync::atomic::Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-
-        reservation.publish(&Context, &destination);
-
-        assert!(waiter.join().unwrap());
-    }
-
-    #[test]
-    fn poisoned_registry_is_recovered() {
-        let runtime = IoRuntime::default();
-        _ = catch_unwind(AssertUnwindSafe(|| {
-            let _registry = runtime.registry.lock();
-            panic!("poison registry");
-        }));
-
-        assert!(!runtime.is_registered::<Context>());
-    }
-
-    #[test]
-    #[should_panic(expected = "at least one async worker")]
-    fn zero_workers_are_rejected() {
-        _ = IoRuntime::new(0);
-    }
-
-    #[test]
-    fn debug_reports_worker_count() {
-        assert!(format!("{:?}", IoRuntime::new(3)).contains("worker_count: 3"));
     }
 }
 

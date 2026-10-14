@@ -300,12 +300,50 @@ mod tests {
     use std::task;
     use std::task::Poll;
 
+    use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
     use testing_aids::TEST_TIMEOUT;
+    use thread_aware::ThreadAware;
 
     use super::*;
     use crate::runtime::blocking_worker::BlockingPool;
     use crate::runtime::dispatch::test_threads;
     use crate::runtime::thread::waiter::MockWaitForShutdown;
+
+    #[derive(Clone)]
+    struct TestIoContext;
+
+    impl ThreadAware for TestIoContext {
+        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+    }
+
+    impl IoContext for TestIoContext {
+        type ContextOptions = ();
+        type Driver = TestDriver;
+
+        fn context((): Self::ContextOptions) -> Self {
+            Self
+        }
+
+        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+            Ok(DriverInstance::new(TestDriver, DriverRole::Primary))
+        }
+    }
+
+    struct TestDriver;
+
+    impl Driver for TestDriver {
+        fn waker(&self) -> Waker {
+            Waker::noop().clone()
+        }
+
+        fn execute_cycle(&mut self, _cycle: &mut Cycle) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        fn shutdown(self) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
 
     #[cfg_attr(test, mutants::skip)]
     fn endpoint(tx: channel::Sender<AsyncWorkerCommand>, thread: &Thread) -> WorkerEndpoint {
@@ -328,9 +366,9 @@ mod tests {
             observed::Sink::noop(),
         );
 
-        assert!(!dispatcher.prepare_io_everywhere::<crate::io::TestIoContext>());
+        assert!(!dispatcher.prepare_io_everywhere::<TestIoContext>());
         dispatcher.stop();
-        assert!(!dispatcher.prepare_io_everywhere::<crate::io::TestIoContext>());
+        assert!(!dispatcher.prepare_io_everywhere::<TestIoContext>());
         assert!(!dispatcher.access_io(WorkerIndex(0), Box::new(|_| {})));
     }
 

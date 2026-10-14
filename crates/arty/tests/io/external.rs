@@ -56,6 +56,7 @@ fn stopped_runtime_is_reported_before_external_io_dispatch() {
     assert_eq!(error.to_string(), "the runtime is shutting down");
     assert!(format!("{:?}", builtins.io()).contains("Io"));
 }
+
 #[test]
 fn concurrent_external_access_registers_one_context_and_driver() {
     let runtime = runtime(1);

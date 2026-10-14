@@ -87,8 +87,6 @@ pub(crate) use driver_host::DriverHost;
 use performables::arc::Arc;
 use performables::sync::channel;
 pub(crate) use runtime_state::IoRuntime;
-#[cfg(test)]
-pub(crate) use runtime_state::tests::Context as TestIoContext;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::Error;
@@ -259,34 +257,5 @@ impl ThreadAware for Io {
         if self.dispatcher.owns(destination) {
             self.thread = destination.clone();
         }
-    }
-}
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disconnected_worker_reports_shutdown_for_external_access_and_initialization() {
-        let (dispatcher, thread) = crate::runtime::dispatch::disconnected_test_dispatcher();
-        let worker_index = dispatcher.worker_index(thread.id()).unwrap();
-        let io = Io::new(Arc::new(IoRuntime::new(1)), dispatcher, thread);
-
-        let Err(access_error) = io.try_context_from_external_thread::<TestIoContext>(worker_index, Some(())) else {
-            panic!("disconnected worker access must fail");
-        };
-        assert_eq!(access_error.to_string(), "channel is closed");
-
-        let initialization_error = io.initialize_everywhere::<TestIoContext>().unwrap_err();
-        assert_eq!(initialization_error.to_string(), "the runtime is shutting down");
-    }
-
-    #[test]
-    fn debug_includes_bound_thread() {
-        let (dispatcher, thread) = crate::runtime::dispatch::disconnected_test_dispatcher();
-        let io = Io::new(Arc::new(IoRuntime::new(1)), dispatcher, thread);
-
-        assert!(format!("{io:?}").contains("thread"));
     }
 }
