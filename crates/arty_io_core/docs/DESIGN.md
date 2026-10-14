@@ -26,13 +26,20 @@ The runtime identifies a registration by the concrete `IoContext` type. The
 first retrieval performs these steps:
 
 1. Call `IoContext::context` once.
-2. Clone and relocate the context to every async worker.
-3. Call `IoContext::driver` on each async worker.
-4. Publish the context only after every worker has created its driver.
+2. Store that initial context as a thread-neutral registration value.
+3. Clone the registered context and relocate it from no source thread to the
+   requesting async worker.
+4. Call `IoContext::driver` on that worker.
+
+Other workers repeat steps 3 and 4 when they first retrieve the context.
 
 Later retrievals return a clone of the existing context. The runtime does not
 register the same concrete context type twice. Libraries that need two
 independent registrations use two distinct context types.
+
+`IoContext::context` runs while the neutral context registry is locked and must
+not retrieve another I/O context. Driver creation happens after the registry
+lock is released.
 
 `IoContext::driver` completes driver setup. There is no special initialization
 cycle. A driver must not wait for another async worker to run during creation.
@@ -46,11 +53,11 @@ Each context registration uses one driver role on every async worker:
 - A **primary** driver may wait inside `execute_cycle`.
 - A **secondary** driver must return from `execute_cycle` without waiting.
 
-The runtime passes the roles still available through
-`DriverOptions::allowed_roles`. The context selects one of them and returns it
-in `DriverInstance`. A registration must use the same role on every async
-worker. Once one registration uses the primary role, later registrations can
-only use the secondary role.
+The runtime atomically assigns the first context type requested from one runtime
+the primary role. It assigns every other context type the secondary role. The
+runtime passes the assigned role through `DriverOptions::allowed_roles`, and the
+context returns it in `DriverInstance` or rejects it as unsupported. A
+registration uses the same role on every async worker.
 
 An async worker invokes secondary drivers first with
 `Cycle::max_wait() == Duration::ZERO`. A secondary either processes completions

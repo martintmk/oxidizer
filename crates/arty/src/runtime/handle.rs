@@ -3,7 +3,6 @@
 
 use performables::arc::Arc;
 
-use crate::io::IoRuntime;
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::error::Error;
@@ -55,7 +54,6 @@ use crate::task::{RuntimeScheduler, Scheduler};
 #[derive(Debug)]
 pub struct Runtime {
     scheduler: RuntimeScheduler,
-    io_state: Arc<IoRuntime>,
     shutdown_on_drop: bool,
 }
 
@@ -185,13 +183,12 @@ impl Runtime {
             return Err(Error::shutdown_wait_from_blocking_callback());
         }
         self.scheduler.dispatcher.wait()?;
-        self.io_state.failure().map_or(Ok(()), Err)
+        self.scheduler.dispatcher.take_shutdown_error().map_or(Ok(()), Err)
     }
 
-    pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient, io_runtime: Arc<IoRuntime>) -> Self {
+    pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient) -> Self {
         Self {
             scheduler: RuntimeScheduler::new(dispatcher),
-            io_state: io_runtime,
             shutdown_on_drop: true,
         }
     }
@@ -231,7 +228,6 @@ mod tests {
         let worker = thread::spawn(|| panic!("worker shutdown failure"));
         let endpoint = WorkerEndpoint {
             command_tx: channel::unbounded().0,
-            io_command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: ThreadBuilder::default().build(worker.thread().id()),
             blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
@@ -241,7 +237,7 @@ mod tests {
             nonempty::NonEmpty::new(endpoint),
             Sink::noop(),
         )));
-        let runtime = Runtime::with_dispatcher(dispatcher, Arc::new(IoRuntime::default()));
+        let runtime = Runtime::with_dispatcher(dispatcher);
         assert!(runtime.stop().unwrap_err().to_string().contains("panicked"));
     }
 

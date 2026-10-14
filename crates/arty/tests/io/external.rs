@@ -34,7 +34,7 @@ fn builtins_clone_initializes_and_accesses_io_from_a_non_runtime_thread() {
     assert_ne!(external.0, worker);
     assert_eq!(external.1, worker);
     assert_eq!(external.2, worker);
-    assert_eq!(external.3, external.4);
+    assert_eq!(external.3 + 1, external.4);
     assert_eq!(scenario.context_constructions.load(Ordering::SeqCst), 1);
     assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(scenario.option_workers(), vec![worker]);
@@ -138,7 +138,7 @@ fn shutdown_during_external_initialization_unblocks_without_io_failure() {
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
 }
 #[test]
-fn external_context_panic_is_resumed_without_corrupting_runtime() {
+fn external_context_panic_unwinds_the_worker() {
     let runtime = runtime(1);
     let builtins = runtime.scheduler().block_on(async |builtins| builtins).unwrap();
     let scenario = Scenario::options(RolePlan::PreferPrimary);
@@ -146,17 +146,12 @@ fn external_context_panic_is_resumed_without_corrupting_runtime() {
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
         let _ = builtins.io().context::<TestContext<ExternalOptionsPanic>>(&scenario);
-    }))
-    .unwrap_err();
-    assert_eq!(*panic.downcast::<&'static str>().unwrap(), "external context panic");
-    assert_eq!(runtime.scheduler().block_on(async |_| 42).unwrap(), 42);
-
-    scenario.panic_context.store(false, Ordering::SeqCst);
-    let _ = builtins.io().context::<TestContext<ExternalOptionsPanic>>(&scenario);
-    runtime.stop().unwrap();
-    assert_eq!(scenario.context_constructions.load(Ordering::SeqCst), 2);
-    assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
+    }));
+    assert!(panic.is_err());
+    assert!(runtime.stop().unwrap_err().to_string().contains("panicked"));
+    assert_eq!(scenario.context_constructions.load(Ordering::SeqCst), 1);
+    assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 0);
 }
 #[test]
 fn queued_external_access_is_destroyed_when_shutdown_discards_it() {

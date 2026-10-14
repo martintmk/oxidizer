@@ -59,6 +59,10 @@ impl Error {
         Self::new(RuntimeValidation::IoOutsideWorker)
     }
 
+    pub(crate) fn nested_io_context() -> Self {
+        Self::new(RuntimeValidation::NestedIoContext)
+    }
+
     pub(crate) fn runtime_shutting_down() -> Self {
         Self::new(RuntimeValidation::RuntimeShuttingDown)
     }
@@ -111,6 +115,7 @@ pub(crate) enum RuntimeValidation {
     ShutdownWaitFromWorker,
     ShutdownWaitFromBlockingCallback,
     IoOutsideWorker,
+    NestedIoContext,
     RuntimeShuttingDown,
 }
 
@@ -123,6 +128,7 @@ impl Display for RuntimeValidation {
             Self::ShutdownWaitFromWorker => "an async Arty worker cannot wait for runtime shutdown",
             Self::ShutdownWaitFromBlockingCallback => "a runtime blocking callback cannot wait for its own shutdown",
             Self::IoOutsideWorker => "I/O context access cannot synchronously cross between Arty workers",
+            Self::NestedIoContext => "I/O context retrieval cannot be nested during initialization",
             Self::RuntimeShuttingDown => "the runtime is shutting down",
         })
     }

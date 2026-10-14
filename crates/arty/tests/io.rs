@@ -143,10 +143,7 @@ markers!(
     NestedExecutorAccess,
     TokioExternalAccess,
     SameRuntimeCrossWorker,
-    NestedOuter,
-    NestedInner,
     ConcurrentSameContext,
-    NestedOuterFailure,
     RecursiveContext,
     ConcurrentExternal,
     ConcurrentFirstFailure,
@@ -155,12 +152,7 @@ markers!(
     ConcurrentFailureA,
     ConcurrentFailureB,
     ReservedSecondary,
-    ConcurrentSecondary,
-    LaterPrimary,
     ShutdownWhileWaiting,
-    ReadinessPublication,
-    ReentrantCycleA,
-    ReentrantCycleB,
     ShutdownTaskCleanup,
 );
 
@@ -232,22 +224,8 @@ struct DriverGate {
 }
 
 enum ContextAction {
-    RegisterNested {
-        io: Io,
-        options: ScenarioOptions,
-    },
     RegisterSelf {
         io: Io,
-    },
-    RegisterCycleA {
-        io: Io,
-        options: ScenarioOptions,
-        barrier: Arc<Barrier>,
-    },
-    RegisterCycleB {
-        io: Io,
-        options: ScenarioOptions,
-        barrier: Arc<Barrier>,
     },
 }
 
@@ -360,20 +338,8 @@ impl Scenario {
         }
     }
 
-    fn register_nested_from_context(&self, io: Io, options: ScenarioOptions) {
-        *self.context_action.lock().unwrap() = Some(ContextAction::RegisterNested { io, options });
-    }
-
     fn register_self_from_context(&self, io: Io) {
         *self.context_action.lock().unwrap() = Some(ContextAction::RegisterSelf { io });
-    }
-
-    fn register_cycle_a_from_context(&self, io: Io, options: ScenarioOptions, barrier: Arc<Barrier>) {
-        *self.context_action.lock().unwrap() = Some(ContextAction::RegisterCycleA { io, options, barrier });
-    }
-
-    fn register_cycle_b_from_context(&self, io: Io, options: ScenarioOptions, barrier: Arc<Barrier>) {
-        *self.context_action.lock().unwrap() = Some(ContextAction::RegisterCycleB { io, options, barrier });
     }
 
     fn set_driver_failure_message(&self, message: &'static str) {
@@ -404,7 +370,8 @@ impl<M: Marker> fmt::Debug for TestContext<M> {
 }
 
 impl<M: Marker> ThreadAware for TestContext<M> {
-    fn relocate(&mut self, _source: Option<&Thread>, destination: &Thread) {
+    fn relocate(&mut self, source: Option<&Thread>, destination: &Thread) {
+        assert!(source.is_none(), "registered context clones relocate from a thread-neutral source");
         self.scenario.relocations.fetch_add(1, Ordering::SeqCst);
         self.thread = Some(destination.clone());
     }
@@ -419,19 +386,12 @@ impl<M: Marker> IoContext for TestContext<M> {
         assert!(!options.panic_context.load(Ordering::SeqCst), "external context panic");
         let action = options.context_action.lock().unwrap().take();
         match action {
-            Some(ContextAction::RegisterNested { io, options: nested }) => {
-                let _ = io.context::<TestContext<NestedInner>>(&nested);
-            }
             Some(ContextAction::RegisterSelf { io }) => {
-                let _ = io.context::<Self>(&options);
-            }
-            Some(ContextAction::RegisterCycleA { io, options, barrier }) => {
-                barrier.wait();
-                let _ = io.context::<TestContext<ReentrantCycleA>>(&options);
-            }
-            Some(ContextAction::RegisterCycleB { io, options, barrier }) => {
-                barrier.wait();
-                let _ = io.context::<TestContext<ReentrantCycleB>>(&options);
+                let error = io.try_context::<Self>(&options).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "I/O context retrieval cannot be nested during initialization"
+                );
             }
             None => {}
         }

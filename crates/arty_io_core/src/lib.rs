@@ -87,8 +87,9 @@
 //!
 //! # Runtime responsibilities
 //!
-//! The runtime clones and relocates contexts to its async workers and supplies the acceptable
-//! roles through [`DriverOptions`]. The context selects one role and returns it in a
+//! The runtime centrally stores the thread-neutral context returned by [`IoContext::context`],
+//! then clones and relocates it from no source thread to its async workers. It supplies the
+//! acceptable roles through [`DriverOptions`]. The context selects one role and returns it in a
 //! [`DriverInstance`]. Driver creation completes all setup; there is no special initialization
 //! cycle.
 //!

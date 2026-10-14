@@ -78,13 +78,22 @@ fn context_panics_after_requesting_shutdown_on_initialization_failure() {
 }
 
 #[test]
-fn worker_driver_construction_failure_prevents_context_publication() {
+fn worker_driver_construction_failure_stops_an_already_registered_context() {
     let runtime = runtime(WORKERS);
     let workers = worker_schedulers(&runtime, WORKERS);
     let scenario = Scenario::options(RolePlan::PreferPrimary);
     scenario.fail_driver_at.store(2, Ordering::SeqCst);
 
-    let error = workers[0]
+    workers[0]
+        .spawn({
+            let scenario = scenario.clone();
+            async move |builtins| {
+                let _ = builtins.io().context::<TestContext<LateConstructionFailure>>(&scenario);
+            }
+        })
+        .join()
+        .unwrap();
+    let error = workers[1]
         .spawn({
             let scenario = scenario.clone();
             async move |builtins| {
@@ -100,7 +109,7 @@ fn worker_driver_construction_failure_prevents_context_publication() {
 
     assert_eq!(error, "driver construction failed");
     assert_eq!(runtime.stop().unwrap_err().to_string(), "driver construction failed");
-    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), WORKERS);
 }
 #[test]
 fn shutdown_during_first_registration_is_not_reported_as_driver_failure() {
@@ -141,8 +150,20 @@ fn shutdown_during_late_initialization_is_observed_by_the_request() {
     let scenario = Scenario::options(RolePlan::PreferPrimary);
     scenario.block_driver_at.store(2, Ordering::SeqCst);
 
+    workers[0]
+        .spawn({
+            let scenario = scenario.clone();
+            async move |builtins| {
+                let _ = builtins
+                    .io()
+                    .context::<TestContext<ShutdownDuringLateInitialization>>(&scenario);
+            }
+        })
+        .join()
+        .unwrap();
+
     let (outcome_tx, outcome_rx) = mpsc::channel();
-    let initialization = workers[0].spawn({
+    let initialization = workers[1].spawn({
         let scenario = scenario.clone();
         async move |builtins| {
             let outcome = builtins
@@ -171,11 +192,31 @@ fn concurrent_worker_initialization_failure_is_reported_consistently() {
     let runtime = runtime(CONCURRENT_WORKERS);
     let workers = worker_schedulers(&runtime, CONCURRENT_WORKERS);
     let scenario = Scenario::options(RolePlan::PreferPrimary);
-    scenario.block_driver_at.store(3, Ordering::SeqCst);
-    scenario.fail_driver_at.store(2, Ordering::SeqCst);
+    scenario.block_driver_at.store(2, Ordering::SeqCst);
+    scenario.fail_driver_at.store(3, Ordering::SeqCst);
+
+    workers[0]
+        .spawn({
+            let scenario = scenario.clone();
+            async move |builtins| {
+                let _ = builtins.io().context::<TestContext<ConcurrentLateFailure>>(&scenario);
+            }
+        })
+        .join()
+        .unwrap();
 
     let (outcome_tx, outcome_rx) = mpsc::channel();
-    let blocked_initialization = workers[0].spawn({
+    let blocked_initialization = workers[1].spawn({
+        let scenario = scenario.clone();
+        async move |builtins| {
+            let _ = builtins
+                .io()
+                .try_context::<TestContext<ConcurrentLateFailure>>(&scenario);
+        }
+    });
+    scenario.wait_until_driver_blocked();
+
+    let failed_initialization = workers[2].spawn({
         let scenario = scenario.clone();
         async move |builtins| {
             let outcome = builtins
@@ -185,12 +226,12 @@ fn concurrent_worker_initialization_failure_is_reported_consistently() {
             outcome_tx.send(outcome).unwrap();
         }
     });
-    scenario.wait_until_driver_blocked();
 
     assert_eq!(
         outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
         "driver construction failed"
     );
+    let _ = failed_initialization.join();
     scenario.release_driver();
     let _ = blocked_initialization.join();
     assert_eq!(runtime.stop().unwrap_err().to_string(), "driver construction failed");
@@ -198,7 +239,7 @@ fn concurrent_worker_initialization_failure_is_reported_consistently() {
 }
 
 #[test]
-fn concurrent_failures_report_one_consistent_runtime_error() {
+fn concurrent_failures_preserve_the_first_shutdown_cause() {
     let runtime = runtime(WORKERS);
     let workers = worker_schedulers(&runtime, WORKERS);
     let first = Scenario::options(RolePlan::PreferPrimary);
@@ -236,14 +277,14 @@ fn concurrent_failures_report_one_consistent_runtime_error() {
     first.release_driver();
     assert_eq!(first_failure.join().unwrap(), "first environmental failure");
     second.release_driver();
-    assert_eq!(second_failure.join().unwrap(), "first environmental failure");
+    assert_eq!(second_failure.join().unwrap(), "second environmental failure");
     assert_eq!(runtime.stop().unwrap_err().to_string(), "first environmental failure");
     assert_eq!(first.driver_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(second.driver_attempts.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn shutdown_wakes_registration_waiters_after_eager_initialization() {
+fn shutdown_does_not_couple_independent_worker_initialization() {
     let runtime = runtime(WORKERS);
     let operations = RuntimeOperations::from(&runtime);
     let workers = worker_schedulers(&runtime, WORKERS);
@@ -287,7 +328,7 @@ fn shutdown_wakes_registration_waiters_after_eager_initialization() {
     );
     assert_eq!(
         second_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
-        "the runtime is shutting down"
+        "ok"
     );
     let _ = first.join();
     let _ = second.join();

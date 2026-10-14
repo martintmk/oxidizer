@@ -10,9 +10,9 @@ use nonempty::NonEmpty;
 use observed::emit;
 use performables::arc::Arc;
 use performables::sync::channel;
+use performables::sync::mutex::Mutex;
 use thread_aware::Thread;
 
-use crate::io::DriverHost;
 use crate::runtime::Error;
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::telemetry::events::{PlacementLabel, RuntimeStopped, RuntimeStopping, TaskSpawned};
@@ -25,7 +25,6 @@ use crate::task::join::JoinHandle;
 #[derive(Debug)]
 pub(in crate::runtime) struct WorkerEndpoint {
     pub(in crate::runtime) command_tx: channel::Sender<AsyncWorkerCommand>,
-    pub(in crate::runtime) io_command_tx: channel::Sender<crate::io::DriverCommand>,
     pub(in crate::runtime) waker: Waker,
     pub(in crate::runtime) thread: Thread,
     pub(in crate::runtime) blocking_worker: Arc<BlockingWorker>,
@@ -60,6 +59,7 @@ pub(in crate::runtime) struct DispatcherCore<WFS> {
     /// special-case logic in some situations that need special handling during shutdown.
     shutdown_started: Arc<AtomicBool>,
     stopped_reported: AtomicBool,
+    shutdown_error: Mutex<Option<Error>>,
 
     worker_endpoints: NonEmpty<WorkerEndpoint>,
 
@@ -106,6 +106,7 @@ impl<WFS> DispatcherCore<WFS> {
             wait_for_shutdown,
             shutdown_started,
             stopped_reported: AtomicBool::new(false),
+            shutdown_error: Mutex::new(None),
             worker_endpoints,
             worker_indices,
             next_async_worker_index: AtomicUsize::new(0),
@@ -116,6 +117,24 @@ impl<WFS> DispatcherCore<WFS> {
     /// Stops the runtime. Safe to call multiple times.
     #[cfg_attr(test, mutants::skip)] // Tests will hang if we mutate away the stop signal.
     pub(in crate::runtime) fn stop(&self) {
+        self.stop_inner();
+    }
+
+    pub(in crate::runtime) fn stop_with_error(&self, error: Error) {
+        let mut shutdown_error = match self.shutdown_error.lock_result() {
+            Ok(shutdown_error) => shutdown_error,
+            Err(poisoned) => {
+                let shutdown_error = poisoned.into_inner();
+                self.shutdown_error.clear_poison();
+                shutdown_error
+            }
+        };
+        _ = shutdown_error.get_or_insert(error);
+        drop(shutdown_error);
+        self.stop_inner();
+    }
+
+    fn stop_inner(&self) {
         // If we've already started shutting down, don't do it again.
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
@@ -130,6 +149,18 @@ impl<WFS> DispatcherCore<WFS> {
             _ = endpoint.command_tx.send(AsyncWorkerCommand::Shutdown);
             endpoint.waker.wake_by_ref();
         }
+    }
+
+    pub(in crate::runtime) fn take_shutdown_error(&self) -> Option<Error> {
+        let mut shutdown_error = match self.shutdown_error.lock_result() {
+            Ok(shutdown_error) => shutdown_error,
+            Err(poisoned) => {
+                let shutdown_error = poisoned.into_inner();
+                self.shutdown_error.clear_poison();
+                shutdown_error
+            }
+        };
+        shutdown_error.take()
     }
 
     #[expect(clippy::arithmetic_side_effects, reason = "impossible to divide by zero due to NonEmpty")]
@@ -161,24 +192,6 @@ impl<WFS> DispatcherCore<WFS> {
         (0..self.worker_endpoints.len())
             .map(|index| self.enqueue(WorkerIndex(index), "any", make_factory()))
             .collect()
-    }
-
-    pub(in crate::runtime) fn prepare_io_everywhere<C>(&self) -> bool
-    where
-        C: arty_io_core::IoContext,
-    {
-        if self.is_shutting_down() {
-            return false;
-        }
-
-        for endpoint in &self.worker_endpoints {
-            let send_result = endpoint.io_command_tx.send(DriverHost::prepare::<C>);
-            endpoint.waker.wake_by_ref();
-            if send_result.is_err() {
-                return false;
-            }
-        }
-        true
     }
 
     pub(in crate::runtime) fn access_io(&self, worker_index: WorkerIndex, access: Box<dyn FnOnce(&Builtins) + Send>) -> bool {
@@ -300,56 +313,17 @@ mod tests {
     use std::task;
     use std::task::Poll;
 
-    use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
     use testing_aids::TEST_TIMEOUT;
-    use thread_aware::ThreadAware;
 
     use super::*;
     use crate::runtime::blocking_worker::BlockingPool;
     use crate::runtime::dispatch::test_threads;
     use crate::runtime::thread::waiter::MockWaitForShutdown;
 
-    #[derive(Clone)]
-    struct TestIoContext;
-
-    impl ThreadAware for TestIoContext {
-        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
-    }
-
-    impl IoContext for TestIoContext {
-        type ContextOptions = ();
-        type Driver = TestDriver;
-
-        fn context((): Self::ContextOptions) -> Self {
-            Self
-        }
-
-        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
-            Ok(DriverInstance::new(TestDriver, DriverRole::Primary))
-        }
-    }
-
-    struct TestDriver;
-
-    impl Driver for TestDriver {
-        fn waker(&self) -> Waker {
-            Waker::noop().clone()
-        }
-
-        fn execute_cycle(&mut self, _cycle: &mut Cycle) -> Result<(), DriverError> {
-            Ok(())
-        }
-
-        fn shutdown(self) -> Result<(), DriverError> {
-            Ok(())
-        }
-    }
-
     #[cfg_attr(test, mutants::skip)]
     fn endpoint(tx: channel::Sender<AsyncWorkerCommand>, thread: &Thread) -> WorkerEndpoint {
         WorkerEndpoint {
             command_tx: tx,
-            io_command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: thread.clone(),
             blocking_worker: BlockingWorker::new(BlockingPool::new(None), observed::Sink::noop()),
@@ -357,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn io_dispatch_rejects_shutdown_and_closed_workers() {
+    fn io_access_rejects_shutdown_and_closed_workers() {
         let threads = test_threads(1);
         let (worker_tx, _worker_rx) = channel::unbounded();
         let dispatcher = DispatcherCore::new(
@@ -366,9 +340,7 @@ mod tests {
             observed::Sink::noop(),
         );
 
-        assert!(!dispatcher.prepare_io_everywhere::<TestIoContext>());
         dispatcher.stop();
-        assert!(!dispatcher.prepare_io_everywhere::<TestIoContext>());
         assert!(!dispatcher.access_io(WorkerIndex(0), Box::new(|_| {})));
     }
 

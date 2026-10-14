@@ -183,11 +183,6 @@ where
 
     fn execute_step(&mut self) -> ControlFlow<()> {
         let batch_exhausted = self.process_commands();
-        if !self.shutdown_signal.load(Ordering::Acquire)
-            && let Some(driver_host) = &self.driver_host
-        {
-            driver_host.process_commands();
-        }
 
         let cycle_outcome = self
             .executor

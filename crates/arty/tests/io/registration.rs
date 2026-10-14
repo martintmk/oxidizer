@@ -6,7 +6,7 @@
 use super::*;
 
 #[test]
-fn context_registration_initializes_every_worker_before_returning() {
+fn each_worker_initializes_its_driver_on_first_retrieval() {
     let runtime = runtime(WORKERS);
     let workers = worker_schedulers(&runtime, WORKERS);
     let scenario = Scenario::options(RolePlan::PreferPrimary);
@@ -22,13 +22,13 @@ fn context_registration_initializes_every_worker_before_returning() {
         first.thread.as_ref().unwrap().id(),
         workers[0].spawn(async |cx| cx.thread().id()).join().unwrap()
     );
-    assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), WORKERS);
-    assert_eq!(scenario.option_relocations.load(Ordering::SeqCst), 1);
+    assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(scenario.option_relocations.load(Ordering::SeqCst), 0);
 
     flush_workers(&workers);
     assert_eq!(scenario.context_constructions.load(Ordering::SeqCst), 1);
-    assert_eq!(scenario.relocations.load(Ordering::SeqCst), WORKERS);
-    assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), WORKERS);
+    assert_eq!(scenario.relocations.load(Ordering::SeqCst), 1);
+    assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), 1);
 
     workers[0]
         .spawn(async |builtins| {
@@ -131,7 +131,7 @@ fn waiting_registration_observes_another_workers_failure() {
     );
     assert_eq!(
         second_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
-        "driver construction failed"
+        "ok"
     );
     let _ = first.join();
     let _ = second.join();
@@ -176,96 +176,7 @@ fn concurrent_same_context_registration_constructs_options_once() {
 }
 
 #[test]
-fn registration_is_not_ready_before_the_final_worker_installs_its_waker() {
-    let _serial = serialize_invariant_test();
-    let runtime = runtime(WORKERS);
-    let workers = worker_schedulers(&runtime, WORKERS);
-    let scenario = Scenario::options(RolePlan::PreferPrimary);
-    scenario.block_waker_at.store(WORKERS, Ordering::SeqCst);
-    let (outcome_tx, outcome_rx) = mpsc::channel();
-
-    let registration = workers[0].spawn({
-        let scenario = scenario.clone();
-        async move |builtins| {
-            let outcome = builtins
-                .io()
-                .try_context::<TestContext<ReadinessPublication>>(&scenario)
-                .map_or_else(|error| error.to_string(), |_| "ready".to_owned());
-            outcome_tx.send(outcome).unwrap();
-        }
-    });
-    scenario.wait_until_driver_blocked();
-
-    assert!(matches!(
-        outcome_rx.recv_timeout(Duration::from_millis(50)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    ));
-    scenario.release_driver();
-    assert_eq!(outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(), "ready");
-    registration.join().unwrap();
-    runtime.stop().unwrap();
-}
-
-#[test]
-fn nested_context_registration_does_not_deadlock_or_duplicate_primary() {
-    let (result_tx, result_rx) = mpsc::channel();
-    let execution = thread::spawn(move || {
-        let runtime = runtime(1);
-        let outer = Scenario::options(RolePlan::PreferPrimary);
-        let inner = Scenario::options(RolePlan::PreferPrimary);
-        runtime
-            .scheduler()
-            .block_on({
-                let outer = outer.clone();
-                let inner = inner.clone();
-                async move |builtins| {
-                    outer.register_nested_from_context(builtins.io().clone(), inner);
-                    let _ = builtins.io().context::<TestContext<NestedOuter>>(&outer);
-                }
-            })
-            .unwrap();
-        runtime.stop().unwrap();
-        result_tx.send((outer.roles(), inner.roles())).unwrap();
-    });
-
-    let (outer_roles, inner_roles) = result_rx
-        .recv_timeout(testing_aids::TEST_TIMEOUT)
-        .expect("nested context registration must not deadlock");
-    execution.join().unwrap();
-    assert_eq!(outer_roles, vec![DriverRole::Primary]);
-    assert_eq!(inner_roles, vec![DriverRole::Secondary]);
-}
-#[test]
-fn nested_registration_is_cleaned_up_when_outer_initialization_fails() {
-    let runtime = runtime(1);
-    let outer = Scenario::options(RolePlan::PreferPrimary);
-    let inner = Scenario::options(RolePlan::PreferPrimary);
-    outer.fail_driver_at.store(1, Ordering::SeqCst);
-
-    let error = runtime
-        .scheduler()
-        .block_on({
-            let outer = outer.clone();
-            let inner = inner.clone();
-            async move |builtins| {
-                outer.register_nested_from_context(builtins.io().clone(), inner);
-                builtins
-                    .io()
-                    .try_context::<TestContext<NestedOuterFailure>>(&outer)
-                    .unwrap_err()
-                    .to_string()
-            }
-        })
-        .unwrap();
-
-    assert_eq!(error, "driver construction failed");
-    assert_eq!(inner.roles(), vec![DriverRole::Secondary]);
-    assert_eq!(runtime.stop().unwrap_err().to_string(), "driver construction failed");
-    assert_eq!(outer.shutdowns.load(Ordering::SeqCst), 0);
-    assert_eq!(inner.shutdowns.load(Ordering::SeqCst), 1);
-}
-#[test]
-fn recursive_same_context_registration_panics_without_corrupting_registry() {
+fn nested_context_retrieval_returns_an_error_without_corrupting_registry() {
     let runtime = runtime(1);
     let scenario = Scenario::options(RolePlan::PreferPrimary);
 
@@ -275,79 +186,15 @@ fn recursive_same_context_registration_panics_without_corrupting_registry() {
             let scenario = scenario.clone();
             async move |builtins| {
                 scenario.register_self_from_context(builtins.io().clone());
-                let panic = catch_unwind(AssertUnwindSafe(|| {
-                    let _ = builtins.io().context::<TestContext<RecursiveContext>>(&scenario);
-                }))
-                .unwrap_err();
-                assert!(
-                    panic
-                        .downcast_ref::<String>()
-                        .is_some_and(|message| message.contains("recursively requested its own registration"))
-                        || panic
-                            .downcast_ref::<&'static str>()
-                            .is_some_and(|message| message.contains("recursively requested its own registration"))
-                );
-
                 let _ = builtins.io().context::<TestContext<RecursiveContext>>(&scenario);
             }
         })
         .unwrap();
 
-    assert_eq!(scenario.context_constructions.load(Ordering::SeqCst), 2);
+    assert_eq!(scenario.context_constructions.load(Ordering::SeqCst), 1);
     assert_eq!(scenario.driver_attempts.load(Ordering::SeqCst), 1);
     runtime.stop().unwrap();
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn concurrent_cross_worker_nested_registration_fails_instead_of_deadlocking() {
-    let _serial = serialize_invariant_test();
-    let (result_tx, result_rx) = mpsc::channel();
-    let execution = thread::spawn(move || {
-        let runtime = runtime(WORKERS);
-        let workers = worker_schedulers(&runtime, WORKERS);
-        let first = Scenario::options(RolePlan::PreferPrimary);
-        let second = Scenario::options(RolePlan::PreferPrimary);
-        let barrier = Arc::new(Barrier::new(WORKERS));
-
-        let first_registration = workers[0].spawn({
-            let first = first.clone();
-            let second = second.clone();
-            let barrier = Arc::clone(&barrier);
-            async move |builtins| {
-                first.register_cycle_b_from_context(builtins.io().clone(), second, barrier);
-                builtins
-                    .io()
-                    .try_context::<TestContext<ReentrantCycleA>>(&first)
-                    .unwrap_err()
-                    .to_string()
-            }
-        });
-        let second_registration = workers[1].spawn({
-            async move |builtins| {
-                second.register_cycle_a_from_context(builtins.io().clone(), first, barrier);
-                builtins
-                    .io()
-                    .try_context::<TestContext<ReentrantCycleB>>(&second)
-                    .unwrap_err()
-                    .to_string()
-            }
-        });
-
-        let first_error = first_registration.join().unwrap();
-        let second_error = second_registration.join().unwrap();
-        let runtime_error = runtime.stop().unwrap_err().to_string();
-        result_tx.send((first_error, second_error, runtime_error)).unwrap();
-    });
-
-    let errors = result_rx
-        .recv_timeout(testing_aids::TEST_TIMEOUT)
-        .expect("cross-worker nested registration must terminate");
-    execution.join().unwrap();
-    let errors: [String; 3] = errors.into();
-    for error in errors {
-        assert!(error.contains("cannot wait for concurrent registration"));
-    }
 }
 
 #[test]
@@ -357,7 +204,16 @@ fn inconsistent_primary_role_on_another_worker_is_rejected() {
     let scenario = Scenario::options(RolePlan::Inconsistent);
     scenario.fail_shutdown.store(true, Ordering::SeqCst);
 
-    let error = workers[0]
+    workers[0]
+        .spawn({
+            let scenario = scenario.clone();
+            async move |builtins| {
+                let _ = builtins.io().context::<TestContext<InconsistentPrimary>>(&scenario);
+            }
+        })
+        .join()
+        .unwrap();
+    let error = workers[1]
         .spawn({
             let scenario = scenario.clone();
             async move |builtins| {
@@ -432,51 +288,27 @@ fn additional_drivers_are_secondary_on_every_worker() {
 }
 
 #[test]
-fn secondary_selection_releases_the_primary_reservation() {
-    let runtime = runtime(WORKERS);
-    let workers = worker_schedulers(&runtime, WORKERS);
-    let reserved = Scenario::options(RolePlan::Secondary);
-    let concurrent = Scenario::options(RolePlan::PreferPrimary);
-    let later = Scenario::options(RolePlan::PreferPrimary);
-    reserved.block_driver_at.store(1, Ordering::SeqCst);
+fn first_registration_cannot_decline_the_primary_role() {
+    let runtime = runtime(1);
+    let scenario = Scenario::options(RolePlan::Secondary);
 
-    let reserved_registration = workers[0].spawn({
-        let reserved = reserved.clone();
-        async move |builtins| {
-            let _ = builtins.io().context::<TestContext<ReservedSecondary>>(&reserved);
-        }
-    });
-    reserved.wait_until_driver_blocked();
-
-    let concurrent_registration = workers[1].spawn({
-        let concurrent = concurrent.clone();
-        async move |builtins| {
-            let _ = builtins.io().context::<TestContext<ConcurrentSecondary>>(&concurrent);
-        }
-    });
-    wait_until(|| concurrent.driver_attempts.load(Ordering::SeqCst) > 0);
-
-    reserved.release_driver();
-    reserved_registration.join().unwrap();
-    concurrent_registration.join().unwrap();
-    assert_eq!(reserved.roles(), vec![DriverRole::Secondary; WORKERS]);
-    assert_eq!(concurrent.roles(), vec![DriverRole::Secondary; WORKERS]);
-
-    workers[0]
-        .spawn({
-            let later = later.clone();
+    let error = runtime
+        .scheduler()
+        .block_on({
+            let scenario = scenario.clone();
             async move |builtins| {
-                let _ = builtins.io().context::<TestContext<LaterPrimary>>(&later);
+                builtins
+                    .io()
+                    .try_context::<TestContext<ReservedSecondary>>(&scenario)
+                    .unwrap_err()
+                    .to_string()
             }
         })
-        .join()
         .unwrap();
-    assert_eq!(later.roles(), vec![DriverRole::Primary; WORKERS]);
 
-    runtime.stop().unwrap();
-    assert_eq!(reserved.shutdowns.load(Ordering::SeqCst), WORKERS);
-    assert_eq!(concurrent.shutdowns.load(Ordering::SeqCst), WORKERS);
-    assert_eq!(later.shutdowns.load(Ordering::SeqCst), WORKERS);
+    assert!(error.contains("disallowed role Secondary"));
+    assert!(runtime.stop().unwrap_err().to_string().contains("disallowed role Secondary"));
+    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
 }
 
 fn race_primary_registration_once() {
