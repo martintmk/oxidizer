@@ -80,6 +80,8 @@ pub(crate) struct DriverHost {
 }
 
 impl fmt::Debug for DriverHost {
+    #[cfg_attr(coverage_nightly, coverage(off))] // Opaque diagnostic formatting only.
+    #[cfg_attr(test, mutants::skip)] // Debug formatting has no behavioral contract.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DriverHost").field("thread", &self.thread).finish_non_exhaustive()
     }
