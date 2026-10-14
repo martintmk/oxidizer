@@ -206,8 +206,9 @@ where
         let max_wait = if can_suspend { SUSPEND_SLEEP_DURATION } else { Duration::ZERO };
         let cycle_started = Instant::now();
         let driver_failed = self
-            .driver_host
+            .thread_state
             .as_ref()
+            .and(self.driver_host.as_ref())
             .is_some_and(|driver_host| driver_host.execute_cycle(max_wait).is_err());
         if driver_failed {
             self.begin_shutdown();

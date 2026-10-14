@@ -29,6 +29,7 @@ where
 
     assert_eq!(runtime.stop().unwrap_err().to_string(), "normal driver cycle failed");
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(event_count(&processor, "arty.rt.io.driver.cycle_failed"), 1);
     let events = processor.events();
     let event = events
         .iter()
@@ -70,6 +71,7 @@ fn cycle_failure_remains_primary_when_driver_shutdown_also_fails() {
 
     assert_eq!(runtime.stop().unwrap_err().to_string(), "normal driver cycle failed");
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(event_count(&processor, "arty.rt.io.driver.cycle_failed"), 1);
     assert_eq!(event_count(&processor, "arty.rt.io.driver.shutdown_failed"), 1);
 }
 #[test]
