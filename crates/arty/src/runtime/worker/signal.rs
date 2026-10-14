@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::{Arc as StdArc, OnceLock};
+use std::sync::Arc as StdArc;
 use std::task::{Wake, Waker};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use performables::sync::mutex::Mutex;
 pub(crate) struct WorkerSignal {
     notified: Mutex<bool>,
     ready: Condvar,
-    primary_waker: OnceLock<Waker>,
+    primary_waker: Mutex<Option<Waker>>,
 }
 
 fn should_finish_wait(timed_out: bool, elapsed: Duration, timeout: Duration) -> bool {
@@ -81,14 +81,20 @@ impl WorkerSignal {
     }
 
     pub(crate) fn set_primary_waker(&self, waker: Waker) {
-        self.primary_waker
-            .set(waker)
-            .expect("a worker initializes at most one primary I/O driver");
+        let mut primary_waker = self.primary_waker.lock();
+        assert!(
+            primary_waker.replace(waker).is_none(),
+            "a worker initializes at most one primary I/O driver"
+        );
+    }
+
+    pub(crate) fn clear_primary_waker(&self) {
+        *self.primary_waker.lock() = None;
     }
 
     fn notify(&self) {
         *self.notified.lock() = true;
-        if let Some(primary_waker) = self.primary_waker.get() {
+        if let Some(primary_waker) = self.primary_waker.lock().as_ref() {
             primary_waker.wake_by_ref();
         }
         self.wake_waiter();

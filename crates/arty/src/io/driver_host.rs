@@ -424,6 +424,7 @@ impl DriverHost {
 
     fn shutdown(&self) {
         DRIVERS_ACTIVE.set(false);
+        self.signal.clear_primary_waker();
 
         let mut primary = None;
         let mut secondaries = Vec::new();
