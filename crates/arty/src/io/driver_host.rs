@@ -237,7 +237,7 @@ impl DriverHost {
     where
         C: IoContext,
     {
-        if self.runtime.failure().is_some() || self.dispatcher.is_shutting_down() {
+        if self.dispatcher.is_shutting_down() {
             return;
         }
         if self.contexts.borrow().contains_key(&TypeId::of::<C>()) {

@@ -120,6 +120,7 @@ impl Wake for WorkerSignal {
 #[cfg_attr(coverage_nightly, coverage(off))] // Test scaffolding is not runtime behavior.
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread;
 
@@ -145,6 +146,29 @@ mod tests {
     fn remote_wake_releases_a_waiter() {
         if is_mutation_testing() {
             return;
+        }
+
+        #[test]
+        fn clearing_primary_waker_releases_its_state() {
+            struct TrackedWake(Arc<AtomicBool>);
+
+            impl Drop for TrackedWake {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            impl Wake for TrackedWake {
+                fn wake(self: StdArc<Self>) {}
+            }
+
+            let signal = WorkerSignal::default();
+            let dropped = Arc::new(AtomicBool::new(false));
+            signal.set_primary_waker(Waker::from(Arc::into_std_arc(Arc::new(TrackedWake(Arc::clone(&dropped))))));
+
+            signal.clear_primary_waker();
+
+            assert!(dropped.load(Ordering::SeqCst));
         }
         let signal = Arc::new(WorkerSignal::default());
         let (ready_tx, ready_rx) = mpsc::channel();
