@@ -178,7 +178,7 @@ impl IoRuntime {
         self.registry().registrations.contains_key(&TypeId::of::<C>())
     }
 
-    pub(crate) fn resolve<C>(&self, destination: &Thread) -> Resolution<'_, C>
+    pub(crate) fn resolve<C>(&self, destination: &Thread, nested: bool) -> Result<Resolution<'_, C>, DriverError>
     where
         C: IoContext,
     {
@@ -187,13 +187,19 @@ impl IoRuntime {
         let mut registry = self.registry();
         loop {
             if let Some(registration) = registry.registrations.get(&context_type) {
+                if nested && registration.initialized_workers.len() != self.worker_count {
+                    return Err(reentrant_registration::<C>());
+                }
                 let (context, allowed_roles) = registration.prepare(destination);
-                return Resolution::Existing { context, allowed_roles };
+                return Ok(Resolution::Existing { context, allowed_roles });
             }
             if let Some(constructing_thread) = registry.constructing.get(&context_type) {
                 if *constructing_thread == current_thread {
                     drop(registry);
                     Self::recursive_registration::<C>();
+                }
+                if nested {
+                    return Err(reentrant_registration::<C>());
                 }
                 #[cfg(test)]
                 self.report_resolution_waiting();
@@ -206,12 +212,12 @@ impl IoRuntime {
                 registry.primary = Some(context_type);
             }
             registry.constructing.insert(context_type, current_thread);
-            return Resolution::Register(RegistrationReservation {
+            return Ok(Resolution::Register(RegistrationReservation {
                 runtime: self,
                 context_type,
                 primary_candidate,
                 published: false,
-            });
+            }));
         }
     }
 
@@ -226,18 +232,18 @@ impl IoRuntime {
             .map(|registration| registration.prepare(destination))
     }
 
-    pub(crate) fn complete_driver<C>(&self, worker: ThreadId, role: DriverRole) -> Result<(), DriverError>
+    pub(crate) fn select_driver_role<C>(&self, role: DriverRole) -> Result<(), DriverError>
     where
         C: IoContext,
     {
         let context_type = TypeId::of::<C>();
         let mut registry = self.registry();
-        let (primary_candidate, owner_signal) = {
+        let primary_candidate = {
             let registration = registry
                 .registrations
                 .get_mut(&context_type)
-                .expect("driver completion requires a published I/O registration");
-            let primary_candidate = if let Some(expected) = registration.role {
+                .expect("driver role selection requires a published I/O registration");
+            if let Some(expected) = registration.role {
                 if role != expected {
                     return Err(DriverError::from_message(format!(
                         "I/O driver selected {role:?}, but the registration uses {expected:?}"
@@ -247,12 +253,7 @@ impl IoRuntime {
             } else {
                 registration.role = Some(role);
                 registration.primary_candidate
-            };
-            assert!(
-                registration.initialized_workers.insert(worker),
-                "each worker initializes a context driver at most once"
-            );
-            (primary_candidate, Arc::clone(&registration.owner_signal))
+            }
         };
         if primary_candidate {
             assert_eq!(
@@ -264,9 +265,29 @@ impl IoRuntime {
                 registry.primary = None;
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn complete_driver<C>(&self, worker: ThreadId)
+    where
+        C: IoContext,
+    {
+        let context_type = TypeId::of::<C>();
+        let mut registry = self.registry();
+        let owner_signal = {
+            let registration = registry
+                .registrations
+                .get_mut(&context_type)
+                .expect("driver completion requires a published I/O registration");
+            assert!(registration.role.is_some(), "driver completion follows role selection");
+            assert!(
+                registration.initialized_workers.insert(worker),
+                "each worker initializes a context driver at most once"
+            );
+            Arc::clone(&registration.owner_signal)
+        };
         drop(registry);
         owner_signal.notify();
-        Ok(())
     }
 
     pub(crate) fn is_ready<C>(&self) -> Result<bool, Error>
@@ -510,4 +531,14 @@ fn allowed_roles(role: Option<DriverRole>, primary_candidate: bool) -> &'static 
         Some(DriverRole::Primary) => PRIMARY_ROLE,
         Some(DriverRole::Secondary) | None => SECONDARY_ROLE,
     }
+}
+
+pub(crate) fn reentrant_registration<C>() -> DriverError
+where
+    C: IoContext,
+{
+    DriverError::from_message(format!(
+        "I/O context {} cannot wait for concurrent registration while another context is initializing on this worker",
+        std::any::type_name::<C>()
+    ))
 }

@@ -30,6 +30,7 @@ use static_assertions::assert_impl_all;
 use support::JoinHandleExt as _;
 
 const WORKERS: usize = 2;
+static INVARIANT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 assert_impl_all!(Io: Clone, Send, ThreadAware);
 assert_impl_all!(RuntimeBuilder: Send, Sync);
@@ -133,6 +134,12 @@ markers!(
     ConcurrentSecondary,
     LaterPrimary,
     ShutdownWhileWaiting,
+    ReadinessPublication,
+    DriverHookPanic,
+    WakerHookPanic,
+    ReentrantCycleA,
+    ReentrantCycleB,
+    ShutdownTaskCleanup,
 );
 
 #[derive(Clone, Copy)]
@@ -164,6 +171,9 @@ struct Scenario {
     cycle_log: Arc<Mutex<Vec<&'static str>>>,
     driver_wakes: AtomicUsize,
     block_driver_at: AtomicUsize,
+    block_waker_at: AtomicUsize,
+    panic_driver_at: AtomicUsize,
+    panic_waker_at: AtomicUsize,
     driver_gate: Mutex<DriverGate>,
     driver_gate_changed: Condvar,
     context_action: Mutex<Option<ContextAction>>,
@@ -202,8 +212,23 @@ struct DriverGate {
 }
 
 enum ContextAction {
-    RegisterNested { io: Io, options: ScenarioOptions },
-    RegisterSelf { io: Io },
+    RegisterNested {
+        io: Io,
+        options: ScenarioOptions,
+    },
+    RegisterSelf {
+        io: Io,
+    },
+    RegisterCycleA {
+        io: Io,
+        options: ScenarioOptions,
+        barrier: Arc<Barrier>,
+    },
+    RegisterCycleB {
+        io: Io,
+        options: ScenarioOptions,
+        barrier: Arc<Barrier>,
+    },
 }
 
 impl Scenario {
@@ -238,6 +263,9 @@ impl Scenario {
             cycle_log,
             driver_wakes: AtomicUsize::new(0),
             block_driver_at: AtomicUsize::new(0),
+            block_waker_at: AtomicUsize::new(0),
+            panic_driver_at: AtomicUsize::new(0),
+            panic_waker_at: AtomicUsize::new(0),
             driver_gate: Mutex::new(DriverGate::default()),
             driver_gate_changed: Condvar::new(),
             context_action: Mutex::new(None),
@@ -296,11 +324,21 @@ impl Scenario {
         if self.block_driver_at.load(Ordering::SeqCst) != attempt {
             return;
         }
+        self.block_at_gate();
+    }
+
+    fn block_at_gate(&self) {
         let mut gate = self.driver_gate.lock().unwrap();
         gate.entered = true;
         self.driver_gate_changed.notify_all();
         while !gate.released {
             gate = self.driver_gate_changed.wait(gate).unwrap();
+        }
+    }
+
+    fn block_waker_if_configured(&self, attempt: usize) {
+        if self.block_waker_at.load(Ordering::SeqCst) == attempt {
+            self.block_at_gate();
         }
     }
 
@@ -310,6 +348,14 @@ impl Scenario {
 
     fn register_self_from_context(&self, io: Io) {
         *self.context_action.lock().unwrap() = Some(ContextAction::RegisterSelf { io });
+    }
+
+    fn register_cycle_a_from_context(&self, io: Io, options: ScenarioOptions, barrier: Arc<Barrier>) {
+        *self.context_action.lock().unwrap() = Some(ContextAction::RegisterCycleA { io, options, barrier });
+    }
+
+    fn register_cycle_b_from_context(&self, io: Io, options: ScenarioOptions, barrier: Arc<Barrier>) {
+        *self.context_action.lock().unwrap() = Some(ContextAction::RegisterCycleB { io, options, barrier });
     }
 
     fn set_driver_failure_message(&self, message: &'static str) {
@@ -361,6 +407,14 @@ impl<M: Marker> IoContext for TestContext<M> {
             Some(ContextAction::RegisterSelf { io }) => {
                 let _ = io.context::<Self>(&options);
             }
+            Some(ContextAction::RegisterCycleA { io, options, barrier }) => {
+                barrier.wait();
+                let _ = io.context::<TestContext<ReentrantCycleA>>(&options);
+            }
+            Some(ContextAction::RegisterCycleB { io, options, barrier }) => {
+                barrier.wait();
+                let _ = io.context::<TestContext<ReentrantCycleB>>(&options);
+            }
             None => {}
         }
         Self {
@@ -374,6 +428,11 @@ impl<M: Marker> IoContext for TestContext<M> {
         assert_eq!(self.thread.as_ref(), Some(options.thread()));
         let attempt = self.scenario.driver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         self.scenario.block_driver_if_configured(attempt);
+        assert_ne!(
+            self.scenario.panic_driver_at.load(Ordering::SeqCst),
+            attempt,
+            "configured driver hook panic"
+        );
         if self.scenario.fail_driver_at.load(Ordering::SeqCst) == attempt {
             let blocked_attempt = self.scenario.block_driver_at.load(Ordering::SeqCst);
             if blocked_attempt != 0 && blocked_attempt != attempt {
@@ -392,6 +451,7 @@ impl<M: Marker> IoContext for TestContext<M> {
                 scenario: Arc::clone(&self.scenario),
                 role,
                 wake,
+                attempt,
                 _marker: PhantomData,
             },
             role,
@@ -440,11 +500,18 @@ struct TestDriver<M: Marker> {
     scenario: Arc<Scenario>,
     role: DriverRole,
     wake: Arc<DriverWake>,
+    attempt: usize,
     _marker: PhantomData<M>,
 }
 
 impl<M: Marker> Driver for TestDriver<M> {
     fn waker(&self) -> Waker {
+        self.scenario.block_waker_if_configured(self.attempt);
+        assert_ne!(
+            self.scenario.panic_waker_at.load(Ordering::SeqCst),
+            self.attempt,
+            "configured driver waker panic"
+        );
         Waker::from(Arc::clone(&self.wake))
     }
 
@@ -519,6 +586,10 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "condition did not become true before the test timeout");
         thread::yield_now();
     }
+}
+
+fn serialize_invariant_test() -> std::sync::MutexGuard<'static, ()> {
+    INVARIANT_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[path = "io/cycles.rs"]

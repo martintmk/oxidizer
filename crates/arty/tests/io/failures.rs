@@ -76,6 +76,60 @@ fn context_panics_after_requesting_shutdown_on_initialization_failure() {
     assert!(panicked);
     assert_eq!(runtime.stop().unwrap_err().to_string(), "driver construction failed");
 }
+
+#[test]
+fn driver_hook_panic_becomes_a_terminal_runtime_failure() {
+    let _serial = serialize_invariant_test();
+    let runtime = runtime(1);
+    let worker = worker_schedulers(&runtime, 1).pop().unwrap();
+    let scenario = Scenario::options(RolePlan::PreferPrimary);
+    scenario.panic_driver_at.store(1, Ordering::SeqCst);
+
+    let error = worker
+        .spawn({
+            async move |builtins| {
+                builtins
+                    .io()
+                    .try_context::<TestContext<DriverHookPanic>>(&scenario)
+                    .unwrap_err()
+                    .to_string()
+            }
+        })
+        .join()
+        .unwrap();
+
+    assert_eq!(error, "I/O driver initialization panicked");
+    assert_eq!(runtime.stop().unwrap_err().to_string(), error);
+}
+
+#[test]
+fn waker_hook_panic_wakes_registration_waiters_with_the_terminal_failure() {
+    let _serial = serialize_invariant_test();
+    let runtime = runtime(WORKERS);
+    let workers = worker_schedulers(&runtime, WORKERS);
+    let scenario = Scenario::options(RolePlan::PreferPrimary);
+    scenario.panic_waker_at.store(WORKERS, Ordering::SeqCst);
+
+    let error = workers[0]
+        .spawn({
+            let scenario = scenario.clone();
+            async move |builtins| {
+                builtins
+                    .io()
+                    .try_context::<TestContext<WakerHookPanic>>(&scenario)
+                    .unwrap_err()
+                    .to_string()
+            }
+        })
+        .join()
+        .unwrap();
+
+    assert_eq!(error, "I/O driver waker panicked");
+    assert_eq!(runtime.stop().unwrap_err().to_string(), error);
+    assert_eq!(scenario.initialized.load(Ordering::SeqCst), WORKERS);
+    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn worker_driver_construction_failure_prevents_context_publication() {
     let runtime = runtime(WORKERS);

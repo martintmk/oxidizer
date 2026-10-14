@@ -4,7 +4,9 @@
 use std::any::{Any, TypeId, type_name};
 use std::cell::RefCell;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::{Rc, Weak};
+use std::task::Waker;
 use std::time::Duration;
 
 use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
@@ -14,7 +16,7 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::Thread;
 
-use super::runtime_state::Resolution;
+use super::runtime_state::{Resolution, reentrant_registration};
 use super::{DriverCommand, IoRuntime, fail_runtime, runtime_error};
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::telemetry::events::{
@@ -22,6 +24,7 @@ use crate::runtime::telemetry::events::{
     IoDriverShutdownFailed,
 };
 use crate::runtime::{Error, WorkerSignal};
+use crate::task::execution::discard_panic;
 
 thread_local! {
     static CURRENT: RefCell<Option<Weak<DriverHost>>> = const { RefCell::new(None) };
@@ -65,6 +68,8 @@ struct LocalContext {
     role: DriverRole,
     context_name: &'static str,
 }
+
+type InitializedDriver = (Box<dyn ErasedDriver>, DriverRole, Option<Waker>);
 
 pub(crate) struct DriverHost {
     runtime: Arc<IoRuntime>,
@@ -152,8 +157,12 @@ impl DriverHost {
             initializing: &self.initializing,
             context_type,
         };
+        let nested = self.initializing.borrow().len() > 1;
         let local = self.contexts.borrow_mut().remove(&context_type);
         let (context, registered) = if let Some(local) = local {
+            if nested && !self.runtime.is_ready::<C>()? {
+                return Err(self.fail(reentrant_registration::<C>()));
+            }
             let context = Self::clone_context::<C>(&local);
             assert!(
                 self.contexts.borrow_mut().insert(context_type, local).is_none(),
@@ -161,20 +170,17 @@ impl DriverHost {
             );
             (context, false)
         } else {
-            let (mut context, allowed_roles, registered) = match self.runtime.resolve::<C>(&self.thread) {
-                Resolution::Existing { context, allowed_roles } => (context, allowed_roles, false),
-                Resolution::Register(reservation) => {
-                    let mut context = C::context(options());
-                    context.relocate(None, &self.thread);
-                    let allowed_roles = reservation.publish(&context, &self.thread, Arc::clone(&self.signal));
-                    (context, allowed_roles, true)
-                }
-            };
-            let (driver, role) = self
-                .initialize_driver::<C>(&mut context, allowed_roles)
-                .map_err(|error| self.fail(error))?;
-            self.insert_local::<C>(context.clone(), driver, role);
-            (context, registered)
+            let (context, allowed_roles, registered) =
+                match self.runtime.resolve::<C>(&self.thread, nested).map_err(|error| self.fail(error))? {
+                    Resolution::Existing { context, allowed_roles } => (context, allowed_roles, false),
+                    Resolution::Register(reservation) => {
+                        let mut context = C::context(options());
+                        context.relocate(None, &self.thread);
+                        let allowed_roles = reservation.publish(&context, &self.thread, Arc::clone(&self.signal));
+                        (context, allowed_roles, true)
+                    }
+                };
+            (self.initialize_local::<C>(context, allowed_roles)?, registered)
         };
         drop(initialization);
         if registered {
@@ -194,18 +200,16 @@ impl DriverHost {
         if self.contexts.borrow().contains_key(&TypeId::of::<C>()) {
             return;
         }
-        let Some((mut context, allowed_roles)) = self.runtime.prepared::<C>(&self.thread) else {
+        let Some((context, allowed_roles)) = self.runtime.prepared::<C>(&self.thread) else {
             return;
         };
-        match self.initialize_driver::<C>(&mut context, allowed_roles) {
-            Ok((driver, role)) => self.insert_local::<C>(context, driver, role),
-            Err(error) => {
-                self.fail(error);
-            }
-        }
+        _ = self.initialize_local::<C>(context, allowed_roles);
     }
 
     pub(crate) fn process_commands(&self) {
+        if self.dispatcher.is_shutting_down() {
+            return;
+        }
         while let Ok(command) = self.command_rx.try_recv() {
             command(self);
         }
@@ -231,35 +235,58 @@ impl DriverHost {
         C: IoContext,
     {
         loop {
+            if self.dispatcher.is_shutting_down() {
+                return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
+            }
             self.process_commands();
             if self.runtime.is_ready::<C>()? {
                 return Ok(());
-            }
-            if self.dispatcher.is_shutting_down() {
-                return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
             }
             self.signal.wait_until_notified();
         }
     }
 
-    fn initialize_driver<C>(
-        &self,
-        context: &mut C,
-        allowed_roles: &[DriverRole],
-    ) -> Result<(Box<dyn ErasedDriver>, DriverRole), DriverError>
+    fn initialize_local<C>(&self, mut context: C, allowed_roles: &[DriverRole]) -> Result<C, Error>
+    where
+        C: IoContext,
+    {
+        let (driver, role, primary_waker) = self
+            .initialize_driver::<C>(&mut context, allowed_roles)
+            .map_err(|error| self.fail(error))?;
+        let returned = self
+            .call_provider::<C, _>("context clone", || context.clone())
+            .map_err(|error| self.fail(error))?;
+        if let Some(waker) = primary_waker {
+            self.signal.set_primary_waker(waker);
+        }
+        self.insert_local::<C>(context, driver, role);
+        self.runtime.complete_driver::<C>(self.thread.id());
+        emit!(
+            &self.sink,
+            IoDriverInitialized {
+                context: IoContextName(type_name::<C>()),
+                role: IoDriverRoleLabel::from(role),
+            }
+        );
+        Ok(returned)
+    }
+
+    fn initialize_driver<C>(&self, context: &mut C, allowed_roles: &[DriverRole]) -> Result<InitializedDriver, DriverError>
     where
         C: IoContext,
     {
         let options = DriverOptions::new(self.thread.clone(), WorkerSignal::waker(&self.signal), allowed_roles.to_vec());
-        let DriverInstance { driver, role, .. } = context.driver(options).inspect_err(|error| {
-            emit!(
-                &self.sink,
-                IoDriverInitializationFailed {
-                    context: IoContextName(type_name::<C>()),
-                    error: IoDriverErrorMessage::new(error),
-                }
-            );
-        })?;
+        let DriverInstance { driver, role, .. } = self
+            .call_provider::<C, _>("initialization", || context.driver(options))?
+            .inspect_err(|error| {
+                emit!(
+                    &self.sink,
+                    IoDriverInitializationFailed {
+                        context: IoContextName(type_name::<C>()),
+                        error: IoDriverErrorMessage::new(error),
+                    }
+                );
+            })?;
         if !allowed_roles.contains(&role) {
             let error = DriverError::from_message(format!("I/O driver selected disallowed role {role:?}"));
             emit!(
@@ -272,7 +299,7 @@ impl DriverHost {
             Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
             return Err(error);
         }
-        if let Err(error) = self.runtime.complete_driver::<C>(self.thread.id(), role) {
+        if let Err(error) = self.runtime.select_driver_role::<C>(role) {
             emit!(
                 &self.sink,
                 IoDriverInitializationFailed {
@@ -283,17 +310,33 @@ impl DriverHost {
             Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
             return Err(error);
         }
-        if role == DriverRole::Primary {
-            self.signal.set_primary_waker(driver.waker());
-        }
-        emit!(
-            &self.sink,
-            IoDriverInitialized {
-                context: IoContextName(type_name::<C>()),
-                role: IoDriverRoleLabel::from(role),
+        let primary_waker = if role == DriverRole::Primary {
+            Some(self.call_provider::<C, _>("waker", || driver.waker())?)
+        } else {
+            None
+        };
+        Ok((Box::new(driver), role, primary_waker))
+    }
+
+    fn call_provider<C, T>(&self, operation: &'static str, callback: impl FnOnce() -> T) -> Result<T, DriverError>
+    where
+        C: IoContext,
+    {
+        match catch_unwind(AssertUnwindSafe(callback)) {
+            Ok(value) => Ok(value),
+            Err(panic) => {
+                let error = DriverError::from_message(format!("I/O driver {operation} panicked"));
+                emit!(
+                    &self.sink,
+                    IoDriverInitializationFailed {
+                        context: IoContextName(type_name::<C>()),
+                        error: IoDriverErrorMessage::new(&error),
+                    }
+                );
+                discard_panic(panic);
+                Err(error)
             }
-        );
-        Ok((Box::new(driver), role))
+        }
     }
 
     fn insert_local<C>(&self, context: C, driver: Box<dyn ErasedDriver>, role: DriverRole)

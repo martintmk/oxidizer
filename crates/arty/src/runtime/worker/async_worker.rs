@@ -183,7 +183,9 @@ where
 
     fn execute_step(&mut self) -> ControlFlow<()> {
         let batch_exhausted = self.process_commands();
-        if let Some(driver_host) = &self.driver_host {
+        if !self.shutdown_signal.load(Ordering::Acquire)
+            && let Some(driver_host) = &self.driver_host
+        {
             driver_host.process_commands();
         }
 
@@ -203,10 +205,20 @@ where
         let can_suspend = matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted;
         let max_wait = if can_suspend { SUSPEND_SLEEP_DURATION } else { Duration::ZERO };
         let cycle_started = Instant::now();
-        if let Some(driver_host) = &self.driver_host
-            && driver_host.execute_cycle(max_wait).is_err()
-        {
+        let driver_failed = self
+            .driver_host
+            .as_ref()
+            .is_some_and(|driver_host| driver_host.execute_cycle(max_wait).is_err());
+        if driver_failed {
             self.begin_shutdown();
+        }
+        if matches!(cycle_outcome, CycleOutcome::Shutdown) {
+            if let Some(driver_host) = self.driver_host.take() {
+                driver_host.shutdown();
+            }
+            return ControlFlow::Break(());
+        }
+        if driver_failed {
             return ControlFlow::Continue(());
         }
 
@@ -217,9 +229,7 @@ where
                 self.signal.wait(max_wait.saturating_sub(cycle_started.elapsed()));
             }
             CycleOutcome::Continue | CycleOutcome::Suspend => {}
-            // This is the only way to exit the loop, guaranteeing safe shutdown of the
-            // executor. The storage has already been retired before timer callbacks run.
-            CycleOutcome::Shutdown => return ControlFlow::Break(()),
+            CycleOutcome::Shutdown => unreachable!("executor shutdown is handled before suspension"),
         }
 
         ControlFlow::Continue(())
@@ -286,10 +296,10 @@ where
 
     #[cfg_attr(test, mutants::skip)] // If mutated, shutdown process will never finish - will hang.
     fn begin_shutdown(&mut self) {
-        Scheduler::clear_current();
-        if let Some(driver_host) = self.driver_host.take() {
-            driver_host.shutdown();
+        if self.thread_state.is_none() {
+            return;
         }
+        Scheduler::clear_current();
         // Drop the thread state, as it may hold references to resources that
         // block executor shutdown (via various futures, waiters, etc).
         self.thread_state = None;

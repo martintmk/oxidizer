@@ -9,6 +9,7 @@ fn cycle_failure<M: Marker>(role_plan: RolePlan, expected_role: &'static str)
 where
     TestContext<M>: IoContext<ContextOptions = ScenarioOptions>,
 {
+    let _serial = serialize_invariant_test();
     let (runtime, processor) = runtime_with_telemetry(1);
     let worker = worker_schedulers(&runtime, 1).pop().unwrap();
     let scenario = Scenario::options(role_plan);
@@ -48,6 +49,7 @@ fn secondary_cycle_failure_stops_runtime() {
 }
 #[test]
 fn cycle_failure_remains_primary_when_driver_shutdown_also_fails() {
+    let _serial = serialize_invariant_test();
     let (runtime, processor) = runtime_with_telemetry(1);
     let worker = worker_schedulers(&runtime, 1).pop().unwrap();
     let scenario = Scenario::options(RolePlan::PreferPrimary);
@@ -150,4 +152,40 @@ fn shutdown_failures_are_diagnostic_and_do_not_skip_other_drivers() {
     assert_eq!(primary.shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(secondary.shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(event_count(&processor, "arty.rt.io.driver.shutdown_failed"), 2);
+}
+
+#[test]
+fn task_cancellation_runs_before_driver_shutdown() {
+    struct ObserveDriverOnDrop {
+        scenario: ScenarioOptions,
+        dropped_tx: mpsc::Sender<bool>,
+    }
+
+    impl Drop for ObserveDriverOnDrop {
+        fn drop(&mut self) {
+            self.dropped_tx.send(self.scenario.shutdowns.load(Ordering::SeqCst) == 0).unwrap();
+        }
+    }
+
+    let _serial = serialize_invariant_test();
+    let runtime = runtime(1);
+    let worker = worker_schedulers(&runtime, 1).pop().unwrap();
+    let scenario = Scenario::options(RolePlan::PreferPrimary);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let task = worker.spawn({
+        let scenario = scenario.clone();
+        async move |builtins| {
+            let _ = builtins.io().context::<TestContext<ShutdownTaskCleanup>>(&scenario);
+            let _observe = ObserveDriverOnDrop { scenario, dropped_tx };
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }
+    });
+    started_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap();
+    drop(task);
+
+    runtime.stop().unwrap();
+    assert!(dropped_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap());
+    assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
 }

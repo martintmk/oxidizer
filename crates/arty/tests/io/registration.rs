@@ -174,6 +174,38 @@ fn concurrent_same_context_registration_constructs_options_once() {
     runtime.stop().unwrap();
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), WORKERS);
 }
+
+#[test]
+fn registration_is_not_ready_before_the_final_worker_installs_its_waker() {
+    let _serial = serialize_invariant_test();
+    let runtime = runtime(WORKERS);
+    let workers = worker_schedulers(&runtime, WORKERS);
+    let scenario = Scenario::options(RolePlan::PreferPrimary);
+    scenario.block_waker_at.store(WORKERS, Ordering::SeqCst);
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+
+    let registration = workers[0].spawn({
+        let scenario = scenario.clone();
+        async move |builtins| {
+            let outcome = builtins
+                .io()
+                .try_context::<TestContext<ReadinessPublication>>(&scenario)
+                .map_or_else(|error| error.to_string(), |_| "ready".to_owned());
+            outcome_tx.send(outcome).unwrap();
+        }
+    });
+    scenario.wait_until_driver_blocked();
+
+    assert!(matches!(
+        outcome_rx.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    scenario.release_driver();
+    assert_eq!(outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(), "ready");
+    registration.join().unwrap();
+    runtime.stop().unwrap();
+}
+
 #[test]
 fn nested_context_registration_does_not_deadlock_or_duplicate_primary() {
     let (result_tx, result_rx) = mpsc::channel();
@@ -266,6 +298,58 @@ fn recursive_same_context_registration_panics_without_corrupting_registry() {
     runtime.stop().unwrap();
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn concurrent_cross_worker_nested_registration_fails_instead_of_deadlocking() {
+    let _serial = serialize_invariant_test();
+    let (result_tx, result_rx) = mpsc::channel();
+    let execution = thread::spawn(move || {
+        let runtime = runtime(WORKERS);
+        let workers = worker_schedulers(&runtime, WORKERS);
+        let first = Scenario::options(RolePlan::PreferPrimary);
+        let second = Scenario::options(RolePlan::PreferPrimary);
+        let barrier = Arc::new(Barrier::new(WORKERS));
+
+        let first_registration = workers[0].spawn({
+            let first = first.clone();
+            let second = second.clone();
+            let barrier = Arc::clone(&barrier);
+            async move |builtins| {
+                first.register_cycle_b_from_context(builtins.io().clone(), second, barrier);
+                builtins
+                    .io()
+                    .try_context::<TestContext<ReentrantCycleA>>(&first)
+                    .unwrap_err()
+                    .to_string()
+            }
+        });
+        let second_registration = workers[1].spawn({
+            async move |builtins| {
+                second.register_cycle_a_from_context(builtins.io().clone(), first, barrier);
+                builtins
+                    .io()
+                    .try_context::<TestContext<ReentrantCycleB>>(&second)
+                    .unwrap_err()
+                    .to_string()
+            }
+        });
+
+        let first_error = first_registration.join().unwrap();
+        let second_error = second_registration.join().unwrap();
+        let runtime_error = runtime.stop().unwrap_err().to_string();
+        result_tx.send((first_error, second_error, runtime_error)).unwrap();
+    });
+
+    let errors = result_rx
+        .recv_timeout(testing_aids::TEST_TIMEOUT)
+        .expect("cross-worker nested registration must terminate");
+    execution.join().unwrap();
+    let errors: [String; 3] = errors.into();
+    for error in errors {
+        assert!(error.contains("cannot wait for concurrent registration"));
+    }
+}
+
 #[test]
 fn inconsistent_primary_role_on_another_worker_is_rejected() {
     let (runtime, processor) = runtime_with_telemetry(WORKERS);
