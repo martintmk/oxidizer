@@ -87,6 +87,8 @@ use arty_io_core::DriverError;
 pub(crate) use driver_host::DriverHost;
 use performables::sync::channel;
 pub(crate) use runtime_state::IoRuntime;
+#[cfg(test)]
+pub(crate) use runtime_state::tests::Context as TestIoContext;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::Error;

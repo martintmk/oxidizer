@@ -338,3 +338,131 @@ impl IoRuntime {
         );
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::task::Waker;
+
+    use arty_io_core::{Cycle, Driver, DriverInstance, DriverOptions};
+    use thread_aware::{ThreadAware, ThreadBuilder};
+
+    use super::*;
+
+    #[derive(Clone)]
+    pub(crate) struct Context;
+
+    impl ThreadAware for Context {
+        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+    }
+
+    impl IoContext for Context {
+        type ContextOptions = ();
+        type Driver = TestDriver;
+
+        fn context((): Self::ContextOptions) -> Self {
+            Self
+        }
+
+        fn driver(&mut self, _options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+            Ok(DriverInstance::new(TestDriver, DriverRole::Primary))
+        }
+    }
+
+    pub(crate) struct TestDriver;
+
+    impl Driver for TestDriver {
+        fn waker(&self) -> Waker {
+            Waker::noop().clone()
+        }
+
+        fn execute_cycle(&mut self, _cycle: &mut Cycle) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        fn shutdown(self) -> Result<(), DriverError> {
+            Ok(())
+        }
+    }
+
+    fn thread() -> Thread {
+        ThreadBuilder::default().build(thread::current().id())
+    }
+
+    #[test]
+    fn abandoned_reservation_releases_primary_role() {
+        let runtime = IoRuntime::default();
+        let destination = thread();
+        let Resolution::Register {
+            allowed_roles,
+            reservation,
+        } = runtime.resolve::<Context>(&destination)
+        else {
+            panic!("first resolution must reserve registration");
+        };
+        assert_eq!(allowed_roles, [DriverRole::Primary, DriverRole::Secondary]);
+        drop(reservation);
+
+        let Resolution::Register { allowed_roles, .. } = runtime.resolve::<Context>(&destination) else {
+            panic!("abandoned registration must be reservable again");
+        };
+        assert_eq!(allowed_roles, [DriverRole::Primary, DriverRole::Secondary]);
+    }
+
+    #[test]
+    fn recursive_resolution_panics() {
+        let runtime = IoRuntime::default();
+        let destination = thread();
+        let resolution = runtime.resolve::<Context>(&destination);
+
+        let panic = match catch_unwind(AssertUnwindSafe(|| runtime.resolve::<Context>(&destination))) {
+            Ok(_) => panic!("recursive resolution must panic"),
+            Err(panic) => panic,
+        };
+        drop(resolution);
+
+        assert!(panic.downcast_ref::<String>().unwrap().contains("recursively requested"));
+    }
+
+    #[test]
+    fn completed_registration_rejects_a_different_role() {
+        let runtime = IoRuntime::new(2);
+        let destination = thread();
+        let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
+            panic!("first resolution must reserve registration");
+        };
+        reservation.publish(&Context, &destination);
+        runtime
+            .complete_driver::<Context>(thread::current().id(), DriverRole::Primary)
+            .unwrap();
+
+        let error = runtime
+            .complete_driver::<Context>(std::thread::spawn(|| thread::current().id()).join().unwrap(), DriverRole::Secondary)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("registration uses Primary"));
+    }
+
+    #[test]
+    fn poisoned_registry_is_recovered() {
+        let runtime = IoRuntime::default();
+        _ = catch_unwind(AssertUnwindSafe(|| {
+            let _registry = runtime.registry.lock();
+            panic!("poison registry");
+        }));
+
+        assert!(!runtime.is_registered::<Context>());
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one async worker")]
+    fn zero_workers_are_rejected() {
+        _ = IoRuntime::new(0);
+    }
+
+    #[test]
+    fn debug_reports_worker_count() {
+        assert!(format!("{:?}", IoRuntime::new(3)).contains("worker_count: 3"));
+    }
+}

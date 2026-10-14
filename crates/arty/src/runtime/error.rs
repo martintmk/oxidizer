@@ -219,4 +219,13 @@ mod tests {
             assert_eq!(error.source().unwrap().downcast_ref::<RuntimeValidation>(), Some(&validation));
         }
     }
+
+    #[test]
+    fn io_failure_preserves_driver_error_as_its_source() {
+        let error = Error::io_failure(Arc::new(DriverError::from_message("driver failed")));
+        let source = error.source().unwrap();
+
+        assert_eq!(source.to_string(), "driver failed");
+        assert_eq!(source.source().unwrap().to_string(), "driver failed");
+    }
 }

@@ -333,6 +333,22 @@ mod tests {
     }
 
     #[test]
+    fn io_dispatch_rejects_shutdown_and_closed_workers() {
+        let threads = test_threads(1);
+        let (worker_tx, _worker_rx) = channel::unbounded();
+        let dispatcher = DispatcherCore::new(
+            MockWaitForShutdown::new(),
+            NonEmpty::from_vec(vec![endpoint(worker_tx, &threads[0])]).unwrap(),
+            observed::Sink::noop(),
+        );
+
+        assert!(!dispatcher.prepare_io_everywhere::<crate::io::TestIoContext>());
+        dispatcher.stop();
+        assert!(!dispatcher.prepare_io_everywhere::<crate::io::TestIoContext>());
+        assert!(!dispatcher.access_io(WorkerIndex(0), Box::new(|_| {})));
+    }
+
+    #[test]
     #[should_panic(expected = "same runtime owner")]
     fn dispatcher_rejects_mixed_runtime_owners() {
         let first = test_threads(1).remove(0);
