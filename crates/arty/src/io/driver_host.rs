@@ -16,7 +16,7 @@ use performables::sync::channel;
 use thread_aware::Thread;
 
 use super::runtime_state::Resolution;
-use super::{DriverCommand, IoRuntime};
+use super::{DriverCommand, IoRuntime, fail_runtime, runtime_error};
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::telemetry::events::{
     IoContextName, IoDriverCycleFailed, IoDriverErrorMessage, IoDriverInitializationFailed, IoDriverInitialized, IoDriverRoleLabel,
@@ -153,7 +153,7 @@ impl DriverHost {
         C: IoContext,
         C::ContextOptions: Clone,
     {
-        if let Some(error) = Self::runtime_error(&self.runtime, &self.dispatcher) {
+        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
             return Err(error);
         }
         let context_type = TypeId::of::<C>();
@@ -208,7 +208,7 @@ impl DriverHost {
     where
         C: IoContext,
     {
-        if Self::runtime_error(&self.runtime, &self.dispatcher).is_some() {
+        if runtime_error(&self.runtime, &self.dispatcher).is_some() {
             return;
         }
         if self.contexts.borrow().contains_key(&TypeId::of::<C>()) {
@@ -240,12 +240,14 @@ impl DriverHost {
                 return Ok(());
             }
             if self.dispatcher.is_shutting_down() {
-                return Err(self.runtime.failure().unwrap_or_else(Error::runtime_shutting_down));
+                return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
             }
             match self.command_rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(command) => command(self),
                 Err(error) if error.is_timeout() => {}
-                Err(_) => return Err(self.runtime.failure().unwrap_or_else(Error::runtime_shutting_down)),
+                Err(_) => {
+                    return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
+                }
             }
         }
     }
@@ -351,19 +353,7 @@ impl DriverHost {
     }
 
     fn fail(&self, error: DriverError) -> Error {
-        Self::fail_runtime(&self.runtime, &self.dispatcher, error)
-    }
-
-    fn fail_runtime(runtime: &IoRuntime, dispatcher: &DispatcherClient, error: DriverError) -> Error {
-        let error = runtime.record_failure(error);
-        dispatcher.stop();
-        Error::io_failure(error)
-    }
-
-    fn runtime_error(runtime: &IoRuntime, dispatcher: &DispatcherClient) -> Option<Error> {
-        runtime
-            .failure()
-            .or_else(|| dispatcher.is_shutting_down().then(Error::runtime_shutting_down))
+        fail_runtime(&self.runtime, &self.dispatcher, error)
     }
 
     pub(crate) fn shutdown(&self) {

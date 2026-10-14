@@ -4,7 +4,7 @@
 use std::any::{Any, TypeId};
 use std::fmt;
 use std::sync::Arc;
-use std::thread::ThreadId;
+use std::thread::{self, ThreadId};
 
 use arty_io_core::{DriverError, DriverRole, IoContext};
 use foldhash::{HashMap, HashSet};
@@ -58,14 +58,14 @@ struct Registry {
     registrations: HashMap<TypeId, RegistrationState>,
     primary: Option<TypeId>,
     primary_reservation: Option<TypeId>,
-    constructing: HashSet<TypeId>,
+    constructing: HashMap<TypeId, ThreadId>,
+    failure: Option<Arc<DriverError>>,
 }
 
 pub(crate) struct IoRuntime {
     worker_count: usize,
     registry: Mutex<Registry>,
     registration_changed: Condvar,
-    failure: Mutex<Option<Arc<DriverError>>>,
     #[cfg(test)]
     resolution_waiting: std::sync::atomic::AtomicBool,
 }
@@ -104,9 +104,10 @@ impl RegistrationReservation<'_> {
                 .is_none(),
             "an I/O context registration cannot replace an existing registration"
         );
-        assert!(
+        assert_eq!(
             registry.constructing.remove(&self.context_type),
-            "publishing requires an active I/O context construction reservation"
+            Some(thread::current().id()),
+            "the publishing thread must own the I/O context construction reservation"
         );
         self.published = true;
         drop(registry);
@@ -158,7 +159,6 @@ impl IoRuntime {
             worker_count,
             registry: Mutex::new(Registry::default()),
             registration_changed: Condvar::new(),
-            failure: Mutex::new(None),
             #[cfg(test)]
             resolution_waiting: std::sync::atomic::AtomicBool::new(false),
         }
@@ -176,6 +176,7 @@ impl IoRuntime {
         C: IoContext,
     {
         let context_type = TypeId::of::<C>();
+        let current_thread = thread::current().id();
         let mut registry = self.registry();
         loop {
             if let Some(registration) = registry.registrations.get(&context_type) {
@@ -192,7 +193,11 @@ impl IoRuntime {
                     allowed_roles,
                 };
             }
-            if registry.constructing.contains(&context_type) {
+            if let Some(constructing_thread) = registry.constructing.get(&context_type) {
+                if *constructing_thread == current_thread {
+                    drop(registry);
+                    Self::recursive_registration::<C>();
+                }
                 #[cfg(test)]
                 self.report_resolution_waiting();
                 registry = self.registration_changed.wait(registry);
@@ -201,7 +206,7 @@ impl IoRuntime {
                 if reserved_primary {
                     registry.primary_reservation = Some(context_type);
                 }
-                registry.constructing.insert(context_type);
+                registry.constructing.insert(context_type, current_thread);
                 let allowed_roles = if reserved_primary {
                     vec![DriverRole::Primary, DriverRole::Secondary]
                 } else {
@@ -284,11 +289,11 @@ impl IoRuntime {
     where
         C: IoContext,
     {
-        if let Some(error) = self.failure() {
-            return Err(error);
-        }
         let context_type = TypeId::of::<C>();
         let registry = self.registry();
+        if let Some(error) = &registry.failure {
+            return Err(Error::io_failure(Arc::clone(error)));
+        }
         let registration = registry
             .registrations
             .get(&context_type)
@@ -297,15 +302,15 @@ impl IoRuntime {
     }
 
     pub(crate) fn record_failure(&self, error: DriverError) -> Arc<DriverError> {
-        let mut failure = self.failure.lock();
-        let error = Arc::clone(failure.get_or_insert_with(|| Arc::new(error)));
-        drop(failure);
+        let mut registry = self.registry();
+        let error = Arc::clone(registry.failure.get_or_insert_with(|| Arc::new(error)));
+        drop(registry);
         self.registration_changed.notify_all();
         error
     }
 
     pub(crate) fn failure(&self) -> Option<Error> {
-        self.failure.lock().as_ref().map(|error| Error::io_failure(Arc::clone(error)))
+        self.registry().failure.as_ref().map(|error| Error::io_failure(Arc::clone(error)))
     }
 
     fn registry(&self) -> MutexGuard<'_, Registry> {
@@ -317,6 +322,19 @@ impl IoRuntime {
                 registry
             }
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[expect(clippy::panic, reason = "recursive registration is a caller programming error")]
+    fn recursive_registration<C>() -> !
+    where
+        C: IoContext,
+    {
+        panic!(
+            "I/O context {} recursively requested its own registration",
+            std::any::type_name::<C>()
+        );
     }
 
     #[cfg(test)]

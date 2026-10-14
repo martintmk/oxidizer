@@ -82,6 +82,7 @@ mod runtime_state;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use arty_io_core::DriverError;
 pub(crate) use driver_host::DriverHost;
 use performables::arc::Arc;
 use performables::sync::channel;
@@ -95,6 +96,18 @@ use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
 use crate::task::{Builtins, Scheduler};
 
 pub(crate) type DriverCommand = Box<dyn FnOnce(&DriverHost) + Send>;
+
+fn runtime_error(runtime: &IoRuntime, dispatcher: &DispatcherClient) -> Option<Error> {
+    runtime
+        .failure()
+        .or_else(|| dispatcher.is_shutting_down().then(Error::runtime_shutting_down))
+}
+
+fn fail_runtime(runtime: &IoRuntime, dispatcher: &DispatcherClient, error: DriverError) -> Error {
+    let error = runtime.record_failure(error);
+    dispatcher.stop();
+    Error::io_failure(error)
+}
 
 /// Access to I/O contexts hosted by an Arty runtime.
 ///
@@ -173,7 +186,7 @@ impl Io {
         C: arty_io_core::IoContext,
         C::ContextOptions: Clone + ThreadAware,
     {
-        if let Some(error) = self.runtime_error() {
+        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
             return Err(error);
         }
 
@@ -214,10 +227,12 @@ impl Io {
             }));
             _ = result_tx.send(result);
         });
-        _ = self.dispatcher.access_io(worker_index, access);
+        if !self.dispatcher.access_io(worker_index, access) {
+            return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
+        }
         match result_rx
             .recv()
-            .map_err(|disconnected| self.runtime_error().unwrap_or_else(|| Error::new(disconnected)))?
+            .map_err(|disconnected| runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(|| Error::new(disconnected)))?
         {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -237,14 +252,14 @@ impl Io {
     where
         C: arty_io_core::IoContext,
     {
-        if let Some(error) = self.runtime_error() {
+        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
             return Err(error);
         }
         if registered {
             self.initialize_everywhere::<C>()?;
         }
         DriverHost::wait_until_ready_current::<C>(&self.runtime, &self.thread)?;
-        self.runtime_error().map_or(Ok(context), Err)
+        runtime_error(&self.runtime, &self.dispatcher).map_or(Ok(context), Err)
     }
 
     fn initialize_everywhere<C>(&self) -> Result<(), Error>
@@ -254,14 +269,14 @@ impl Io {
         if self.dispatcher.prepare_io_everywhere::<C>() {
             return Ok(());
         }
-        self.dispatcher.stop();
-        Err(self.runtime_error().unwrap_or_else(Error::runtime_shutting_down))
-    }
-
-    fn runtime_error(&self) -> Option<Error> {
-        self.runtime
-            .failure()
-            .or_else(|| self.dispatcher.is_shutting_down().then(Error::runtime_shutting_down))
+        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
+            return Err(error);
+        }
+        Err(fail_runtime(
+            &self.runtime,
+            &self.dispatcher,
+            DriverError::from_message("runtime worker stopped before I/O registration was delivered"),
+        ))
     }
 }
 

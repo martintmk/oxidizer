@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use performables::arc::Arc as PArc;
+use performables::arc::Arc;
 
 use crate::io::IoRuntime;
 use crate::runtime::builder::RuntimeBuilder;
@@ -55,7 +55,7 @@ use crate::task::{RuntimeScheduler, Scheduler};
 #[derive(Debug)]
 pub struct Runtime {
     scheduler: RuntimeScheduler,
-    io: PArc<IoRuntime>,
+    io_state: Arc<IoRuntime>,
     shutdown_on_drop: bool,
 }
 
@@ -185,13 +185,13 @@ impl Runtime {
             return Err(Error::shutdown_wait_from_blocking_callback());
         }
         self.scheduler.dispatcher.wait()?;
-        self.io.failure().map_or(Ok(()), Err)
+        self.io_state.failure().map_or(Ok(()), Err)
     }
 
-    pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient, io_runtime: PArc<IoRuntime>) -> Self {
+    pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient, io_runtime: Arc<IoRuntime>) -> Self {
         Self {
             scheduler: RuntimeScheduler::new(dispatcher),
-            io: io_runtime,
+            io_state: io_runtime,
             shutdown_on_drop: true,
         }
     }
@@ -217,7 +217,6 @@ mod tests {
     use std::thread;
 
     use observed::Sink;
-    use performables::arc::Arc;
     use performables::sync::channel;
     use testing_aids::TEST_TIMEOUT;
     use thread_aware::{ThreadBuilder, Unaware};
@@ -242,7 +241,7 @@ mod tests {
             nonempty::NonEmpty::new(endpoint),
             Sink::noop(),
         )));
-        let runtime = Runtime::with_dispatcher(dispatcher, PArc::new(IoRuntime::default()));
+        let runtime = Runtime::with_dispatcher(dispatcher, Arc::new(IoRuntime::default()));
         assert!(runtime.stop().unwrap_err().to_string().contains("panicked"));
     }
 
