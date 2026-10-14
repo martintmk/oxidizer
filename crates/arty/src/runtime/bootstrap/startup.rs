@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 use std::rc::Rc;
-use std::sync::Arc as StdArc;
 use std::sync::atomic::AtomicBool;
 use std::task::Waker;
 use std::thread;
@@ -71,7 +70,7 @@ pub(in crate::runtime) fn build(
 
     let worker_count = processors.len();
     let shutdown_started = Arc::new(AtomicBool::new(false));
-    let io_runtime = StdArc::new(IoRuntime::new(worker_count));
+    let io_runtime = Arc::new(IoRuntime::new(worker_count));
     let blocking_pools = processor_config.blocking_pool_policy.into_pools().inspect_err(|_| {
         emit!(
             &sink,
@@ -104,7 +103,7 @@ pub(in crate::runtime) fn build(
                 thread_builder: thread_builder.clone(),
                 blocking_pools: blocking_pools.clone(),
                 shutdown_started: Arc::clone(&shutdown_started),
-                io_runtime: StdArc::clone(&io_runtime),
+                io_runtime: Arc::clone(&io_runtime),
                 sink: sink.clone(),
             }
             .start(),
@@ -130,7 +129,6 @@ pub(in crate::runtime) fn build(
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown_started,
-        StdArc::clone(&io_runtime),
     ));
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
@@ -157,7 +155,7 @@ pub(in crate::runtime) fn build(
         }
     );
 
-    Ok(Runtime::with_dispatcher(dispatcher_client))
+    Ok(Runtime::with_dispatcher(dispatcher_client, io_runtime))
 }
 
 /// The data set required to start one async worker (the message channels and associated data).
@@ -176,7 +174,7 @@ struct AsyncWorkerStartInfo {
     thread_builder: ThreadBuilder,
     blocking_pools: BlockingPools,
     shutdown_started: Arc<AtomicBool>,
-    io_runtime: StdArc<IoRuntime>,
+    io_runtime: Arc<IoRuntime>,
     sink: Sink,
 }
 
@@ -240,8 +238,8 @@ impl AsyncWorkerStartInfo {
 
         let dispatcher = Rc::new(start_signal.dispatcher);
         let shutdown_signal = dispatcher.shutdown_signal();
-        let io = Io::new(StdArc::clone(&io_runtime), dispatcher.as_ref().clone(), current.clone());
-        DriverHost::install(
+        let io = Io::new(Arc::clone(&io_runtime), dispatcher.as_ref().clone(), current.clone());
+        let driver_host = DriverHost::new(
             io_runtime,
             dispatcher.as_ref().clone(),
             current.clone(),
@@ -268,6 +266,7 @@ impl AsyncWorkerStartInfo {
                 signal,
                 shutdown_signal,
                 success_tx,
+                Some(driver_host),
             )
         };
 

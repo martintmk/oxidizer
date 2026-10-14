@@ -81,9 +81,9 @@ mod runtime_state;
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 
 pub(crate) use driver_host::DriverHost;
+use performables::arc::Arc;
 use performables::sync::channel;
 pub(crate) use runtime_state::IoRuntime;
 #[cfg(test)]
@@ -94,7 +94,7 @@ use crate::runtime::Error;
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
 use crate::task::{Builtins, Scheduler};
 
-pub(crate) type DriverCommand = Box<dyn FnOnce() + Send>;
+pub(crate) type DriverCommand = Box<dyn FnOnce(&DriverHost) + Send>;
 
 /// Access to I/O contexts hosted by an Arty runtime.
 ///
@@ -177,15 +177,13 @@ impl Io {
             return Err(error);
         }
 
-        if DriverHost::is_current(&self.runtime, &self.thread) {
-            let destination = self.thread.clone();
-            let result = DriverHost::try_context_current(&self.runtime, &self.thread, || {
-                let mut options = options.clone();
-                options.relocate(None, &destination);
-                options
-            });
-            let result = result?;
-            return self.finish_context(result);
+        let destination = self.thread.clone();
+        if let Some(result) = DriverHost::try_context_current(&self.runtime, &self.thread, || {
+            let mut options = options.clone();
+            options.relocate(None, &destination);
+            options
+        }) {
+            return self.finish_context(result?);
         }
         if Scheduler::is_current_worker_thread() {
             return Err(Error::io_outside_worker());
@@ -231,7 +229,7 @@ impl Io {
         C: arty_io_core::IoContext,
         C::ContextOptions: Clone + ThreadAware,
     {
-        let result = DriverHost::try_context_current(&self.runtime, &self.thread, options)?;
+        let result = DriverHost::try_context_current(&self.runtime, &self.thread, options).ok_or_else(Error::io_outside_worker)??;
         self.finish_context(result)
     }
 

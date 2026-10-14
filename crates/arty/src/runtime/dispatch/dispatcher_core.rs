@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Waker;
 use std::thread::ThreadId;
@@ -13,7 +12,7 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::Thread;
 
-use crate::io::{DriverHost, IoRuntime};
+use crate::io::DriverHost;
 use crate::runtime::Error;
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::telemetry::events::{PlacementLabel, RuntimeStopped, RuntimeStopping, TaskSpawned};
@@ -74,19 +73,12 @@ pub(in crate::runtime) struct DispatcherCore<WFS> {
     /// Sink for runtime telemetry. Enrichment context is captured from it at spawn time and
     /// restored on every poll of spawned futures.
     sink: observed::Sink,
-    io_runtime: StdArc<IoRuntime>,
 }
 
 impl<WFS> DispatcherCore<WFS> {
     #[cfg(test)]
     pub(in crate::runtime) fn new(wait_for_shutdown: WFS, worker_endpoints: NonEmpty<WorkerEndpoint>, sink: observed::Sink) -> Self {
-        Self::new_with_shutdown(
-            wait_for_shutdown,
-            worker_endpoints,
-            sink,
-            Arc::new(AtomicBool::new(false)),
-            StdArc::new(IoRuntime::default()),
-        )
+        Self::new_with_shutdown(wait_for_shutdown, worker_endpoints, sink, Arc::new(AtomicBool::new(false)))
     }
 
     pub(in crate::runtime) fn new_with_shutdown(
@@ -94,7 +86,6 @@ impl<WFS> DispatcherCore<WFS> {
         worker_endpoints: NonEmpty<WorkerEndpoint>,
         sink: observed::Sink,
         shutdown_started: Arc<AtomicBool>,
-        io_runtime: StdArc<IoRuntime>,
     ) -> Self {
         let owner = worker_endpoints.first().thread.owner();
         assert!(
@@ -119,7 +110,6 @@ impl<WFS> DispatcherCore<WFS> {
             worker_indices,
             next_async_worker_index: AtomicUsize::new(0),
             sink,
-            io_runtime,
         }
     }
 
@@ -182,11 +172,7 @@ impl<WFS> DispatcherCore<WFS> {
         }
 
         for endpoint in &self.worker_endpoints {
-            let runtime = StdArc::clone(&self.io_runtime);
-            let thread = endpoint.thread.clone();
-            let send_result = endpoint.io_command_tx.send(Box::new(move || {
-                DriverHost::prepare_current::<C>(&runtime, &thread);
-            }));
+            let send_result = endpoint.io_command_tx.send(Box::new(DriverHost::prepare::<C>));
             endpoint.waker.wake_by_ref();
             if send_result.is_err() {
                 return false;
@@ -303,7 +289,7 @@ where
         if !self.stopped_reported.swap(true, Ordering::Relaxed) {
             emit!(&self.sink, RuntimeStopped);
         }
-        outcome.and_then(|()| self.io_runtime.failure().map_or(Ok(()), Err))
+        outcome
     }
 }
 

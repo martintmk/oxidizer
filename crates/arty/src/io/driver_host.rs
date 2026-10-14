@@ -3,15 +3,15 @@
 
 use std::any::{Any, TypeId, type_name};
 use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::rc::{Rc, Weak};
 use std::task::Waker;
-use std::thread;
 use std::time::Duration;
+use std::{fmt, thread};
 
 use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
 use foldhash::{HashMap, HashSet};
 use observed::{Sink, emit};
+use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::Thread;
 
@@ -25,7 +25,7 @@ use crate::runtime::telemetry::events::{
 use crate::runtime::{Error, WorkerSignal};
 
 thread_local! {
-    static CURRENT: RefCell<Option<Rc<DriverHost>>> = const { RefCell::new(None) };
+    static CURRENT: RefCell<Option<Weak<DriverHost>>> = const { RefCell::new(None) };
 }
 
 trait ErasedDriver {
@@ -72,112 +72,78 @@ pub(crate) struct DriverHost {
     dispatcher: DispatcherClient,
     thread: Thread,
     owner_waker: Waker,
-    signal: performables::arc::Arc<WorkerSignal>,
+    signal: Arc<WorkerSignal>,
     command_rx: channel::Receiver<DriverCommand>,
     sink: Sink,
     contexts: RefCell<HashMap<TypeId, LocalContext>>,
     initializing: RefCell<HashSet<TypeId>>,
 }
 
+impl fmt::Debug for DriverHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DriverHost").field("thread", &self.thread).finish_non_exhaustive()
+    }
+}
+
 impl DriverHost {
-    pub(crate) fn install(
+    pub(crate) fn new(
         runtime: Arc<IoRuntime>,
         dispatcher: DispatcherClient,
         thread: Thread,
-        signal: performables::arc::Arc<WorkerSignal>,
+        signal: Arc<WorkerSignal>,
         command_rx: channel::Receiver<DriverCommand>,
         sink: Sink,
-    ) {
+    ) -> Rc<Self> {
         let owner_waker = WorkerSignal::waker(&signal);
-        CURRENT.with_borrow_mut(|current| {
-            assert!(current.is_none(), "an I/O driver host is already installed on this worker");
-            *current = Some(Rc::new(Self {
-                runtime,
-                dispatcher,
-                thread,
-                owner_waker,
-                signal,
-                command_rx,
-                sink,
-                contexts: RefCell::new(HashMap::default()),
-                initializing: RefCell::new(HashSet::default()),
-            }));
+        let host = Rc::new(Self {
+            runtime,
+            dispatcher,
+            thread,
+            owner_waker,
+            signal,
+            command_rx,
+            sink,
+            contexts: RefCell::new(HashMap::default()),
+            initializing: RefCell::new(HashSet::default()),
         });
+        CURRENT.with_borrow_mut(|current| {
+            assert!(
+                current.as_ref().and_then(Weak::upgrade).is_none(),
+                "an I/O driver host is already installed on this worker"
+            );
+            *current = Some(Rc::downgrade(&host));
+        });
+        host
     }
 
     pub(crate) fn try_context_current<C>(
         runtime: &Arc<IoRuntime>,
         thread: &Thread,
         options: impl FnOnce() -> C::ContextOptions,
-    ) -> Result<(C, bool), Error>
+    ) -> Option<Result<(C, bool), Error>>
     where
         C: IoContext,
         C::ContextOptions: Clone,
     {
-        CURRENT.with_borrow(|current| {
-            let host = current.as_ref().ok_or_else(Error::io_outside_worker)?;
-            debug_assert!(Arc::ptr_eq(&host.runtime, runtime));
-            debug_assert_eq!(host.thread, *thread);
-            host.try_context(options)
-        })
+        Self::current(runtime, thread).map(|host| host.try_context(options))
     }
 
-    pub(crate) fn is_current(runtime: &Arc<IoRuntime>, thread: &Thread) -> bool {
+    fn current(runtime: &Arc<IoRuntime>, thread: &Thread) -> Option<Rc<Self>> {
         CURRENT.with_borrow(|current| {
             current
                 .as_ref()
-                .is_some_and(|host| Arc::ptr_eq(&host.runtime, runtime) && host.thread == *thread)
+                .and_then(Weak::upgrade)
+                .filter(|host| Arc::ptr_eq(&host.runtime, runtime) && host.thread == *thread)
         })
-    }
-
-    pub(crate) fn prepare_current<C>(runtime: &Arc<IoRuntime>, thread: &Thread)
-    where
-        C: IoContext,
-    {
-        CURRENT.with_borrow(|current| {
-            let host = current
-                .as_ref()
-                .expect("I/O initialization commands run only on active runtime workers");
-            debug_assert!(Arc::ptr_eq(&host.runtime, runtime));
-            debug_assert_eq!(host.thread, *thread);
-            host.prepare::<C>();
-        });
-    }
-
-    pub(crate) fn process_current_commands() {
-        CURRENT.with_borrow(|current| {
-            if let Some(host) = current {
-                host.process_commands();
-            }
-        });
     }
 
     pub(crate) fn wait_until_ready_current<C>(runtime: &Arc<IoRuntime>, thread: &Thread) -> Result<(), Error>
     where
         C: IoContext,
     {
-        CURRENT.with_borrow(|current| {
-            let host = current.as_ref().ok_or_else(Error::io_outside_worker)?;
-            debug_assert!(Arc::ptr_eq(&host.runtime, runtime));
-            debug_assert_eq!(host.thread, *thread);
-            host.wait_until_ready::<C>()
-        })
-    }
-
-    pub(crate) fn execute_current(max_wait: Duration) -> Result<(), ()> {
-        CURRENT.with_borrow(|current| {
-            let Some(host) = current.as_ref() else { return Ok(()) };
-            host.execute_cycle(max_wait).map_err(|error| {
-                host.fail(error);
-            })
-        })
-    }
-
-    pub(crate) fn shutdown_current() {
-        let host = CURRENT.with_borrow_mut(Option::take);
-        if let Some(host) = host {
-            host.shutdown();
-        }
+        Self::current(runtime, thread)
+            .ok_or_else(Error::io_outside_worker)?
+            .wait_until_ready::<C>()
     }
 
     fn try_context<C>(&self, options: impl FnOnce() -> C::ContextOptions) -> Result<(C, bool), Error>
@@ -185,6 +151,9 @@ impl DriverHost {
         C: IoContext,
         C::ContextOptions: Clone,
     {
+        if let Some(error) = Self::runtime_error(&self.runtime, &self.dispatcher) {
+            return Err(error);
+        }
         let context_type = TypeId::of::<C>();
         assert!(
             self.initializing.borrow_mut().insert(context_type),
@@ -233,20 +202,19 @@ impl DriverHost {
         }
     }
 
-    fn prepare<C>(&self)
+    pub(crate) fn prepare<C>(&self)
     where
         C: IoContext,
     {
-        if self.dispatcher.is_shutting_down() {
+        if Self::runtime_error(&self.runtime, &self.dispatcher).is_some() {
             return;
         }
         if self.contexts.borrow().contains_key(&TypeId::of::<C>()) {
             return;
         }
-        let (mut context, allowed_roles) = self
-            .runtime
-            .prepared::<C>(&self.thread)
-            .expect("I/O initialization is dispatched only after registration is published");
+        let Some((mut context, allowed_roles)) = self.runtime.prepared::<C>(&self.thread) else {
+            return;
+        };
         match self.initialize_driver::<C>(&mut context, &allowed_roles) {
             Ok((driver, role)) => self.insert_local::<C>(context, driver, role),
             Err(error) => {
@@ -255,9 +223,9 @@ impl DriverHost {
         }
     }
 
-    fn process_commands(&self) {
+    pub(crate) fn process_commands(&self) {
         while let Ok(command) = self.command_rx.try_recv() {
-            command();
+            command(self);
         }
     }
 
@@ -272,11 +240,11 @@ impl DriverHost {
             if self.dispatcher.is_shutting_down() {
                 return Err(self.runtime.failure().unwrap_or_else(Error::runtime_shutting_down));
             }
-            match self.command_rx.try_recv() {
-                Ok(command) => command(),
-                Err(error) => assert!(error.is_empty(), "I/O command channel closed while its dispatcher is retained"),
+            match self.command_rx.recv_timeout(Duration::from_millis(1)) {
+                Ok(command) => command(self),
+                Err(error) if error.is_timeout() => {}
+                Err(_) => return Err(self.runtime.failure().unwrap_or_else(Error::runtime_shutting_down)),
             }
-            thread::yield_now();
         }
     }
 
@@ -356,13 +324,13 @@ impl DriverHost {
             .clone()
     }
 
-    fn execute_cycle(&self, max_wait: Duration) -> Result<(), DriverError> {
+    pub(crate) fn execute_cycle(&self, max_wait: Duration) -> Result<(), Error> {
         let mut contexts = self.contexts.borrow_mut();
         for local in contexts.values_mut().filter(|local| local.role == DriverRole::Secondary) {
-            Self::execute_driver(local, Duration::ZERO, &self.sink)?;
+            Self::execute_driver(local, Duration::ZERO, &self.sink).map_err(|error| self.fail(error))?;
         }
         if let Some(primary) = contexts.values_mut().find(|local| local.role == DriverRole::Primary) {
-            Self::execute_driver(primary, max_wait, &self.sink)?;
+            Self::execute_driver(primary, max_wait, &self.sink).map_err(|error| self.fail(error))?;
         }
         Ok(())
     }
@@ -390,7 +358,13 @@ impl DriverHost {
         Error::io_failure(error)
     }
 
-    fn shutdown(&self) {
+    fn runtime_error(runtime: &IoRuntime, dispatcher: &DispatcherClient) -> Option<Error> {
+        runtime
+            .failure()
+            .or_else(|| dispatcher.is_shutting_down().then(Error::runtime_shutting_down))
+    }
+
+    pub(crate) fn shutdown(&self) {
         self.signal.clear_primary_waker();
 
         let mut primary = None;

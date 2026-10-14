@@ -97,6 +97,7 @@ where
     clock_driver: ClockDriver,
 
     signal: Arc<WorkerSignal>,
+    driver_host: Option<Rc<DriverHost>>,
     _single_threaded: PhantomData<*const ()>,
 }
 
@@ -118,6 +119,7 @@ where
         signal: Arc<WorkerSignal>,
         shutdown_signal: Arc<AtomicBool>,
         thread_state_constructed_tx: channel::Sender<()>,
+        driver_host: Option<Rc<DriverHost>>,
     ) -> Self
     where
         TSFF: FnOnce(TaskSet, Clock) -> TSF + 'static,
@@ -157,6 +159,7 @@ where
             clock_driver,
             blocking_worker,
             signal,
+            driver_host,
             _single_threaded: PhantomData,
         }
     }
@@ -176,7 +179,9 @@ where
 
     fn execute_step(&mut self) -> ControlFlow<()> {
         let batch_exhausted = self.process_commands();
-        DriverHost::process_current_commands();
+        if let Some(driver_host) = &self.driver_host {
+            driver_host.process_commands();
+        }
 
         let cycle_outcome = self
             .executor
@@ -191,24 +196,23 @@ where
 
         // Advances the timers registered with the clock.
         _ = self.clock_driver.advance_timers(Instant::now());
+        let can_suspend = matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted;
+        let max_wait = if can_suspend { SUSPEND_SLEEP_DURATION } else { Duration::ZERO };
+        let cycle_started = Instant::now();
+        if let Some(driver_host) = &self.driver_host {
+            if driver_host.execute_cycle(max_wait).is_err() {
+                self.begin_shutdown();
+                return ControlFlow::Continue(());
+            }
+        }
 
         match cycle_outcome {
             // Retain the donor's timer cadence, including externally controlled clocks.
             // A notification arriving before this wait is retained by WorkerSignal.
             CycleOutcome::Suspend if !batch_exhausted => {
-                let cycle_started = Instant::now();
-                if DriverHost::execute_current(SUSPEND_SLEEP_DURATION).is_err() {
-                    self.begin_shutdown();
-                    return ControlFlow::Continue(());
-                }
-                self.signal.wait(SUSPEND_SLEEP_DURATION.saturating_sub(cycle_started.elapsed()));
+                self.signal.wait(max_wait.saturating_sub(cycle_started.elapsed()));
             }
-            CycleOutcome::Continue | CycleOutcome::Suspend => {
-                if DriverHost::execute_current(Duration::ZERO).is_err() {
-                    self.begin_shutdown();
-                    return ControlFlow::Continue(());
-                }
-            }
+            CycleOutcome::Continue | CycleOutcome::Suspend => {}
             // This is the only way to exit the loop, guaranteeing safe shutdown of the
             // executor. The storage has already been retired before timer callbacks run.
             CycleOutcome::Shutdown => return ControlFlow::Break(()),
@@ -279,7 +283,9 @@ where
     #[cfg_attr(test, mutants::skip)] // If mutated, shutdown process will never finish - will hang.
     fn begin_shutdown(&mut self) {
         Scheduler::clear_current();
-        DriverHost::shutdown_current();
+        if let Some(driver_host) = self.driver_host.take() {
+            driver_host.shutdown();
+        }
         // Drop the thread state, as it may hold references to resources that
         // block executor shutdown (via various futures, waiters, etc).
         self.thread_state = None;
@@ -414,6 +420,7 @@ mod tests {
                     Arc::clone(&signal),
                     Arc::clone(&shutdown_signal),
                     ready_tx,
+                    None,
                 )
             };
             let mut scenario = Self {
@@ -617,6 +624,7 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
+                None,
             )
         };
         let executor = worker.executor.as_ref().unwrap();
@@ -654,6 +662,7 @@ mod tests {
                 Arc::clone(&signal),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
+                None,
             )
         };
         assert!(worker.execute_step().is_continue());
@@ -704,6 +713,7 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::new(AtomicBool::new(false)),
                 ready_tx,
+                None,
             )
         };
         let _ = worker.executor.as_ref().unwrap().execute_cycle();
@@ -744,6 +754,7 @@ mod tests {
                         signal,
                         Arc::new(AtomicBool::new(false)),
                         channel::unbounded().0,
+                        None,
                     )
                 };
                 worker.run();
@@ -816,6 +827,7 @@ mod tests {
                         signal,
                         Arc::new(AtomicBool::new(false)),
                         constructed_tx,
+                        None,
                     )
                 };
 
@@ -873,6 +885,7 @@ mod tests {
                     signal,
                     Arc::new(AtomicBool::new(false)),
                     channel::unbounded().0,
+                    None,
                 )
             };
             worker.run();
@@ -918,6 +931,7 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::clone(&shutdown_signal),
                 ready_tx,
+                None,
             )
         };
         let _ = worker.executor.as_ref().unwrap().execute_cycle();
@@ -956,6 +970,7 @@ mod tests {
                 Arc::new(WorkerSignal::default()),
                 Arc::new(AtomicBool::new(false)),
                 channel::unbounded().0,
+                None,
             )
         };
 

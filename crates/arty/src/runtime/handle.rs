@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use performables::arc::Arc as PArc;
+
+use crate::io::IoRuntime;
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::error::Error;
@@ -52,6 +55,7 @@ use crate::task::{RuntimeScheduler, Scheduler};
 #[derive(Debug)]
 pub struct Runtime {
     scheduler: RuntimeScheduler,
+    io_runtime: PArc<IoRuntime>,
     shutdown_on_drop: bool,
 }
 
@@ -180,12 +184,14 @@ impl Runtime {
         if self.scheduler.dispatcher.is_current_blocking_task() {
             return Err(Error::shutdown_wait_from_blocking_callback());
         }
-        self.scheduler.dispatcher.wait()
+        self.scheduler.dispatcher.wait()?;
+        self.io_runtime.failure().map_or(Ok(()), Err)
     }
 
-    pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient) -> Self {
+    pub(in crate::runtime) const fn with_dispatcher(dispatcher: DispatcherClient, io_runtime: PArc<IoRuntime>) -> Self {
         Self {
             scheduler: RuntimeScheduler::new(dispatcher),
+            io_runtime,
             shutdown_on_drop: true,
         }
     }
@@ -236,7 +242,7 @@ mod tests {
             nonempty::NonEmpty::new(endpoint),
             Sink::noop(),
         )));
-        let runtime = Runtime::with_dispatcher(dispatcher);
+        let runtime = Runtime::with_dispatcher(dispatcher, PArc::new(IoRuntime::default()));
         assert!(runtime.stop().unwrap_err().to_string().contains("panicked"));
     }
 
