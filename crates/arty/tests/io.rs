@@ -8,8 +8,6 @@
 
 testing_aids::init_tracing!();
 
-mod support;
-
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -23,13 +21,39 @@ use std::{fmt, thread};
 use arty::core::{Thread, ThreadAware};
 use arty::io::Io;
 use arty::runtime::{Runtime, RuntimeBuilder, RuntimeOperations, WorkersPolicy};
-use arty::task::Scheduler;
+use arty::task::{JoinError, JoinHandle, Scheduler};
 use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
 use observed_testing::{CapturedEvent, MockProcessor, TEST_ID, test_emitter};
 use static_assertions::assert_impl_all;
-use support::JoinHandleExt as _;
 
 const WORKERS: usize = 2;
+
+trait IoJoinHandleExt {
+    type Output;
+
+    fn join(self) -> Result<Self::Output, JoinError>;
+}
+
+impl<R> IoJoinHandleExt for JoinHandle<R>
+where
+    R: Send + 'static,
+{
+    type Output = R;
+
+    fn join(self) -> Result<Self::Output, JoinError> {
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            _ = result_tx.send(futures::executor::block_on(self));
+        });
+        match result_rx.recv_timeout(testing_aids::TEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("I/O task join did not complete before the test deadline: {error}");
+                std::process::abort();
+            }
+        }
+    }
+}
 static INVARIANT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 assert_impl_all!(Io: Clone, Send, ThreadAware);
