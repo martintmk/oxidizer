@@ -11,10 +11,11 @@
 
 use std::thread::ThreadId as StdThreadId;
 
+use arty_io_core::DriverRole;
 use data_privacy::classified;
 use observed::event;
 
-use super::{PANIC_MESSAGE, SYSTEM_METADATA};
+use super::{IO_DRIVER_ERROR_MESSAGE, PANIC_MESSAGE, SYSTEM_METADATA};
 
 /// A system-level metric count (processors, threads, bytes) recorded in telemetry.
 #[classified(SYSTEM_METADATA)]
@@ -51,6 +52,36 @@ pub(crate) struct BlockingWorkerPoolMode(pub &'static str);
 #[classified(SYSTEM_METADATA)]
 #[derive(Clone, Copy)]
 pub(crate) struct PlacementLabel(pub &'static str);
+
+/// The concrete I/O context type associated with a driver.
+#[classified(SYSTEM_METADATA)]
+#[derive(Clone, Copy)]
+pub(crate) struct IoContextName(pub &'static str);
+
+/// The fixed waiting role selected by an I/O driver.
+#[classified(SYSTEM_METADATA)]
+#[derive(Clone, Copy)]
+pub(crate) struct IoDriverRoleLabel(pub &'static str);
+
+/// Diagnostic message reported by an I/O driver infrastructure failure.
+#[classified(IO_DRIVER_ERROR_MESSAGE)]
+#[derive(Clone)]
+pub(crate) struct IoDriverErrorMessage(pub String);
+
+impl IoDriverErrorMessage {
+    pub(crate) fn new(error: &arty_io_core::DriverError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl From<DriverRole> for IoDriverRoleLabel {
+    fn from(role: DriverRole) -> Self {
+        Self(match role {
+            DriverRole::Primary => "primary",
+            DriverRole::Secondary => "secondary",
+        })
+    }
+}
 
 /// The name of an OS thread the runtime owns.
 #[classified(SYSTEM_METADATA)]
@@ -121,6 +152,52 @@ pub(crate) struct RuntimeStopping;
 #[event("arty.rt.stopped")]
 #[info("runtime stopped")]
 pub(crate) struct RuntimeStopped;
+
+/// Emitted after a worker-local I/O driver completes initialization.
+#[event("arty.rt.io.driver.initialized")]
+#[debug("I/O driver initialized")]
+#[counter(name = "arty.rt.io.driver.initialized")]
+pub(crate) struct IoDriverInitialized {
+    #[dimension(log = "io.context")]
+    pub context: IoContextName,
+    #[dimension(log = "io.driver.role", metric = "io.driver.role")]
+    pub role: IoDriverRoleLabel,
+}
+
+/// Emitted when a worker-local I/O driver cannot be initialized.
+#[event("arty.rt.io.driver.initialization_failed")]
+#[error("I/O driver initialization failed")]
+#[counter(name = "arty.rt.io.driver.initialization_failed")]
+pub(crate) struct IoDriverInitializationFailed {
+    #[dimension(log = "io.context")]
+    pub context: IoContextName,
+    #[dimension(log = "error.message")]
+    pub error: IoDriverErrorMessage,
+}
+
+/// Emitted when a normal I/O driver cycle fails.
+#[event("arty.rt.io.driver.cycle_failed")]
+#[error("I/O driver cycle failed")]
+#[counter(name = "arty.rt.io.driver.cycle_failed")]
+pub(crate) struct IoDriverCycleFailed {
+    #[dimension(log = "io.context")]
+    pub context: IoContextName,
+    #[dimension(log = "io.driver.role", metric = "io.driver.role")]
+    pub role: IoDriverRoleLabel,
+    #[dimension(log = "error.message")]
+    pub error: IoDriverErrorMessage,
+}
+
+/// Emitted when an I/O driver reports a shutdown diagnostic.
+#[event("arty.rt.io.driver.shutdown_failed")]
+#[error("I/O driver shutdown failed")]
+#[counter(name = "arty.rt.io.driver.shutdown_failed")]
+pub(crate) struct IoDriverShutdownFailed {
+    #[dimension(log = "io.context")]
+    pub context: IoContextName,
+    #[dimension(log = "error.message")]
+    pub error: IoDriverErrorMessage,
+}
 
 /// Emitted when an async worker thread starts.
 #[event("arty.rt.async_worker.started")]

@@ -99,6 +99,17 @@ impl DispatcherClient {
     {
         self.core.spawn_everywhere(make_factory)
     }
+
+    pub(crate) fn prepare_io_everywhere<C>(&self) -> bool
+    where
+        C: arty_io_core::IoContext,
+    {
+        self.core.prepare_io_everywhere::<C>()
+    }
+
+    pub(crate) fn access_io(&self, worker_index: WorkerIndex, access: Box<dyn FnOnce(&Builtins) + Send>) -> bool {
+        self.core.access_io(worker_index, access)
+    }
 }
 
 impl DispatcherClient {
@@ -134,6 +145,7 @@ mod tests {
         let (command_tx, _commands) = channel::unbounded();
         let worker = WorkerEndpoint {
             command_tx,
+            io_command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: test_threads(1).pop().unwrap(),
             blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
@@ -157,6 +169,7 @@ mod tests {
         let (command_tx, _commands) = channel::unbounded();
         let worker = WorkerEndpoint {
             command_tx,
+            io_command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: test_threads(1).pop().unwrap(),
             blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
@@ -185,12 +198,14 @@ mod tests {
             nonempty::NonEmpty::from_vec(vec![
                 WorkerEndpoint {
                     command_tx: worker0_tx,
+                    io_command_tx: channel::unbounded().0,
                     waker: Waker::noop().clone(),
                     thread: threads[0].clone(),
                     blocking_worker: Arc::clone(&blocking_worker),
                 },
                 WorkerEndpoint {
                     command_tx: worker1_tx,
+                    io_command_tx: channel::unbounded().0,
                     waker: Waker::noop().clone(),
                     thread: threads[1].clone(),
                     blocking_worker: Arc::clone(&blocking_worker),
@@ -230,12 +245,14 @@ mod tests {
             nonempty::NonEmpty::from_vec(vec![
                 WorkerEndpoint {
                     command_tx: channel::unbounded().0,
+                    io_command_tx: channel::unbounded().0,
                     waker: Waker::noop().clone(),
                     thread: threads[0].clone(),
                     blocking_worker: Arc::clone(&source_worker),
                 },
                 WorkerEndpoint {
                     command_tx: channel::unbounded().0,
+                    io_command_tx: channel::unbounded().0,
                     waker: Waker::noop().clone(),
                     thread: threads[1].clone(),
                     blocking_worker: Arc::clone(&destination_worker),

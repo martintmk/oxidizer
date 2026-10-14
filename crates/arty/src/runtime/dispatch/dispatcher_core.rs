@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Waker;
 use std::thread::ThreadId;
@@ -12,6 +13,7 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::Thread;
 
+use crate::io::{DriverHost, IoRuntime};
 use crate::runtime::Error;
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::telemetry::events::{PlacementLabel, RuntimeStopped, RuntimeStopping, TaskSpawned};
@@ -24,6 +26,7 @@ use crate::task::join::JoinHandle;
 #[derive(Debug)]
 pub(in crate::runtime) struct WorkerEndpoint {
     pub(in crate::runtime) command_tx: channel::Sender<AsyncWorkerCommand>,
+    pub(in crate::runtime) io_command_tx: channel::Sender<crate::io::DriverCommand>,
     pub(in crate::runtime) waker: Waker,
     pub(in crate::runtime) thread: Thread,
     pub(in crate::runtime) blocking_worker: Arc<BlockingWorker>,
@@ -71,12 +74,19 @@ pub(in crate::runtime) struct DispatcherCore<WFS> {
     /// Sink for runtime telemetry. Enrichment context is captured from it at spawn time and
     /// restored on every poll of spawned futures.
     sink: observed::Sink,
+    io_runtime: StdArc<IoRuntime>,
 }
 
 impl<WFS> DispatcherCore<WFS> {
     #[cfg(test)]
     pub(in crate::runtime) fn new(wait_for_shutdown: WFS, worker_endpoints: NonEmpty<WorkerEndpoint>, sink: observed::Sink) -> Self {
-        Self::new_with_shutdown(wait_for_shutdown, worker_endpoints, sink, Arc::new(AtomicBool::new(false)))
+        Self::new_with_shutdown(
+            wait_for_shutdown,
+            worker_endpoints,
+            sink,
+            Arc::new(AtomicBool::new(false)),
+            StdArc::new(IoRuntime::default()),
+        )
     }
 
     pub(in crate::runtime) fn new_with_shutdown(
@@ -84,6 +94,7 @@ impl<WFS> DispatcherCore<WFS> {
         worker_endpoints: NonEmpty<WorkerEndpoint>,
         sink: observed::Sink,
         shutdown_started: Arc<AtomicBool>,
+        io_runtime: StdArc<IoRuntime>,
     ) -> Self {
         let owner = worker_endpoints.first().thread.owner();
         assert!(
@@ -108,6 +119,7 @@ impl<WFS> DispatcherCore<WFS> {
             worker_indices,
             next_async_worker_index: AtomicUsize::new(0),
             sink,
+            io_runtime,
         }
     }
 
@@ -159,6 +171,41 @@ impl<WFS> DispatcherCore<WFS> {
         (0..self.worker_endpoints.len())
             .map(|index| self.enqueue(WorkerIndex(index), "any", make_factory()))
             .collect()
+    }
+
+    pub(in crate::runtime) fn prepare_io_everywhere<C>(&self) -> bool
+    where
+        C: arty_io_core::IoContext,
+    {
+        if self.is_shutting_down() {
+            return false;
+        }
+
+        for endpoint in &self.worker_endpoints {
+            let runtime = StdArc::clone(&self.io_runtime);
+            let thread = endpoint.thread.clone();
+            let send_result = endpoint.io_command_tx.send(Box::new(move || {
+                DriverHost::prepare_current::<C>(&runtime, &thread);
+            }));
+            endpoint.waker.wake_by_ref();
+            if send_result.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(in crate::runtime) fn access_io(&self, worker_index: WorkerIndex, access: Box<dyn FnOnce(&Builtins) + Send>) -> bool {
+        if self.is_shutting_down() {
+            return false;
+        }
+        let endpoint = self
+            .worker_endpoints
+            .get(usize::from(worker_index))
+            .expect("worker index must identify a registered runtime worker");
+        let send_result = endpoint.command_tx.send(AsyncWorkerCommand::AccessIo { access: Some(access) });
+        endpoint.waker.wake_by_ref();
+        send_result.is_ok()
     }
 
     pub(in crate::runtime) fn owns(&self, thread: &Thread) -> bool {
@@ -256,7 +303,7 @@ where
         if !self.stopped_reported.swap(true, Ordering::Relaxed) {
             emit!(&self.sink, RuntimeStopped);
         }
-        outcome
+        outcome.and_then(|()| self.io_runtime.failure().map_or(Ok(()), Err))
     }
 }
 
@@ -278,6 +325,7 @@ mod tests {
     fn endpoint(tx: channel::Sender<AsyncWorkerCommand>, thread: &Thread) -> WorkerEndpoint {
         WorkerEndpoint {
             command_tx: tx,
+            io_command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: thread.clone(),
             blocking_worker: BlockingWorker::new(BlockingPool::new(None), observed::Sink::noop()),

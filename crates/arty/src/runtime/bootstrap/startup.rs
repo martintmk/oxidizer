@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::rc::Rc;
+use std::sync::Arc as StdArc;
 use std::sync::atomic::AtomicBool;
 use std::task::Waker;
 use std::thread;
@@ -16,6 +17,7 @@ use performables::sync::channel::{OneshotReceiver, Sender};
 use thread_aware::{Thread, ThreadAware, ThreadBuilder};
 use tick::runtime::InactiveClock;
 
+use crate::io::{DriverCommand, DriverHost, Io, IoRuntime};
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::bootstrap::pools::BlockingPools;
 use crate::runtime::config::RuntimeConfig;
@@ -69,6 +71,7 @@ pub(in crate::runtime) fn build(
 
     let worker_count = processors.len();
     let shutdown_started = Arc::new(AtomicBool::new(false));
+    let io_runtime = StdArc::new(IoRuntime::new(worker_count));
     let blocking_pools = processor_config.blocking_pool_policy.into_pools().inspect_err(|_| {
         emit!(
             &sink,
@@ -80,6 +83,7 @@ pub(in crate::runtime) fn build(
 
     for (worker_index, processor) in processors.into_iter().enumerate() {
         let (command_tx, command_rx) = channel::unbounded();
+        let (io_command_tx, io_command_rx) = channel::unbounded::<DriverCommand>();
         let (worker_endpoint_tx, worker_endpoint_rx) = channel::unbounded();
         let (start_tx, start_rx) = channel::oneshot();
         let (success_tx, success_rx) = channel::unbounded();
@@ -89,6 +93,7 @@ pub(in crate::runtime) fn build(
         async_worker_join_handles.push(
             AsyncWorkerStartInfo {
                 command_rx,
+                io_command_rx,
                 stack_size,
                 start_rx,
                 success_tx,
@@ -99,6 +104,7 @@ pub(in crate::runtime) fn build(
                 thread_builder: thread_builder.clone(),
                 blocking_pools: blocking_pools.clone(),
                 shutdown_started: Arc::clone(&shutdown_started),
+                io_runtime: StdArc::clone(&io_runtime),
                 sink: sink.clone(),
             }
             .start(),
@@ -109,6 +115,7 @@ pub(in crate::runtime) fn build(
             .expect("failed to receive the worker endpoint from the starting worker");
         async_worker_command_txs.push(WorkerEndpoint {
             command_tx,
+            io_command_tx,
             waker,
             thread,
             blocking_worker,
@@ -123,6 +130,7 @@ pub(in crate::runtime) fn build(
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown_started,
+        StdArc::clone(&io_runtime),
     ));
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
@@ -157,6 +165,7 @@ pub(in crate::runtime) fn build(
 #[derive(Debug)]
 struct AsyncWorkerStartInfo {
     command_rx: channel::Receiver<AsyncWorkerCommand>,
+    io_command_rx: channel::Receiver<DriverCommand>,
     stack_size: usize,
     start_rx: OneshotReceiver<StartWorker>,
     success_tx: Sender<()>,
@@ -167,6 +176,7 @@ struct AsyncWorkerStartInfo {
     thread_builder: ThreadBuilder,
     blocking_pools: BlockingPools,
     shutdown_started: Arc<AtomicBool>,
+    io_runtime: StdArc<IoRuntime>,
     sink: Sink,
 }
 
@@ -184,6 +194,7 @@ impl AsyncWorkerStartInfo {
     fn run_worker_thread(self) {
         let Self {
             command_rx,
+            io_command_rx,
             stack_size: _stack_size,
             start_rx,
             success_tx,
@@ -194,6 +205,7 @@ impl AsyncWorkerStartInfo {
             thread_builder,
             blocking_pools,
             shutdown_started,
+            io_runtime,
             sink,
         } = self;
 
@@ -228,10 +240,19 @@ impl AsyncWorkerStartInfo {
 
         let dispatcher = Rc::new(start_signal.dispatcher);
         let shutdown_signal = dispatcher.shutdown_signal();
+        let io = Io::new(StdArc::clone(&io_runtime), dispatcher.as_ref().clone(), current.clone());
+        DriverHost::install(
+            io_runtime,
+            dispatcher.as_ref().clone(),
+            current.clone(),
+            Arc::clone(&signal),
+            io_command_rx,
+            sink.clone(),
+        );
 
         let thread_state_constructor = {
             async move |tasks: TaskSet, clock| {
-                let builtins = Builtins::sync_init(RuntimeBuiltins::new(&dispatcher, clock, current, sink));
+                let builtins = Builtins::sync_init(RuntimeBuiltins::new(&dispatcher, clock, io, current, sink));
                 Scheduler::register_current(builtins.clone(), tasks);
                 builtins
             }

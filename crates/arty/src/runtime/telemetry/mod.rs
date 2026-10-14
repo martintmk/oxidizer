@@ -12,3 +12,4 @@ pub(crate) mod events;
 /// the separate `arty/PanicMessage` class. Metric values themselves remain numeric.
 pub(super) static SYSTEM_METADATA: data_privacy::DataClass = data_privacy::DataClass::new("arty", "SystemMetadata");
 pub(super) static PANIC_MESSAGE: data_privacy::DataClass = data_privacy::DataClass::new("arty", "PanicMessage");
+pub(super) static IO_DRIVER_ERROR_MESSAGE: data_privacy::DataClass = data_privacy::DataClass::new("arty", "IoDriverErrorMessage");

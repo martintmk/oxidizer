@@ -18,6 +18,7 @@ repository = "https://github.com/microsoft/oxidizer/tree/main/crates/arty"
 
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
+    "arty_io_core::io_context::IoContext",
     "arty_macros::main",
     "arty_macros::test",
     "observed::sink::core::Sink",
@@ -126,6 +127,10 @@ required-features = ["rt"]
 
 [[example]]
 name = "arty_basic"
+required-features = ["macros"]
+
+[[example]]
+name = "arty_io"
 required-features = ["macros"]
 
 # >>> anvil-managed: anvil-lints

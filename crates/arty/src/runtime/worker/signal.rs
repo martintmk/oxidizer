@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Arc as StdArc;
+use std::sync::{Arc as StdArc, OnceLock};
 use std::task::{Wake, Waker};
 use std::time::Duration;
 
@@ -11,9 +11,10 @@ use performables::sync::mutex::Mutex;
 
 /// A coalescing notification shared by task wakers and the command dispatcher.
 #[derive(Debug, Default)]
-pub(in crate::runtime) struct WorkerSignal {
+pub(crate) struct WorkerSignal {
     notified: Mutex<bool>,
     ready: Condvar,
+    primary_waker: OnceLock<Waker>,
 }
 
 fn should_finish_wait(timed_out: bool, elapsed: Duration, timeout: Duration) -> bool {
@@ -40,7 +41,7 @@ fn wait_until_deadline<S>(
 }
 
 impl WorkerSignal {
-    pub(in crate::runtime) fn wait(&self, timeout: Duration) {
+    pub(crate) fn wait(&self, timeout: Duration) {
         let start = std::time::Instant::now();
         let mut notified = Some(self.notified.lock());
         wait_until_deadline(
@@ -67,7 +68,7 @@ impl WorkerSignal {
         *notified = false;
     }
 
-    pub(in crate::runtime) fn waker(signal: &Arc<Self>) -> Waker {
+    pub(crate) fn waker(signal: &Arc<Self>) -> Waker {
         // Wake requires a standard Arc; both handles share the same allocation.
         Waker::from(Arc::into_std_arc(Arc::clone(signal)))
     }
@@ -79,8 +80,17 @@ impl WorkerSignal {
         *self.notified.lock()
     }
 
+    pub(crate) fn set_primary_waker(&self, waker: Waker) {
+        self.primary_waker
+            .set(waker)
+            .expect("a worker initializes at most one primary I/O driver");
+    }
+
     fn notify(&self) {
         *self.notified.lock() = true;
+        if let Some(primary_waker) = self.primary_waker.get() {
+            primary_waker.wake_by_ref();
+        }
         self.wake_waiter();
     }
 
