@@ -21,8 +21,12 @@ where
         std::thread::spawn(move || {
             _ = result_tx.send(futures::executor::block_on(self));
         });
-        result_rx
-            .recv_timeout(TEST_TIMEOUT)
-            .expect("task join did not complete before the test deadline")
+        match result_rx.recv_timeout(TEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("task join did not complete before the test deadline: {error}");
+                std::process::abort();
+            }
+        }
     }
 }
