@@ -191,21 +191,24 @@ where
 
         // Advances the timers registered with the clock.
         _ = self.clock_driver.advance_timers(Instant::now());
-        let can_suspend = matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted;
-        let max_wait = if can_suspend { SUSPEND_SLEEP_DURATION } else { Duration::ZERO };
-        let cycle_started = Instant::now();
-        if DriverHost::execute_current(max_wait).is_err() {
-            self.begin_shutdown();
-            return ControlFlow::Continue(());
-        }
 
         match cycle_outcome {
             // Retain the donor's timer cadence, including externally controlled clocks.
             // A notification arriving before this wait is retained by WorkerSignal.
             CycleOutcome::Suspend if !batch_exhausted => {
-                self.signal.wait(max_wait.saturating_sub(cycle_started.elapsed()));
+                let cycle_started = Instant::now();
+                if DriverHost::execute_current(SUSPEND_SLEEP_DURATION).is_err() {
+                    self.begin_shutdown();
+                    return ControlFlow::Continue(());
+                }
+                self.signal.wait(SUSPEND_SLEEP_DURATION.saturating_sub(cycle_started.elapsed()));
             }
-            CycleOutcome::Continue | CycleOutcome::Suspend => {}
+            CycleOutcome::Continue | CycleOutcome::Suspend => {
+                if DriverHost::execute_current(Duration::ZERO).is_err() {
+                    self.begin_shutdown();
+                    return ControlFlow::Continue(());
+                }
+            }
             // This is the only way to exit the loop, guaranteeing safe shutdown of the
             // executor. The storage has already been retired before timer callbacks run.
             CycleOutcome::Shutdown => return ControlFlow::Break(()),

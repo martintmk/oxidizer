@@ -237,7 +237,7 @@ impl DriverHost {
     where
         C: IoContext,
     {
-        if Self::runtime_error(&self.runtime, &self.dispatcher).is_some() {
+        if self.runtime.failure().is_some() || self.dispatcher.is_shutting_down() {
             return;
         }
         if self.contexts.borrow().contains_key(&TypeId::of::<C>()) {
@@ -388,12 +388,6 @@ impl DriverHost {
         let error = runtime.record_failure(error);
         dispatcher.stop();
         Error::io_failure(error)
-    }
-
-    fn runtime_error(runtime: &IoRuntime, dispatcher: &DispatcherClient) -> Option<Error> {
-        runtime
-            .failure()
-            .or_else(|| dispatcher.is_shutting_down().then(Error::runtime_shutting_down))
     }
 
     fn shutdown(&self) {
