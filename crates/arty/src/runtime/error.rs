@@ -3,9 +3,9 @@
 
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
-use std::sync::Arc;
 
 use arty_io_core::DriverError;
+use performables::arc::Arc;
 
 /// An error constructing or operating a runtime.
 ///

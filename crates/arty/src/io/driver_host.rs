@@ -5,7 +5,6 @@ use std::any::{Any, TypeId, type_name};
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::{Rc, Weak};
-use std::task::Waker;
 use std::time::Duration;
 
 use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
@@ -71,7 +70,6 @@ pub(crate) struct DriverHost {
     runtime: Arc<IoRuntime>,
     dispatcher: DispatcherClient,
     thread: Thread,
-    owner_waker: Waker,
     signal: Arc<WorkerSignal>,
     command_rx: channel::Receiver<DriverCommand>,
     sink: Sink,
@@ -96,12 +94,10 @@ impl DriverHost {
         command_rx: channel::Receiver<DriverCommand>,
         sink: Sink,
     ) -> Rc<Self> {
-        let owner_waker = WorkerSignal::waker(&signal);
         let host = Rc::new(Self {
             runtime,
             dispatcher,
             thread,
-            owner_waker,
             signal,
             command_rx,
             sink,
@@ -170,7 +166,7 @@ impl DriverHost {
                 Resolution::Register(reservation) => {
                     let mut context = C::context(options());
                     context.relocate(None, &self.thread);
-                    let allowed_roles = reservation.publish(&context, &self.thread);
+                    let allowed_roles = reservation.publish(&context, &self.thread, Arc::clone(&self.signal));
                     (context, allowed_roles, true)
                 }
             };
@@ -235,19 +231,14 @@ impl DriverHost {
         C: IoContext,
     {
         loop {
+            self.process_commands();
             if self.runtime.is_ready::<C>()? {
                 return Ok(());
             }
             if self.dispatcher.is_shutting_down() {
                 return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
             }
-            match self.command_rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(command) => command(self),
-                Err(error) if error.is_timeout() => {}
-                Err(_) => {
-                    return Err(runtime_error(&self.runtime, &self.dispatcher).unwrap_or_else(Error::runtime_shutting_down));
-                }
-            }
+            self.signal.wait_until_notified();
         }
     }
 
@@ -259,7 +250,7 @@ impl DriverHost {
     where
         C: IoContext,
     {
-        let options = DriverOptions::new(self.thread.clone(), self.owner_waker.clone(), allowed_roles.to_vec());
+        let options = DriverOptions::new(self.thread.clone(), WorkerSignal::waker(&self.signal), allowed_roles.to_vec());
         let DriverInstance { driver, role, .. } = context.driver(options).inspect_err(|error| {
             emit!(
                 &self.sink,

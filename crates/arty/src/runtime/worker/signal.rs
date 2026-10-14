@@ -68,6 +68,12 @@ impl WorkerSignal {
         *notified = false;
     }
 
+    #[cfg_attr(test, mutants::skip)] // Mutating the native wait can strand readiness tests.
+    pub(crate) fn wait_until_notified(&self) {
+        let mut notified = self.ready.wait_while(self.notified.lock(), |notified| !*notified);
+        *notified = false;
+    }
+
     pub(crate) fn waker(signal: &Arc<Self>) -> Waker {
         // Wake requires a standard Arc; both handles share the same allocation.
         Waker::from(Arc::into_std_arc(Arc::clone(signal)))
@@ -92,7 +98,7 @@ impl WorkerSignal {
         *self.primary_waker.lock() = None;
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         *self.notified.lock() = true;
         if let Some(primary_waker) = self.primary_waker.lock().as_ref() {
             primary_waker.wake_by_ref();

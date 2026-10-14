@@ -201,10 +201,10 @@ impl Io {
         if Scheduler::is_current_worker_thread() {
             return Err(Error::io_outside_worker());
         }
-        let worker_index = self
-            .dispatcher
-            .worker_index(self.thread.id())
-            .expect("an I/O handle remains bound to a registered runtime worker");
+        let Some(worker_index) = self.dispatcher.worker_index(self.thread.id()) else {
+            return Err(Error::io_outside_worker());
+        };
+        // Cached external access must not clone options merely to cross the worker boundary.
         let options = (!self.runtime.is_registered::<C>()).then(|| options.clone());
         self.try_context_from_external_thread(worker_index, options)
     }
@@ -219,11 +219,12 @@ impl Io {
         let access = Box::new(move |_: &Builtins| {
             let destination = io.thread.clone();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                io.try_context_on_worker(|| {
+                DriverHost::try_context_current(&io.runtime, &io.thread, || {
                     let mut options = options.expect("options are present when the context is not registered");
                     options.relocate(None, &destination);
                     options
                 })
+                .ok_or_else(Error::io_outside_worker)?
             }));
             _ = result_tx.send(result);
         });
@@ -237,14 +238,6 @@ impl Io {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
         }
-    }
-
-    fn try_context_on_worker<C>(&self, options: impl FnOnce() -> C::ContextOptions) -> Result<C, Error>
-    where
-        C: arty_io_core::IoContext,
-        C::ContextOptions: Clone + ThreadAware,
-    {
-        DriverHost::try_context_current(&self.runtime, &self.thread, options).ok_or_else(Error::io_outside_worker)?
     }
 }
 

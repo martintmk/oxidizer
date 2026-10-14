@@ -3,16 +3,16 @@
 
 use std::any::{Any, TypeId};
 use std::fmt;
-use std::sync::Arc;
 use std::thread::ThreadId;
 
 use arty_io_core::{DriverError, DriverRole, IoContext};
 use foldhash::{HashMap, HashSet};
+use performables::arc::Arc;
 use performables::sync::condition::Condvar;
 use performables::sync::mutex::{Mutex, MutexGuard};
 use thread_aware::Thread;
 
-use crate::runtime::Error;
+use crate::runtime::{Error, WorkerSignal};
 
 const PRIMARY_ROLE: &[DriverRole] = &[DriverRole::Primary];
 const SECONDARY_ROLE: &[DriverRole] = &[DriverRole::Secondary];
@@ -48,6 +48,7 @@ struct RegistrationState {
     role: Option<DriverRole>,
     initialized_workers: HashSet<ThreadId>,
     primary_candidate: bool,
+    owner_signal: Arc<WorkerSignal>,
 }
 
 impl RegistrationState {
@@ -88,7 +89,7 @@ pub(crate) struct RegistrationReservation<'a> {
 }
 
 impl RegistrationReservation<'_> {
-    pub(crate) fn publish<C>(mut self, context: &C, thread: &Thread) -> &'static [DriverRole]
+    pub(crate) fn publish<C>(mut self, context: &C, thread: &Thread, owner_signal: Arc<WorkerSignal>) -> &'static [DriverRole]
     where
         C: IoContext,
     {
@@ -107,6 +108,7 @@ impl RegistrationReservation<'_> {
                         role: None,
                         initialized_workers: HashSet::default(),
                         primary_candidate: self.primary_candidate,
+                        owner_signal,
                     },
                 )
                 .is_none(),
@@ -230,7 +232,7 @@ impl IoRuntime {
     {
         let context_type = TypeId::of::<C>();
         let mut registry = self.registry();
-        let primary_candidate = {
+        let (primary_candidate, owner_signal) = {
             let registration = registry
                 .registrations
                 .get_mut(&context_type)
@@ -250,7 +252,7 @@ impl IoRuntime {
                 registration.initialized_workers.insert(worker),
                 "each worker initializes a context driver at most once"
             );
-            primary_candidate
+            (primary_candidate, Arc::clone(&registration.owner_signal))
         };
         if primary_candidate {
             assert_eq!(
@@ -263,7 +265,7 @@ impl IoRuntime {
             }
         }
         drop(registry);
-        self.registration_changed.notify_all();
+        owner_signal.notify();
         Ok(())
     }
 
