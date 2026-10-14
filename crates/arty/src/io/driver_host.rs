@@ -4,7 +4,6 @@
 use std::any::{Any, TypeId, type_name};
 use std::cell::RefCell;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::{Rc, Weak};
 use std::task::Waker;
 use std::time::Duration;
@@ -24,7 +23,6 @@ use crate::runtime::telemetry::events::{
     IoDriverShutdownFailed,
 };
 use crate::runtime::{Error, WorkerSignal};
-use crate::task::execution::discard_panic;
 
 thread_local! {
     static CURRENT: RefCell<Option<Weak<DriverHost>>> = const { RefCell::new(None) };
@@ -253,9 +251,7 @@ impl DriverHost {
         let (driver, role, primary_waker) = self
             .initialize_driver::<C>(&mut context, allowed_roles)
             .map_err(|error| self.fail(error))?;
-        let returned = self
-            .call_provider::<C, _>("context clone", || context.clone())
-            .map_err(|error| self.fail(error))?;
+        let returned = context.clone();
         if let Some(waker) = primary_waker {
             self.signal.set_primary_waker(waker);
         }
@@ -276,17 +272,15 @@ impl DriverHost {
         C: IoContext,
     {
         let options = DriverOptions::new(self.thread.clone(), WorkerSignal::waker(&self.signal), allowed_roles.to_vec());
-        let DriverInstance { driver, role, .. } = self
-            .call_provider::<C, _>("initialization", || context.driver(options))?
-            .inspect_err(|error| {
-                emit!(
-                    &self.sink,
-                    IoDriverInitializationFailed {
-                        context: IoContextName(type_name::<C>()),
-                        error: IoDriverErrorMessage::new(error),
-                    }
-                );
-            })?;
+        let DriverInstance { driver, role, .. } = context.driver(options).inspect_err(|error| {
+            emit!(
+                &self.sink,
+                IoDriverInitializationFailed {
+                    context: IoContextName(type_name::<C>()),
+                    error: IoDriverErrorMessage::new(error),
+                }
+            );
+        })?;
         if !allowed_roles.contains(&role) {
             let error = DriverError::from_message(format!("I/O driver selected disallowed role {role:?}"));
             emit!(
@@ -310,33 +304,8 @@ impl DriverHost {
             Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
             return Err(error);
         }
-        let primary_waker = if role == DriverRole::Primary {
-            Some(self.call_provider::<C, _>("waker", || driver.waker())?)
-        } else {
-            None
-        };
+        let primary_waker = (role == DriverRole::Primary).then(|| driver.waker());
         Ok((Box::new(driver), role, primary_waker))
-    }
-
-    fn call_provider<C, T>(&self, operation: &'static str, callback: impl FnOnce() -> T) -> Result<T, DriverError>
-    where
-        C: IoContext,
-    {
-        match catch_unwind(AssertUnwindSafe(callback)) {
-            Ok(value) => Ok(value),
-            Err(panic) => {
-                let error = DriverError::from_message(format!("I/O driver {operation} panicked"));
-                emit!(
-                    &self.sink,
-                    IoDriverInitializationFailed {
-                        context: IoContextName(type_name::<C>()),
-                        error: IoDriverErrorMessage::new(&error),
-                    }
-                );
-                discard_panic(panic);
-                Err(error)
-            }
-        }
     }
 
     fn insert_local<C>(&self, context: C, driver: Box<dyn ErasedDriver>, role: DriverRole)

@@ -159,8 +159,6 @@ markers!(
     LaterPrimary,
     ShutdownWhileWaiting,
     ReadinessPublication,
-    DriverHookPanic,
-    WakerHookPanic,
     ReentrantCycleA,
     ReentrantCycleB,
     ShutdownTaskCleanup,
@@ -196,8 +194,6 @@ struct Scenario {
     driver_wakes: AtomicUsize,
     block_driver_at: AtomicUsize,
     block_waker_at: AtomicUsize,
-    panic_driver_at: AtomicUsize,
-    panic_waker_at: AtomicUsize,
     driver_gate: Mutex<DriverGate>,
     driver_gate_changed: Condvar,
     context_action: Mutex<Option<ContextAction>>,
@@ -288,8 +284,6 @@ impl Scenario {
             driver_wakes: AtomicUsize::new(0),
             block_driver_at: AtomicUsize::new(0),
             block_waker_at: AtomicUsize::new(0),
-            panic_driver_at: AtomicUsize::new(0),
-            panic_waker_at: AtomicUsize::new(0),
             driver_gate: Mutex::new(DriverGate::default()),
             driver_gate_changed: Condvar::new(),
             context_action: Mutex::new(None),
@@ -452,11 +446,6 @@ impl<M: Marker> IoContext for TestContext<M> {
         assert_eq!(self.thread.as_ref(), Some(options.thread()));
         let attempt = self.scenario.driver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         self.scenario.block_driver_if_configured(attempt);
-        assert_ne!(
-            self.scenario.panic_driver_at.load(Ordering::SeqCst),
-            attempt,
-            "configured driver hook panic"
-        );
         if self.scenario.fail_driver_at.load(Ordering::SeqCst) == attempt {
             let blocked_attempt = self.scenario.block_driver_at.load(Ordering::SeqCst);
             if blocked_attempt != 0 && blocked_attempt != attempt {
@@ -531,11 +520,6 @@ struct TestDriver<M: Marker> {
 impl<M: Marker> Driver for TestDriver<M> {
     fn waker(&self) -> Waker {
         self.scenario.block_waker_if_configured(self.attempt);
-        assert_ne!(
-            self.scenario.panic_waker_at.load(Ordering::SeqCst),
-            self.attempt,
-            "configured driver waker panic"
-        );
         Waker::from(Arc::clone(&self.wake))
     }
 
