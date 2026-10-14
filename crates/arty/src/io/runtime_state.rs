@@ -322,13 +322,13 @@ impl IoRuntime {
                 self.registry.clear_poison();
                 registry
             }
-
-            #[cfg(test)]
-            #[cfg_attr(coverage_nightly, coverage(off))]
-            fn report_resolution_waiting(&self) {
-                self.resolution_waiting.store(true, std::sync::atomic::Ordering::Release);
-            }
         }
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn report_resolution_waiting(&self) {
+        self.resolution_waiting.store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cold]
