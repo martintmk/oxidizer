@@ -172,7 +172,7 @@ impl<WFS> DispatcherCore<WFS> {
         }
 
         for endpoint in &self.worker_endpoints {
-            let send_result = endpoint.io_command_tx.send(Box::new(DriverHost::prepare::<C>));
+            let send_result = endpoint.io_command_tx.send(DriverHost::prepare::<C>);
             endpoint.waker.wake_by_ref();
             if send_result.is_err() {
                 return false;

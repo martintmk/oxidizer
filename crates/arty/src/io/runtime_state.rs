@@ -4,7 +4,7 @@
 use std::any::{Any, TypeId};
 use std::fmt;
 use std::sync::Arc;
-use std::thread::{self, ThreadId};
+use std::thread::ThreadId;
 
 use arty_io_core::{DriverError, DriverRole, IoContext};
 use foldhash::{HashMap, HashSet};
@@ -114,7 +114,7 @@ impl RegistrationReservation<'_> {
         );
         assert_eq!(
             registry.constructing.remove(&self.context_type),
-            Some(thread::current().id()),
+            Some(thread.id()),
             "the publishing thread must own the I/O context construction reservation"
         );
         self.published = true;
@@ -181,7 +181,7 @@ impl IoRuntime {
         C: IoContext,
     {
         let context_type = TypeId::of::<C>();
-        let current_thread = thread::current().id();
+        let current_thread = destination.id();
         let mut registry = self.registry();
         loop {
             if let Some(registration) = registry.registrations.get(&context_type) {

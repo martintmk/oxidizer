@@ -3,10 +3,10 @@
 
 use std::any::{Any, TypeId, type_name};
 use std::cell::RefCell;
+use std::fmt;
 use std::rc::{Rc, Weak};
 use std::task::Waker;
 use std::time::Duration;
-use std::{fmt, thread};
 
 use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
 use foldhash::{HashMap, HashSet};
@@ -122,7 +122,7 @@ impl DriverHost {
         runtime: &Arc<IoRuntime>,
         thread: &Thread,
         options: impl FnOnce() -> C::ContextOptions,
-    ) -> Option<Result<(C, bool), Error>>
+    ) -> Option<Result<C, Error>>
     where
         C: IoContext,
         C::ContextOptions: Clone,
@@ -139,16 +139,7 @@ impl DriverHost {
         })
     }
 
-    pub(crate) fn wait_until_ready_current<C>(runtime: &Arc<IoRuntime>, thread: &Thread) -> Result<(), Error>
-    where
-        C: IoContext,
-    {
-        Self::current(runtime, thread)
-            .ok_or_else(Error::io_outside_worker)?
-            .wait_until_ready::<C>()
-    }
-
-    fn try_context<C>(&self, options: impl FnOnce() -> C::ContextOptions) -> Result<(C, bool), Error>
+    fn try_context<C>(&self, options: impl FnOnce() -> C::ContextOptions) -> Result<C, Error>
     where
         C: IoContext,
         C::ContextOptions: Clone,
@@ -161,34 +152,40 @@ impl DriverHost {
             self.initializing.borrow_mut().insert(context_type),
             "I/O context recursively requested its own registration on one worker"
         );
-        let _initialization = LocalInitialization {
+        let initialization = LocalInitialization {
             initializing: &self.initializing,
             context_type,
         };
         let local = self.contexts.borrow_mut().remove(&context_type);
-        if let Some(local) = local {
+        let (context, registered) = if let Some(local) = local {
             let context = Self::clone_context::<C>(&local);
             assert!(
                 self.contexts.borrow_mut().insert(context_type, local).is_none(),
                 "worker-local I/O initialization cannot replace an existing context"
             );
-            return Ok((context, false));
-        }
-
-        let (mut context, allowed_roles, registered) = match self.runtime.resolve::<C>(&self.thread) {
-            Resolution::Existing { context, allowed_roles } => (context, allowed_roles, false),
-            Resolution::Register(reservation) => {
-                let mut context = C::context(options());
-                context.relocate(None, &self.thread);
-                let allowed_roles = reservation.publish(&context, &self.thread);
-                (context, allowed_roles, true)
-            }
+            (context, false)
+        } else {
+            let (mut context, allowed_roles, registered) = match self.runtime.resolve::<C>(&self.thread) {
+                Resolution::Existing { context, allowed_roles } => (context, allowed_roles, false),
+                Resolution::Register(reservation) => {
+                    let mut context = C::context(options());
+                    context.relocate(None, &self.thread);
+                    let allowed_roles = reservation.publish(&context, &self.thread);
+                    (context, allowed_roles, true)
+                }
+            };
+            let (driver, role) = self
+                .initialize_driver::<C>(&mut context, allowed_roles)
+                .map_err(|error| self.fail(error))?;
+            self.insert_local::<C>(context.clone(), driver, role);
+            (context, registered)
         };
-        let (driver, role) = self
-            .initialize_driver::<C>(&mut context, allowed_roles)
-            .map_err(|error| self.fail(error))?;
-        self.insert_local::<C>(context.clone(), driver, role);
-        Ok((context, registered))
+        drop(initialization);
+        if registered {
+            self.initialize_everywhere::<C>()?;
+        }
+        self.wait_until_ready::<C>()?;
+        runtime_error(&self.runtime, &self.dispatcher).map_or(Ok(context), Err)
     }
 
     pub(crate) fn prepare<C>(&self)
@@ -216,6 +213,21 @@ impl DriverHost {
         while let Ok(command) = self.command_rx.try_recv() {
             command(self);
         }
+    }
+
+    fn initialize_everywhere<C>(&self) -> Result<(), Error>
+    where
+        C: IoContext,
+    {
+        if self.dispatcher.prepare_io_everywhere::<C>() {
+            return Ok(());
+        }
+        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
+            return Err(error);
+        }
+        Err(self.fail(DriverError::from_message(
+            "runtime worker stopped before I/O registration was delivered",
+        )))
     }
 
     fn wait_until_ready<C>(&self) -> Result<(), Error>
@@ -269,7 +281,7 @@ impl DriverHost {
             Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
             return Err(error);
         }
-        if let Err(error) = self.runtime.complete_driver::<C>(thread::current().id(), role) {
+        if let Err(error) = self.runtime.complete_driver::<C>(self.thread.id(), role) {
             emit!(
                 &self.sink,
                 IoDriverInitializationFailed {

@@ -95,7 +95,7 @@ use crate::runtime::Error;
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
 use crate::task::{Builtins, Scheduler};
 
-pub(crate) type DriverCommand = Box<dyn FnOnce(&DriverHost) + Send>;
+pub(crate) type DriverCommand = fn(&DriverHost);
 
 fn runtime_error(runtime: &IoRuntime, dispatcher: &DispatcherClient) -> Option<Error> {
     runtime
@@ -196,7 +196,7 @@ impl Io {
             options.relocate(None, &destination);
             options
         }) {
-            return self.finish_context(result?);
+            return result;
         }
         if Scheduler::is_current_worker_thread() {
             return Err(Error::io_outside_worker());
@@ -244,39 +244,7 @@ impl Io {
         C: arty_io_core::IoContext,
         C::ContextOptions: Clone + ThreadAware,
     {
-        let result = DriverHost::try_context_current(&self.runtime, &self.thread, options).ok_or_else(Error::io_outside_worker)??;
-        self.finish_context(result)
-    }
-
-    fn finish_context<C>(&self, (context, registered): (C, bool)) -> Result<C, Error>
-    where
-        C: arty_io_core::IoContext,
-    {
-        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
-            return Err(error);
-        }
-        if registered {
-            self.initialize_everywhere::<C>()?;
-        }
-        DriverHost::wait_until_ready_current::<C>(&self.runtime, &self.thread)?;
-        runtime_error(&self.runtime, &self.dispatcher).map_or(Ok(context), Err)
-    }
-
-    fn initialize_everywhere<C>(&self) -> Result<(), Error>
-    where
-        C: arty_io_core::IoContext,
-    {
-        if self.dispatcher.prepare_io_everywhere::<C>() {
-            return Ok(());
-        }
-        if let Some(error) = runtime_error(&self.runtime, &self.dispatcher) {
-            return Err(error);
-        }
-        Err(fail_runtime(
-            &self.runtime,
-            &self.dispatcher,
-            DriverError::from_message("runtime worker stopped before I/O registration was delivered"),
-        ))
+        DriverHost::try_context_current(&self.runtime, &self.thread, options).ok_or_else(Error::io_outside_worker)?
     }
 }
 
