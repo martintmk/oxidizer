@@ -4,7 +4,7 @@
 use std::any::{Any, TypeId};
 use std::fmt;
 use std::sync::Arc;
-use std::thread::{self, ThreadId};
+use std::thread::ThreadId;
 
 use arty_io_core::{DriverError, DriverRole, IoContext};
 use foldhash::{HashMap, HashSet};
@@ -58,7 +58,7 @@ struct Registry {
     registrations: HashMap<TypeId, RegistrationState>,
     primary: Option<TypeId>,
     primary_reservation: Option<TypeId>,
-    constructing: HashMap<TypeId, ThreadId>,
+    constructing: HashSet<TypeId>,
 }
 
 pub(crate) struct IoRuntime {
@@ -104,10 +104,9 @@ impl RegistrationReservation<'_> {
                 .is_none(),
             "an I/O context registration cannot replace an existing registration"
         );
-        assert_eq!(
+        assert!(
             registry.constructing.remove(&self.context_type),
-            Some(thread::current().id()),
-            "the publishing thread must own the I/O context construction reservation"
+            "publishing requires an active I/O context construction reservation"
         );
         self.published = true;
         drop(registry);
@@ -177,7 +176,6 @@ impl IoRuntime {
         C: IoContext,
     {
         let context_type = TypeId::of::<C>();
-        let current_thread = thread::current().id();
         let mut registry = self.registry();
         loop {
             if let Some(registration) = registry.registrations.get(&context_type) {
@@ -194,11 +192,7 @@ impl IoRuntime {
                     allowed_roles,
                 };
             }
-            if let Some(constructing_thread) = registry.constructing.get(&context_type) {
-                if *constructing_thread == current_thread {
-                    drop(registry);
-                    Self::recursive_registration::<C>();
-                }
+            if registry.constructing.contains(&context_type) {
                 #[cfg(test)]
                 self.report_resolution_waiting();
                 registry = self.registration_changed.wait(registry);
@@ -207,7 +201,7 @@ impl IoRuntime {
                 if reserved_primary {
                     registry.primary_reservation = Some(context_type);
                 }
-                registry.constructing.insert(context_type, current_thread);
+                registry.constructing.insert(context_type);
                 let allowed_roles = if reserved_primary {
                     vec![DriverRole::Primary, DriverRole::Secondary]
                 } else {
@@ -330,19 +324,6 @@ impl IoRuntime {
     fn report_resolution_waiting(&self) {
         self.resolution_waiting.store(true, std::sync::atomic::Ordering::Release);
     }
-
-    #[cold]
-    #[inline(never)]
-    #[expect(clippy::panic, reason = "recursive registration is a caller programming error")]
-    fn recursive_registration<C>() -> !
-    where
-        C: IoContext,
-    {
-        panic!(
-            "I/O context {} recursively requested its own registration",
-            std::any::type_name::<C>()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -350,6 +331,7 @@ impl IoRuntime {
 pub(crate) mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::task::Waker;
+    use std::thread;
 
     use arty_io_core::{Cycle, Driver, DriverInstance, DriverOptions};
     use thread_aware::{ThreadAware, ThreadBuilder};
@@ -456,21 +438,6 @@ pub(crate) mod tests {
         drop(reservation);
 
         assert!(runtime.is_registered::<Context>());
-    }
-
-    #[test]
-    fn recursive_resolution_panics() {
-        let runtime = IoRuntime::default();
-        let destination = thread();
-        let resolution = runtime.resolve::<Context>(&destination);
-
-        let panic = match catch_unwind(AssertUnwindSafe(|| runtime.resolve::<Context>(&destination))) {
-            Ok(_) => panic!("recursive resolution must panic"),
-            Err(panic) => panic,
-        };
-        drop(resolution);
-
-        assert!(panic.downcast_ref::<String>().unwrap().contains("recursively requested"));
     }
 
     #[test]
