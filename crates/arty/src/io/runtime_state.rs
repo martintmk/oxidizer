@@ -66,6 +66,8 @@ pub(crate) struct IoRuntime {
     registry: Mutex<Registry>,
     registration_changed: Condvar,
     failure: Mutex<Option<Arc<DriverError>>>,
+    #[cfg(test)]
+    resolution_waiting: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct RegistrationReservation<'a> {
@@ -158,6 +160,8 @@ impl IoRuntime {
             registry: Mutex::new(Registry::default()),
             registration_changed: Condvar::new(),
             failure: Mutex::new(None),
+            #[cfg(test)]
+            resolution_waiting: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -195,6 +199,8 @@ impl IoRuntime {
                     drop(registry);
                     Self::recursive_registration::<C>();
                 }
+                #[cfg(test)]
+                self.report_resolution_waiting();
                 registry = self.registration_changed.wait(registry);
             } else {
                 let reserved_primary = registry.primary.is_none() && registry.primary_reservation.is_none();
@@ -315,6 +321,12 @@ impl IoRuntime {
                 let registry = poisoned.into_inner();
                 self.registry.clear_poison();
                 registry
+            }
+
+            #[cfg(test)]
+            #[cfg_attr(coverage_nightly, coverage(off))]
+            fn report_resolution_waiting(&self) {
+                self.resolution_waiting.store(true, std::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -490,6 +502,9 @@ pub(crate) mod tests {
                 Resolution::Existing { .. }
             )
         });
+        while !runtime.resolution_waiting.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
 
         reservation.publish(&Context, &destination);
 
