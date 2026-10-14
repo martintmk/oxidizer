@@ -185,9 +185,6 @@ impl DriverHost {
         C: IoContext,
         C::ContextOptions: Clone,
     {
-        if let Some(error) = Self::runtime_error(&self.runtime, &self.dispatcher) {
-            return Err(error);
-        }
         let context_type = TypeId::of::<C>();
         assert!(
             self.initializing.borrow_mut().insert(context_type),
@@ -275,11 +272,11 @@ impl DriverHost {
             if self.dispatcher.is_shutting_down() {
                 return Err(self.runtime.failure().unwrap_or_else(Error::runtime_shutting_down));
             }
-            match self.command_rx.recv_timeout(Duration::from_millis(1)) {
+            match self.command_rx.try_recv() {
                 Ok(command) => command(),
-                Err(error) if error.is_timeout() => {}
-                Err(error) => panic!("I/O command channel closed while its dispatcher is retained: {error}"),
+                Err(error) => assert!(error.is_empty(), "I/O command channel closed while its dispatcher is retained"),
             }
+            thread::yield_now();
         }
     }
 
@@ -313,17 +310,7 @@ impl DriverHost {
             Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
             return Err(error);
         }
-        if let Err(error) = self.runtime.complete_driver::<C>(thread::current().id(), role) {
-            emit!(
-                &self.sink,
-                IoDriverInitializationFailed {
-                    context: IoContextName(type_name::<C>()),
-                    error: IoDriverErrorMessage::new(&error),
-                }
-            );
-            Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
-            return Err(error);
-        }
+        self.runtime.complete_driver::<C>(thread::current().id(), role);
         if role == DriverRole::Primary {
             self.signal.set_primary_waker(driver.waker());
         }

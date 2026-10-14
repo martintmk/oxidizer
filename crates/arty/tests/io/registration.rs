@@ -268,9 +268,10 @@ fn recursive_same_context_registration_panics_without_corrupting_registry() {
 }
 #[test]
 fn inconsistent_primary_role_on_another_worker_is_rejected() {
-    let runtime = runtime(WORKERS);
+    let (runtime, processor) = runtime_with_telemetry(WORKERS);
     let workers = worker_schedulers(&runtime, WORKERS);
     let scenario = Scenario::options(RolePlan::Inconsistent);
+    scenario.fail_shutdown.store(true, Ordering::SeqCst);
 
     let error = workers[0]
         .spawn({
@@ -289,6 +290,7 @@ fn inconsistent_primary_role_on_another_worker_is_rejected() {
     assert!(error.contains("disallowed role Secondary"));
     assert!(runtime.stop().unwrap_err().to_string().contains("disallowed role Secondary"));
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), WORKERS);
+    assert_eq!(event_count(&processor, "arty.rt.io.driver.shutdown_failed"), WORKERS);
 }
 #[test]
 fn racing_registrations_select_one_consistent_primary() {

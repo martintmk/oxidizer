@@ -191,9 +191,10 @@ impl Io {
         if Scheduler::is_current_worker_thread() {
             return Err(Error::io_outside_worker());
         }
-        let Some(worker_index) = self.dispatcher.worker_index(self.thread.id()) else {
-            return Err(Error::io_outside_worker());
-        };
+        let worker_index = self
+            .dispatcher
+            .worker_index(self.thread.id())
+            .expect("an I/O handle remains bound to a registered runtime worker");
         let options = (!self.runtime.is_registered::<C>()).then(|| options.clone());
         self.try_context_from_external_thread(worker_index, options)
     }

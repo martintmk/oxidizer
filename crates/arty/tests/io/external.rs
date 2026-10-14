@@ -41,6 +41,21 @@ fn builtins_clone_initializes_and_accesses_io_from_a_non_runtime_thread() {
     runtime.stop().unwrap();
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn stopped_runtime_is_reported_before_external_io_dispatch() {
+    let runtime = runtime(1);
+    let builtins = runtime.scheduler().block_on(async |builtins| builtins).unwrap();
+    runtime.stop().unwrap();
+
+    let error = builtins
+        .io()
+        .try_context::<TestContext<ExternalConstructionFailure>>(&Scenario::options(RolePlan::PreferPrimary))
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "the runtime is shutting down");
+    assert!(format!("{:?}", builtins.io()).contains("Io"));
+}
 #[test]
 fn concurrent_external_access_registers_one_context_and_driver() {
     let runtime = runtime(1);

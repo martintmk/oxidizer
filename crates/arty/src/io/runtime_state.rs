@@ -239,7 +239,7 @@ impl IoRuntime {
         Some((*context, allowed_roles))
     }
 
-    pub(crate) fn complete_driver<C>(&self, worker: ThreadId, role: DriverRole) -> Result<(), DriverError>
+    pub(crate) fn complete_driver<C>(&self, worker: ThreadId, role: DriverRole)
     where
         C: IoContext,
     {
@@ -250,11 +250,7 @@ impl IoRuntime {
             .get_mut(&context_type)
             .expect("driver completion requires a published I/O registration");
         if let Some(expected) = registration.role {
-            if role != expected {
-                return Err(DriverError::from_message(format!(
-                    "I/O driver selected {role:?}, but the registration uses {expected:?}"
-                )));
-            }
+            assert_eq!(role, expected, "driver role was constrained by the published registration");
         } else {
             registration.role = Some(role);
             let reserved_primary = registration.reserved_primary;
@@ -283,7 +279,6 @@ impl IoRuntime {
         );
         drop(registry);
         self.registration_changed.notify_all();
-        Ok(())
     }
 
     pub(crate) fn is_ready<C>(&self) -> Result<bool, Error>
@@ -426,22 +421,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn completed_registration_rejects_a_different_role() {
+    fn completed_registration_accepts_the_published_role() {
         let runtime = IoRuntime::new(2);
         let destination = thread();
         let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
             panic!("first resolution must reserve registration");
         };
         reservation.publish(&Context, &destination);
-        runtime
-            .complete_driver::<Context>(thread::current().id(), DriverRole::Primary)
-            .unwrap();
+        runtime.complete_driver::<Context>(thread::current().id(), DriverRole::Primary);
+        runtime.complete_driver::<Context>(std::thread::spawn(|| thread::current().id()).join().unwrap(), DriverRole::Primary);
 
-        let error = runtime
-            .complete_driver::<Context>(std::thread::spawn(|| thread::current().id()).join().unwrap(), DriverRole::Secondary)
-            .unwrap_err();
+        assert!(runtime.is_ready::<Context>().unwrap());
+    }
 
-        assert!(error.to_string().contains("registration uses Primary"));
+    #[test]
+    fn concurrent_resolution_waits_for_publication() {
+        let runtime = Arc::new(IoRuntime::default());
+        let destination = thread();
+        let Resolution::Register { reservation, .. } = runtime.resolve::<Context>(&destination) else {
+            panic!("first resolution must reserve registration");
+        };
+        let waiting_runtime = Arc::clone(&runtime);
+        let waiting_destination = destination.clone();
+        let waiter = std::thread::spawn(move || {
+            matches!(
+                waiting_runtime.resolve::<Context>(&waiting_destination),
+                Resolution::Existing { .. }
+            )
+        });
+
+        reservation.publish(&Context, &destination);
+
+        assert!(waiter.join().unwrap());
     }
 
     #[test]
