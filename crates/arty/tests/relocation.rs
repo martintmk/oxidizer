@@ -15,7 +15,7 @@ use std::thread::{self, ThreadId};
 
 use arty::runtime::{BlockingPoolPolicy, Runtime, WorkersPolicy};
 use arty::task::{Builtins, Scheduler};
-use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, IoContext};
+use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, IoContext};
 use futures::future::join_all;
 use support::JoinHandleExt as _;
 use thread_aware::{ThreadAware, ThreadBuilder};
@@ -42,13 +42,10 @@ impl IoContext for RelocationIoContext {
         Self(options)
     }
 
-    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, options: DriverOptions) -> Result<Self::Driver, DriverError> {
         self.0.0.lock().unwrap_or_else(PoisonError::into_inner).push(options.thread().id());
-        let role = *options
-            .allowed_roles()
-            .first()
-            .ok_or_else(|| DriverError::from_message("relocation test driver requires an allowed role"))?;
-        Ok(DriverInstance::new(RelocationIoDriver, role))
+        _ = options.role();
+        Ok(RelocationIoDriver)
     }
 }
 

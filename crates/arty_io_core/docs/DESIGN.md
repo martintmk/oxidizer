@@ -55,9 +55,9 @@ Each context registration uses one driver role on every async worker:
 
 The runtime atomically assigns the first context type requested from one runtime
 the primary role. It assigns every other context type the secondary role. The
-runtime passes the assigned role through `DriverOptions::allowed_roles`, and the
-context returns it in `DriverInstance` or rejects it as unsupported. A
-registration uses the same role on every async worker.
+runtime passes the assigned role through `DriverOptions::role`, and the context
+returns an error if it does not support that role. A registration uses the same
+role on every async worker.
 
 An async worker invokes secondary drivers first with
 `Cycle::max_wait() == Duration::ZERO`. A secondary either processes completions

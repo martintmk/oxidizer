@@ -154,9 +154,7 @@ fn shutdown_during_late_initialization_is_observed_by_the_request() {
         .spawn({
             let scenario = scenario.clone();
             async move |builtins| {
-                let _ = builtins
-                    .io()
-                    .context::<TestContext<ShutdownDuringLateInitialization>>(&scenario);
+                let _ = builtins.io().context::<TestContext<ShutdownDuringLateInitialization>>(&scenario);
             }
         })
         .join()
@@ -209,9 +207,7 @@ fn concurrent_worker_initialization_failure_is_reported_consistently() {
     let blocked_initialization = workers[1].spawn({
         let scenario = scenario.clone();
         async move |builtins| {
-            let _ = builtins
-                .io()
-                .try_context::<TestContext<ConcurrentLateFailure>>(&scenario);
+            let _ = builtins.io().try_context::<TestContext<ConcurrentLateFailure>>(&scenario);
         }
     });
     scenario.wait_until_driver_blocked();
@@ -326,10 +322,7 @@ fn shutdown_does_not_couple_independent_worker_initialization() {
         first_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
         "the runtime is shutting down"
     );
-    assert_eq!(
-        second_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
-        "ok"
-    );
+    assert_eq!(second_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(), "ok");
     let _ = first.join();
     let _ = second.join();
     runtime.stop().unwrap();

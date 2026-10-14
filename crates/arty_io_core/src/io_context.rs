@@ -3,7 +3,7 @@
 
 use thread_aware_core::ThreadAware;
 
-use crate::{Driver, DriverError, DriverInstance, DriverOptions};
+use crate::{Driver, DriverError, DriverOptions};
 
 /// A consumer-facing I/O handle that creates worker-local drivers.
 ///
@@ -33,9 +33,8 @@ pub trait IoContext: Clone + ThreadAware + 'static {
     /// execute on another async worker. The context may outlive the driver and must reject new
     /// operations after [`Driver::shutdown`] closes it.
     ///
-    /// A successful instance must select a role listed by [`DriverOptions::allowed_roles`].
-    /// One context registration must select the same role on every async worker. Return an error
-    /// when the driver supports none of the allowed roles.
+    /// [`DriverOptions::role`] contains the role assigned by the runtime. Return an error when the
+    /// driver does not support that role.
     ///
     /// # Errors
     ///
@@ -44,5 +43,5 @@ pub trait IoContext: Clone + ThreadAware + 'static {
     /// shutdown. The neutral context may already be registered, but no further retrieval succeeds
     /// after shutdown begins. The runtime calls [`Driver::shutdown`] on every driver that was
     /// created successfully.
-    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError>;
+    fn driver(&mut self, options: DriverOptions) -> Result<Self::Driver, DriverError>;
 }

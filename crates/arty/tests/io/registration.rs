@@ -129,10 +129,7 @@ fn waiting_registration_observes_another_workers_failure() {
         first_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
         "driver construction failed"
     );
-    assert_eq!(
-        second_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(),
-        "ok"
-    );
+    assert_eq!(second_outcome_rx.recv_timeout(testing_aids::TEST_TIMEOUT).unwrap(), "ok");
     let _ = first.join();
     let _ = second.join();
     assert_eq!(runtime.stop().unwrap_err().to_string(), "driver construction failed");
@@ -227,8 +224,14 @@ fn inconsistent_primary_role_on_another_worker_is_rejected() {
         .join()
         .unwrap();
 
-    assert!(error.contains("disallowed role Secondary"));
-    assert!(runtime.stop().unwrap_err().to_string().contains("disallowed role Secondary"));
+    assert!(error.contains("driver does not support assigned role Primary"));
+    assert!(
+        runtime
+            .stop()
+            .unwrap_err()
+            .to_string()
+            .contains("driver does not support assigned role Primary")
+    );
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), WORKERS);
     assert_eq!(event_count(&processor, "arty.rt.io.driver.shutdown_failed"), WORKERS);
 }
@@ -288,7 +291,7 @@ fn additional_drivers_are_secondary_on_every_worker() {
 }
 
 #[test]
-fn first_registration_cannot_decline_the_primary_role() {
+fn driver_can_reject_the_assigned_primary_role() {
     let runtime = runtime(1);
     let scenario = Scenario::options(RolePlan::Secondary);
 
@@ -306,8 +309,14 @@ fn first_registration_cannot_decline_the_primary_role() {
         })
         .unwrap();
 
-    assert!(error.contains("disallowed role Secondary"));
-    assert!(runtime.stop().unwrap_err().to_string().contains("disallowed role Secondary"));
+    assert!(error.contains("driver does not support assigned role Primary"));
+    assert!(
+        runtime
+            .stop()
+            .unwrap_err()
+            .to_string()
+            .contains("driver does not support assigned role Primary")
+    );
     assert_eq!(scenario.shutdowns.load(Ordering::SeqCst), 1);
 }
 

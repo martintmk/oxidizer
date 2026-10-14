@@ -22,7 +22,7 @@ use arty::core::{Thread, ThreadAware};
 use arty::io::Io;
 use arty::runtime::{Runtime, RuntimeBuilder, RuntimeOperations, WorkersPolicy};
 use arty::task::{JoinError, JoinHandle, Scheduler};
-use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
+use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext};
 use observed_testing::{CapturedEvent, MockProcessor, TEST_ID, test_emitter};
 use static_assertions::assert_impl_all;
 
@@ -224,9 +224,7 @@ struct DriverGate {
 }
 
 enum ContextAction {
-    RegisterSelf {
-        io: Io,
-    },
+    RegisterSelf { io: Io },
 }
 
 impl Scenario {
@@ -269,17 +267,11 @@ impl Scenario {
         }))
     }
 
-    fn select_role(&self, attempt: usize, allowed: &[DriverRole]) -> DriverRole {
+    fn supports_role(&self, attempt: usize, role: DriverRole) -> bool {
         match self.role_plan {
-            RolePlan::PreferPrimary => {
-                if allowed.contains(&DriverRole::Primary) {
-                    DriverRole::Primary
-                } else {
-                    DriverRole::Secondary
-                }
-            }
-            RolePlan::Inconsistent if attempt == 1 => DriverRole::Primary,
-            RolePlan::Secondary | RolePlan::Inconsistent => DriverRole::Secondary,
+            RolePlan::PreferPrimary => true,
+            RolePlan::Inconsistent if attempt == 1 => role == DriverRole::Primary,
+            RolePlan::Secondary | RolePlan::Inconsistent => role == DriverRole::Secondary,
         }
     }
 
@@ -388,10 +380,7 @@ impl<M: Marker> IoContext for TestContext<M> {
         match action {
             Some(ContextAction::RegisterSelf { io }) => {
                 let error = io.try_context::<Self>(&options).unwrap_err();
-                assert_eq!(
-                    error.to_string(),
-                    "I/O context retrieval cannot be nested during initialization"
-                );
+                assert_eq!(error.to_string(), "I/O context retrieval cannot be nested during initialization");
             }
             None => {}
         }
@@ -402,7 +391,7 @@ impl<M: Marker> IoContext for TestContext<M> {
         }
     }
 
-    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
+    fn driver(&mut self, options: DriverOptions) -> Result<Self::Driver, DriverError> {
         assert_eq!(self.thread.as_ref(), Some(options.thread()));
         let attempt = self.scenario.driver_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         self.scenario.block_driver_if_configured(attempt);
@@ -414,21 +403,21 @@ impl<M: Marker> IoContext for TestContext<M> {
             return Err(DriverError::from_message(*self.scenario.driver_failure_message.lock().unwrap()));
         }
 
-        let role = self.scenario.select_role(attempt, options.allowed_roles());
+        let role = options.role();
+        if !self.scenario.supports_role(attempt, role) {
+            return Err(DriverError::from_message(format!("driver does not support assigned role {role:?}")));
+        }
         self.scenario.roles.lock().unwrap().push((thread::current().id(), role));
         self.scenario.owner_wakers.lock().unwrap().push(options.owner_waker().clone());
         let wake = Arc::new(DriverWake::new(Arc::clone(&self.scenario)));
         self.scenario.initialized.fetch_add(1, Ordering::SeqCst);
-        Ok(DriverInstance::new(
-            TestDriver {
-                scenario: Arc::clone(&self.scenario),
-                role,
-                wake,
-                attempt,
-                _marker: PhantomData,
-            },
+        Ok(TestDriver {
+            scenario: Arc::clone(&self.scenario),
             role,
-        ))
+            wake,
+            attempt,
+            _marker: PhantomData,
+        })
     }
 }
 

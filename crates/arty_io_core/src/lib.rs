@@ -21,9 +21,7 @@
 //! ```
 //! use std::task::Waker;
 //!
-//! use arty_io_core::{
-//!     Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext,
-//! };
+//! use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext};
 //! use thread_aware_core::{Thread, ThreadAware};
 //!
 //! #[derive(Clone)]
@@ -43,16 +41,9 @@
 //!         Self
 //!     }
 //!
-//!     fn driver(
-//!         &mut self,
-//!         options: DriverOptions,
-//!     ) -> Result<DriverInstance<Self::Driver>, DriverError> {
-//!         let role = options
-//!             .allowed_roles()
-//!             .first()
-//!             .copied()
-//!             .ok_or_else(|| DriverError::from_message("no supported driver role"))?;
-//!         Ok(DriverInstance::new(ExampleDriver, role))
+//!     fn driver(&mut self, options: DriverOptions) -> Result<Self::Driver, DriverError> {
+//!         let _role = options.role();
+//!         Ok(ExampleDriver)
 //!     }
 //! }
 //!
@@ -77,8 +68,8 @@
 //! ## Primary and secondary drivers
 //!
 //! An async worker has at most one [`Primary`](DriverRole::Primary) driver. [`DriverOptions`]
-//! lists the roles available during creation, and [`DriverInstance`] returns the selected role.
-//! A primary may wait for I/O for up to [`Cycle::max_wait`].
+//! provides the role assigned during creation. A primary may wait for I/O for up to
+//! [`Cycle::max_wait`].
 //!
 //! The runtime calls [`Secondary`](DriverRole::Secondary) drivers with
 //! `Cycle::max_wait() == Duration::ZERO`. A secondary processes completions that are already ready
@@ -89,9 +80,8 @@
 //!
 //! The runtime centrally stores the thread-neutral context returned by [`IoContext::context`],
 //! then clones and relocates it from no source thread to its async workers. It supplies the
-//! acceptable roles through [`DriverOptions`]. The context selects one role and returns it in a
-//! [`DriverInstance`]. Driver creation completes all setup; there is no special initialization
-//! cycle.
+//! assigned role through [`DriverOptions`]. Driver creation completes all setup; there is no
+//! special initialization cycle.
 //!
 //! The runtime invokes secondaries before the primary. If there is no primary, the runtime waits
 //! for work itself. The owner waker in [`DriverOptions`] wakes the async worker, while
@@ -111,7 +101,6 @@
 pub use cycle::Cycle;
 pub use driver::Driver;
 pub use driver_error::DriverError;
-pub use driver_instance::DriverInstance;
 pub use driver_options::DriverOptions;
 pub use driver_role::DriverRole;
 pub use io_context::IoContext;
@@ -119,7 +108,6 @@ pub use io_context::IoContext;
 mod cycle;
 mod driver;
 mod driver_error;
-mod driver_instance;
 mod driver_options;
 mod driver_role;
 mod io_context;

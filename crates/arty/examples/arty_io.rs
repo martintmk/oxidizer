@@ -6,7 +6,7 @@
 use std::task::Waker;
 
 use arty::task::{Builtins, JoinError};
-use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
+use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext};
 use thread_aware::ThreadAware;
 
 #[derive(Clone, ThreadAware)]
@@ -20,12 +20,12 @@ impl IoContext for ExampleContext {
         Self
     }
 
-    fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
-        if !options.allowed_roles().contains(&DriverRole::Primary) {
+    fn driver(&mut self, options: DriverOptions) -> Result<Self::Driver, DriverError> {
+        if options.role() != DriverRole::Primary {
             return Err(DriverError::from_message("example driver requires the primary role"));
         }
         println!("initialized driver on {:?}", options.thread().id());
-        Ok(DriverInstance::new(ExampleDriver, DriverRole::Primary))
+        Ok(ExampleDriver)
     }
 }
 

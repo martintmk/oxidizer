@@ -18,7 +18,7 @@
 //! # use std::task::Waker;
 //! # use arty::core::{Thread, ThreadAware};
 //! # use arty::task::Builtins;
-//! # use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
+//! # use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, IoContext};
 //! # #[derive(Clone)]
 //! # struct ExampleIo;
 //! # impl ExampleIo {
@@ -35,11 +35,8 @@
 //! #         Self
 //! #     }
 //! #
-//! #     fn driver(&mut self, options: DriverOptions) -> Result<DriverInstance<Self::Driver>, DriverError> {
-//! #         let role = options.allowed_roles().first().copied().ok_or_else(|| {
-//! #             DriverError::from_message("the example driver requires an available role")
-//! #         })?;
-//! #         Ok(DriverInstance::new(ExampleDriver, role))
+//! #     fn driver(&mut self, _options: DriverOptions) -> Result<Self::Driver, DriverError> {
+//! #         Ok(ExampleDriver)
 //! #     }
 //! # }
 //! # struct ExampleDriver;
@@ -123,11 +120,7 @@ pub struct Io {
 }
 
 impl Io {
-    pub(crate) fn new(
-        runtime: IoRuntime,
-        dispatcher: DispatcherClient,
-        thread: Thread,
-    ) -> Self {
+    pub(crate) fn new(runtime: IoRuntime, dispatcher: DispatcherClient, thread: Thread) -> Self {
         Self {
             runtime,
             dispatcher,

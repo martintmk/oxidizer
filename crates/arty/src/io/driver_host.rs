@@ -7,7 +7,7 @@ use std::fmt;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use arty_io_core::{Cycle, Driver, DriverError, DriverInstance, DriverOptions, DriverRole, IoContext};
+use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole, IoContext};
 use observed::{Sink, emit};
 use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
@@ -78,13 +78,7 @@ impl fmt::Debug for DriverHost {
 }
 
 impl DriverHost {
-    pub(crate) fn new(
-        runtime: IoRuntime,
-        dispatcher: DispatcherClient,
-        thread: Thread,
-        signal: Arc<WorkerSignal>,
-        sink: Sink,
-    ) -> Rc<Self> {
+    pub(crate) fn new(runtime: IoRuntime, dispatcher: DispatcherClient, thread: Thread, signal: Arc<WorkerSignal>, sink: Sink) -> Rc<Self> {
         let host = Rc::new(Self {
             runtime,
             dispatcher,
@@ -105,11 +99,7 @@ impl DriverHost {
         host
     }
 
-    pub(crate) fn try_context_current<C>(
-        runtime: &IoRuntime,
-        thread: &Thread,
-        options: &C::ContextOptions,
-    ) -> Option<Result<C, Error>>
+    pub(crate) fn try_context_current<C>(runtime: &IoRuntime, thread: &Thread, options: &C::ContextOptions) -> Option<Result<C, Error>>
     where
         C: IoContext,
         C::ContextOptions: Clone + Send + 'static,
@@ -147,10 +137,7 @@ impl DriverHost {
             return Err(Error::nested_io_context());
         }
         let initialization = InitializationGuard(&self.initializing);
-        let Resolution {
-            mut context,
-            role,
-        } = self.runtime.get_context::<C>(options);
+        let Resolution { mut context, role } = self.runtime.get_context::<C>(options);
         context.relocate(None, &self.thread);
         let local = self.create_local_driver::<C>(context, role)?;
         let context = Self::clone_context::<C>(&local);
@@ -171,47 +158,33 @@ impl DriverHost {
     where
         C: IoContext,
     {
-        let options = DriverOptions::new(self.thread.clone(), WorkerSignal::waker(&self.signal), vec![role]);
-        let DriverInstance {
-            driver,
-            role: selected_role,
-            ..
-        } = context.driver(options).inspect_err(|error| {
-            emit!(
-                &self.sink,
-                IoDriverInitializationFailed {
-                    context: IoContextName(type_name::<C>()),
-                    error: IoDriverErrorMessage::new(error),
-                }
-            );
-        })
-        .map_err(|error| self.fail(error))?;
-        if selected_role != role {
-            let error = DriverError::from_message(format!("I/O driver selected disallowed role {selected_role:?}"));
-            emit!(
-                &self.sink,
-                IoDriverInitializationFailed {
-                    context: IoContextName(type_name::<C>()),
-                    error: IoDriverErrorMessage::new(&error),
-                }
-            );
-            Self::shutdown_driver::<C>(Box::new(driver), &self.sink);
-            return Err(self.fail(error));
-        }
-        if selected_role == DriverRole::Primary {
+        let options = DriverOptions::new(self.thread.clone(), WorkerSignal::waker(&self.signal), role);
+        let driver = context
+            .driver(options)
+            .inspect_err(|error| {
+                emit!(
+                    &self.sink,
+                    IoDriverInitializationFailed {
+                        context: IoContextName(type_name::<C>()),
+                        error: IoDriverErrorMessage::new(error),
+                    }
+                );
+            })
+            .map_err(|error| self.fail(error))?;
+        if role == DriverRole::Primary {
             self.signal.set_primary_waker(driver.waker());
         }
         emit!(
             &self.sink,
             IoDriverInitialized {
                 context: IoContextName(type_name::<C>()),
-                role: IoDriverRoleLabel::from(selected_role),
+                role: IoDriverRoleLabel::from(role),
             }
         );
         Ok(LocalContext {
             context: Box::new(context),
             driver: Box::new(driver),
-            role: selected_role,
+            role,
             context_name: type_name::<C>(),
         })
     }
@@ -275,24 +248,8 @@ impl DriverHost {
                         error: IoDriverErrorMessage::new(&error),
                     }
                 );
-                self.dispatcher
-                    .stop_with_error(Error::io_failure(Arc::new(error)));
+                self.dispatcher.stop_with_error(Error::io_failure(Arc::new(error)));
             }
-        }
-    }
-
-    fn shutdown_driver<C>(driver: Box<dyn ErasedDriver>, sink: &Sink)
-    where
-        C: IoContext,
-    {
-        if let Err(error) = driver.shutdown() {
-            emit!(
-                sink,
-                IoDriverShutdownFailed {
-                    context: IoContextName(type_name::<C>()),
-                    error: IoDriverErrorMessage::new(&error),
-                }
-            );
         }
     }
 }

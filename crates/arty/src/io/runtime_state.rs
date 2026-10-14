@@ -67,10 +67,7 @@ impl Default for IoRuntime {
 }
 
 impl IoRuntime {
-    pub(crate) fn get_context<C>(
-        &self,
-        options: &C::ContextOptions,
-    ) -> Resolution<C>
+    pub(crate) fn get_context<C>(&self, options: &C::ContextOptions) -> Resolution<C>
     where
         C: IoContext,
         C::ContextOptions: Clone,
@@ -111,10 +108,7 @@ impl IoRuntime {
             .clone_context()
             .downcast::<C>()
             .expect("I/O contexts are stored under their own TypeId");
-        Resolution {
-            context: *context,
-            role,
-        }
+        Resolution { context: *context, role }
     }
 
     fn registry(&self) -> MutexGuard<'_, Registry> {
