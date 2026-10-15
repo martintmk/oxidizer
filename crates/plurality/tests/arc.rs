@@ -55,6 +55,43 @@ fn arc_drops_value_on_last_handle() {
 }
 
 #[test]
+fn raw_ownership_outlives_pool_and_releases_exactly_once() {
+    let counter = StdArc::new(AtomicUsize::new(0));
+    let pool = Pool::<DropCounter>::builder().chunk_size(1).max_chunks(1).build();
+    let owner = pool.alloc_arc(DropCounter(counter.clone()));
+    let raw = Arc::into_raw(owner.clone());
+    drop(owner);
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+    assert!(pool.try_alloc_arc(DropCounter(counter.clone())).is_err());
+    // The failed allocation drops its input.
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    drop(pool);
+
+    // SAFETY: This is the one reconstruction of the transferred ownership.
+    let owner = unsafe { Arc::<DropCounter>::from_raw(raw) };
+    std::thread::spawn(move || {
+        let clone = owner.clone();
+        drop(owner);
+        drop(clone);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn raw_ownership_preserves_unsized_metadata_and_returns_slot() {
+    let pool = Pool::<u32>::builder().chunk_size(1).max_chunks(1).build();
+    let owner = Arc::unsize(pool.alloc_arc(42), plurality::coerce!(dyn core::fmt::Debug));
+    let raw = Arc::into_raw(owner);
+    // SAFETY: This is the one reconstruction, preserving the original trait-object metadata.
+    let owner = unsafe { Arc::<dyn core::fmt::Debug>::from_raw(raw) };
+    assert_eq!(format!("{owner:?}"), "42");
+    drop(owner);
+    drop(pool.try_alloc_arc(43).unwrap());
+}
+
+#[test]
 fn uninit_arc_placement() {
     let pool = Pool::<String>::builder().chunk_size(2).build();
     let mut a = pool.alloc_uninit_arc();

@@ -38,11 +38,14 @@ naturally (with the future returning `Poll::Ready`) or for the executor to be sh
 only is there no “remove” function but similarly, there is no “cancel” function - once a task
 has started executing, the only thing that can terminate it is the task itself, by completing.
 
-In a steady state, the executor is allocation-free, as all memory used by the executor is
-reused for new tasks when old ones complete.
+Task storage and shared wake tokens are pooled. The task map and wake queue reuse their
+capacity, avoiding allocations in warmed workloads within their existing capacity. Retained
+wakers keep their token slots occupied, so additional tasks may require pool growth.
 
 Cloned task wakers may outlive their tasks. After completion or cancellation, an escaped waker
 remains callable but becomes an inert no-op and cannot delay executor shutdown.
+Wake notifications carry never-reused task identities, which are looked up in the executor’s
+task map before task storage is accessed. A stale notification cannot target a later task.
 
 Join handles may outlive the executor and report shutdown cancellation through [`JoinError`][__link2].
 A panic in a directly registered executor task remains fail-fast.
@@ -53,7 +56,7 @@ A panic in a directly registered executor task remains fail-fast.
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty_executor">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQb2d-tu4PqXUsbYuzt22_JPvsb_N4PPHTp9a8brx0b6bmSDYFhZIKCaUpvaW5FcnJvcvaCbWFydHlfZXhlY3V0b3JlMC4xLjM
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbdYQg8Dtf9z8bjs8rfeIetRcb-5qnyN4EgC0bZPkvIeXRcTthZIKCaUpvaW5FcnJvcvaCbWFydHlfZXhlY3V0b3JlMC4xLjM
  [__link0]: https://docs.rs/arty
  [__link1]: https://docs.rs/arty_executor/0.1.3/arty_executor/remote/index.html
  [__link2]: https://crates.io/crates/JoinError

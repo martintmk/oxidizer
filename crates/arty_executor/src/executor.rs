@@ -148,7 +148,7 @@ mod tests {
 
     use super::*;
     use crate::testing::{TestSubjectFuture, TestWaker, new_guarded_executor};
-    use crate::{AWAKENED_CAPACITY, JoinHandle, TaskOptions};
+    use crate::{JoinHandle, TaskOptions};
 
     trait TestTaskSetExt {
         fn add_test<F, R>(&self, future: F) -> JoinHandle<R>
@@ -435,10 +435,13 @@ mod tests {
 
     #[test]
     fn mass_awaken() {
-        // We awaken a huge amount of tasks, greater than the capacity of the awakened queue.
+        // We awaken enough tasks to grow the wake queue.
         // We still expect them all to awaken together on the same cycle, while one additional
-        // inactive task remains suspended when the executor probes all embedded wake signals.
-        const AWAKENED_TASK_COUNT: usize = AWAKENED_CAPACITY + 1;
+        // inactive task remains suspended.
+        #[cfg(not(miri))]
+        const AWAKENED_TASK_COUNT: usize = 1025;
+        #[cfg(miri)]
+        const AWAKENED_TASK_COUNT: usize = 5;
 
         let executor = new_guarded_executor(Waker::noop().clone());
         let tasks = executor.tasks();

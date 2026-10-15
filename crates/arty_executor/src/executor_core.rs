@@ -2,10 +2,9 @@
 // Licensed under the MIT License.
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::sync::atomic::{self, AtomicBool};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{mem, task};
 
@@ -17,7 +16,8 @@ use tick::SimpleClock;
 use crate::remote::Sender as RemoteSender;
 use crate::wake::WakeShared;
 use crate::{
-    BuildPointerHasher, CycleOutcome, ERR_POISONED_LOCK, JoinEventLake, JoinHandle, Task, TaskOptions, TaskRef, TypeErasedTask, WakeSignal,
+    BuildPointerHasher, CycleOutcome, ERR_POISONED_LOCK, JoinEventLake, JoinHandle, Task, TaskId, TaskOptions, TaskRef, TypeErasedTask,
+    WakeSignal,
 };
 
 /// The real implementation of the executor, shared by different public "client" API surfaces.
@@ -57,6 +57,9 @@ struct ReentrancySafeState {
     /// task itself knowing the specific type of the future and the type of the result it produces.
     task_storage: MultiPool,
 
+    tasks: HashMap<TaskId, TaskRef>,
+    last_task_id: TaskId,
+
     /// Storage for result channels. Managed endpoints retain detached pool slots independently,
     /// allowing join handles to outlive the executor safely.
     join_events: JoinEventLake,
@@ -85,8 +88,7 @@ struct ExclusiveState {
     /// mean it gets polled multiple times per cycle, though - we explicitly poll every task at
     /// most once per cycle, to avoid getting stuck on a hyperactive task.
     ///
-    /// We use a `PointerHasher` for efficient hashing because we know via white-box knowledge
-    /// that `TaskRef` is a thin wrapper around a pointer.
+    /// We use a `PointerHasher` for efficient hashing because `TaskRef` hashes only its task pointer.
     inactive: HashSet<TaskRef, BuildPointerHasher>,
 
     /// Tasks that completed during this cycle and can be released after their independently pooled
@@ -102,19 +104,6 @@ struct ExclusiveState {
     last_cycle_ended: Option<Instant>,
 }
 
-// We prefer to get wake notifications via the "awakened" queue. This may not always be possible
-// because the queue may be full or it may be locked (if the wake-up is coming from another thread).
-//
-// It is just a VecDeque so the size does not significantly impact wake-up processing time.
-// Ideally, this queue should be at least as large as the number of I/O completions that we expect
-// to handle per executor cycle, plus some additional capacity to handle any cross-thread events.
-#[cfg(not(miri))]
-pub(crate) const AWAKENED_CAPACITY: usize = 1024;
-
-// Miri performance scales with memory access count, so large numbers are our enemy.
-#[cfg(miri)]
-pub(crate) const AWAKENED_CAPACITY: usize = 4;
-
 #[expect(clippy::unused_self, reason = "semantically correct, even if not always necessary")]
 impl ExecutorCore {
     /// Creates a new async task executor.
@@ -127,6 +116,8 @@ impl ExecutorCore {
             reentrancy_safe: RefCell::new(ReentrancySafeState {
                 new_tasks: VecDeque::new(),
                 task_storage: MultiPool::new(),
+                tasks: HashMap::new(),
+                last_task_id: TaskId::default(),
                 join_events: JoinEventLake::new(),
                 shutting_down: false,
             }),
@@ -137,11 +128,7 @@ impl ExecutorCore {
                 clock: SimpleClock::new_system().with_fast_instant(true),
                 last_cycle_ended: None,
             }),
-            wake: Arc::new(WakeShared::new(
-                Arc::new(Mutex::new(VecDeque::with_capacity(AWAKENED_CAPACITY))),
-                Arc::new(AtomicBool::new(false)),
-                owner_waker,
-            )),
+            wake: Arc::new(WakeShared::new(owner_waker)),
             sink,
             _single_threaded: PhantomData,
         }
@@ -196,9 +183,11 @@ impl ExecutorCore {
             }
             let (task, output) = create(&state.join_events, self.sink.clone());
 
-            let task_ref = TaskRef::new(state.task_storage.alloc_box(task));
+            let task_id = state.last_task_id.next();
+            let task_ref = TaskRef::new(state.task_storage.alloc_box(task), task_id);
+            state.tasks.insert(task_id, task_ref);
 
-            let wake_signal = WakeSignal::new(Arc::clone(&self.wake), task_ref);
+            let wake_signal = WakeSignal::new(&self.wake, task_id);
 
             // SAFETY: The task is alive (we own it and just created it) and we are on the thread
             // where it was created (because we just created it). The executor is the only thing that
@@ -245,7 +234,7 @@ impl ExecutorCore {
             let mut state_reentrant = self.reentrancy_safe.borrow_mut();
 
             self.accept_new_tasks(&mut state_exclusive, &mut state_reentrant);
-            self.activate_awakened_tasks(&mut state_exclusive);
+            self.activate_awakened_tasks(&mut state_exclusive, &state_reentrant.tasks);
         }
 
         self.poll_active_tasks(&mut state_exclusive);
@@ -259,9 +248,9 @@ impl ExecutorCore {
         }
 
         {
-            let state_reentrant = self.reentrancy_safe.borrow();
+            let mut state_reentrant = self.reentrancy_safe.borrow_mut();
 
-            Self::drop_completed_tasks(&mut state_exclusive, true);
+            Self::drop_completed_tasks(&mut state_exclusive, &mut state_reentrant.tasks, true);
 
             let outcome = if self.evaluate_shutdown_completion(&state_exclusive, &state_reentrant) {
                 CycleOutcome::Shutdown
@@ -309,76 +298,23 @@ impl ExecutorCore {
         mem::swap(&mut state_exclusive.active, &mut state_reentrant.new_tasks);
     }
 
-    fn activate_awakened_tasks(&self, state_exclusive: &mut ExclusiveState) {
-        // There are two ways to activate tasks:
-        // 1. by receiving an explicit wake signal via the `awakened` set (preferred, fast).
-        // 2. by probing the embedded wake signals (slower).
-        //
-        // Note that the same task may be awakened via both channels simultaneously, and that
-        // spurious wake signals may be sent when the task is already active (the signal
-        // may come from a caller who has no idea if the task is already awake or not).
-
-        {
-            // First, we simply drain the "awakened" queue, which is the preferred
-            // way to wake up tasks. This is a fast TaskRef move, so the lock here is
-            // hopefully short and mostly uncontended.
-            let mut awakened = self.wake.awakened.lock().expect(ERR_POISONED_LOCK);
-
-            if !awakened.is_empty() {
-                // Process each contiguous slice in FIFO order, avoiding per-task ring-buffer
-                // bookkeeping. TaskRef is Copy, so clearing once also avoids drain cleanup.
-                for slice in <[_; 2]>::from(awakened.as_slices()) {
-                    for &task_ref in slice {
-                        // SAFETY: Retirement removes every queued notification before task
-                        // storage is released, so every queued reference still targets a live task.
-                        unsafe { task_ref.as_task() }.clear_queued_notification();
-                        // It is theoretically possible for a completed task to be awakened, in which case
-                        // we do nothing. We detect this by ensuring that the task was in the "inactive" set
-                        // before we react to the wake notification. This also eliminates spurious wakes.
-                        if state_exclusive.inactive.remove(&task_ref) {
-                            state_exclusive.active.push_back(task_ref);
-
-                            TASKS_ACTIVATED_VIA_AWAKENED_SET.with(Event::observe_once);
-                        } else {
-                            TASKS_ACTIVATED_SPURIOUS.with(Event::observe_once);
-                        }
-                    }
-                }
-                awakened.clear();
-            }
-        }
-
-        // If we have been instructed to probe the embedded wake signals, we do so now.
-        // This generally means the `awakened` queue was either full or locked, so could not
-        // be used. It switches us into a less efficient mode here but what can you do - if
-        // a lot of things are happening, someone has to pay the price.
-        //
-        // We use Acquire ordering as we are acquiring the synchronization block for the
-        // wake-up flags inside the task wake signals.
-        if !self.wake.probe_embedded_wake_signals.swap(false, atomic::Ordering::Acquire) {
-            return;
-        }
-
-        // This means we need to inspect every task in `inactive` to see if it has
-        // been awakened. This scales very poorly with large (1000+) task sets, which
-        // is why we avoid it if at all possible.
-        state_exclusive.inactive.retain(|task_ref| {
-            // SAFETY: The task is alive (we own it and just created it) and we are on the thread
-            // where it was created (because we just created it). The executor is the only thing that
-            // creates references to the tasks and it only ever creates temporary non-overlapping
-            // references narrowly bounded to individual code blocks, ensuring that aliasing rules
-            // are upheld. Anything outside `ExecutorCore` only passes `TaskRef` by value, never
-            // dereferencing it. Reentrant logic for registering new tasks cannot touch existing tasks.
-            let task = unsafe { task_ref.as_task() };
-
-            if task.consume_awakened() {
-                TASKS_ACTIVATED_VIA_PROBE.with(Event::observe_once);
-                state_exclusive.active.push_back(*task_ref);
-                false
+    fn activate_awakened_tasks(&self, state_exclusive: &mut ExclusiveState, tasks: &HashMap<TaskId, TaskRef>) {
+        let mut awakened = self.wake.awakened.lock().expect(ERR_POISONED_LOCK);
+        for task_id in awakened.drain(..) {
+            let Some(&task_ref) = tasks.get(&task_id) else {
+                TASKS_ACTIVATED_SPURIOUS.with(Event::observe_once);
+                continue;
+            };
+            // SAFETY: The owner-thread map retains only live tasks. Entries are removed before
+            // releasing task storage, and IDs are never reused.
+            unsafe { task_ref.as_task() }.clear_queued_notification();
+            if state_exclusive.inactive.remove(&task_ref) {
+                state_exclusive.active.push_back(task_ref);
+                TASKS_ACTIVATED_VIA_AWAKENED_SET.with(Event::observe_once);
             } else {
-                true
+                TASKS_ACTIVATED_SPURIOUS.with(Event::observe_once);
             }
-        });
+        }
     }
 
     fn poll_active_tasks(&self, state_exclusive: &mut ExclusiveState) {
@@ -410,12 +346,6 @@ impl ExecutorCore {
                     // The task is still pending, so we move it to the inactive set.
                     // It will return to the active set once something jiggles its waker.
                     state_exclusive.inactive.insert(task_ref);
-                    // A wake may have fallen back to the embedded signal while this task was
-                    // already active and therefore absent from the probe scan. Re-arm the probe
-                    // after reclassification so the next cycle cannot suspend past that wake.
-                    if task.is_awakened() {
-                        self.wake.probe_embedded_wake_signals.store(true, atomic::Ordering::Release);
-                    }
                 }
             }
         }
@@ -446,12 +376,13 @@ impl ExecutorCore {
     }
 
     #[cfg_attr(test, mutants::skip)] // If tasks are not dropped, executor will never shut down, leading to infinite loop.
-    fn drop_completed_tasks(state_exclusive: &mut ExclusiveState, record_cycle_metric: bool) {
+    fn drop_completed_tasks(state_exclusive: &mut ExclusiveState, tasks: &mut HashMap<TaskId, TaskRef>, record_cycle_metric: bool) {
         let completed_before = state_exclusive.completed.len();
 
         // We drop all completed tasks after their completion/cancellation path has retired any
         // independently held wake metadata.
         for task_ref in state_exclusive.completed.drain(..) {
+            assert!(tasks.remove(&task_ref.id()).is_some(), "completed tasks must still be registered");
             // SAFETY: Draining removes each completed task exactly once, after its wake metadata
             // has been retired by completion or cancellation.
             unsafe { task_ref.release() };
@@ -478,9 +409,7 @@ impl ExecutorCore {
             "Active tasks should not be present at this point"
         );
 
-        !state_reentrant.new_tasks.is_empty()
-            || !self.wake.awakened.lock().expect(ERR_POISONED_LOCK).is_empty()
-            || self.wake.probe_embedded_wake_signals.load(atomic::Ordering::Relaxed)
+        !state_reentrant.new_tasks.is_empty() || !self.wake.awakened.lock().expect(ERR_POISONED_LOCK).is_empty()
     }
 
     #[cfg_attr(test, mutants::skip)] // Mutation can lead to deadlocked executor as it never shuts down.
@@ -516,7 +445,7 @@ impl ExecutorCore {
         let aborted_count = Self::prepare_task_abort(&self.wake, &mut state_exclusive, &mut state_reentrant);
         drop(state_reentrant);
         Self::abort_prepared_tasks(&state_exclusive, aborted_count);
-        Self::drop_completed_tasks(&mut state_exclusive, false);
+        Self::drop_completed_tasks(&mut state_exclusive, &mut self.reentrancy_safe.borrow_mut().tasks, false);
         if EXECUTOR_PUSHER.try_with(MetricsPusher::push).is_err() {
             // Executor cleanup must remain safe after metrics TLS has been destroyed.
         }
@@ -524,10 +453,6 @@ impl ExecutorCore {
 
     fn prepare_task_abort(wake: &WakeShared, state_exclusive: &mut ExclusiveState, state_reentrant: &mut ReentrancySafeState) -> usize {
         let mut awakened = wake.awakened.lock().expect(ERR_POISONED_LOCK);
-        for &task_ref in awakened.iter() {
-            // SAFETY: Shutdown has not released task storage yet; every queued reference remains live.
-            unsafe { task_ref.as_task() }.clear_queued_notification();
-        }
         awakened.clear();
         drop(awakened);
 
@@ -601,7 +526,7 @@ impl Drop for ExecutorCore {
         let aborted_count = Self::prepare_task_abort(&self.wake, state_exclusive, state_reentrant);
         Self::abort_prepared_tasks(state_exclusive, aborted_count);
 
-        Self::drop_completed_tasks(state_exclusive, false);
+        Self::drop_completed_tasks(state_exclusive, &mut state_reentrant.tasks, false);
         match EXECUTOR_PUSHER.try_with(MetricsPusher::push) {
             Ok(()) => {}
             Err(_access_error) => {
@@ -653,11 +578,6 @@ thread_local! {
         .pusher_local(&EXECUTOR_PUSHER)
         .build();
 
-    static TASKS_ACTIVATED_VIA_PROBE: Event<Push> = Event::builder()
-        .name("ae_tasks_activated_via_probe")
-        .pusher_local(&EXECUTOR_PUSHER)
-        .build();
-
     static TASKS_ACTIVATED_SPURIOUS: Event<Push> = Event::builder()
         .name("ae_tasks_activated_spurious")
         .pusher_local(&EXECUTOR_PUSHER)
@@ -702,7 +622,60 @@ mod tests {
     }
 
     #[test]
-    fn embedded_wake_racing_active_poll_is_reprobed_after_reclassification() {
+    fn stale_wake_identity_cannot_activate_a_replacement_task() {
+        #[expect(clippy::future_not_send, reason = "the executor intentionally supports thread-local futures")]
+        fn counting_task(polls: Rc<Cell<usize>>, ready: bool) -> impl Future<Output = ()> {
+            std::future::poll_fn(move |_| {
+                polls.set(polls.get() + 1);
+                if ready { Poll::Ready(()) } else { Poll::Pending }
+            })
+        }
+
+        let core = ExecutorCore::new(task::Waker::noop().clone(), Sink::noop());
+        let polls = Rc::new(Cell::new(0));
+        let first_handle = core.add_task(counting_task(Rc::clone(&polls), true), TaskOptions::default());
+        let first = *core.reentrancy_safe.borrow().new_tasks.front().unwrap();
+        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+
+        let second_handle = core.add_task(counting_task(Rc::clone(&polls), false), TaskOptions::default());
+        let second = *core.reentrancy_safe.borrow().new_tasks.front().unwrap();
+        assert_eq!(first, second, "the pool reuses the completed task's storage");
+        assert_ne!(first.id(), second.id());
+        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+        assert_eq!(polls.get(), 2);
+
+        core.wake.awakened.lock().unwrap().extend([first.id(), first.id()]);
+        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+        assert_eq!(polls.get(), 2);
+
+        core.wake.awakened.lock().unwrap().extend([first.id(), second.id(), second.id()]);
+        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+        assert_eq!(polls.get(), 3);
+
+        core.begin_shutdown();
+        assert_eq!(core.execute_cycle(), CycleOutcome::Shutdown);
+        drop((first_handle, second_handle));
+    }
+
+    #[test]
+    fn shutdown_ignores_stale_wake_identities() {
+        let core = ExecutorCore::new(task::Waker::noop().clone(), Sink::noop());
+        let completed = core.add_task(async {}, TaskOptions::default());
+        let stale_id = core.reentrancy_safe.borrow().new_tasks.front().unwrap().id();
+        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+
+        let pending = core.add_task(std::future::pending::<()>(), TaskOptions::default());
+        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+        core.wake.awakened.lock().unwrap().push_back(stale_id);
+
+        core.begin_shutdown();
+        assert!(core.wake.awakened.lock().unwrap().is_empty());
+        assert_eq!(core.execute_cycle(), CycleOutcome::Shutdown);
+        drop((completed, pending));
+    }
+
+    #[test]
+    fn wake_after_activation_is_preserved_for_the_next_cycle() {
         let core = ExecutorCore::new(task::Waker::noop().clone(), Sink::noop());
         let captured = Rc::new(Cell::new(None));
         let polls = Rc::new(Cell::new(0));
@@ -719,22 +692,17 @@ mod tests {
             TaskOptions::default(),
         );
         assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
-        let waker = captured.take().expect("the first poll captures a waker");
+        let waker = captured.take().unwrap();
         waker.wake_by_ref();
 
         let mut state = core.exclusive.borrow_mut();
-        core.activate_awakened_tasks(&mut state);
-        {
-            let _queue_guard = core.wake.awakened.lock().unwrap();
-            waker.wake_by_ref();
-        }
-        core.activate_awakened_tasks(&mut state);
-        assert!(!core.wake.probe_embedded_wake_signals.load(atomic::Ordering::Relaxed));
+        core.activate_awakened_tasks(&mut state, &core.reentrancy_safe.borrow().tasks);
+        std::thread::spawn(move || waker.wake()).join().unwrap();
 
         core.poll_active_tasks(&mut state);
 
-        assert!(core.wake.probe_embedded_wake_signals.load(atomic::Ordering::Relaxed));
-        core.activate_awakened_tasks(&mut state);
+        assert!(core.has_work_to_do(&state, &core.reentrancy_safe.borrow()));
+        core.activate_awakened_tasks(&mut state, &core.reentrancy_safe.borrow().tasks);
         core.poll_active_tasks(&mut state);
         assert_eq!(polls.get(), 3);
         drop(state);

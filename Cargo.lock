@@ -297,7 +297,6 @@ dependencies = [
  "nm",
  "observed",
  "observed_testing",
- "pin-project",
  "plurality",
  "scopeguard",
  "static_assertions",

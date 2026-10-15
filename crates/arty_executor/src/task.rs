@@ -36,20 +36,13 @@ where
     /// `None` if the task has either completed or has been abandoned by the executor (e.g. because
     /// it is shutting down).
     ///
-    /// We use `UnsafeCell` to allow the `Task` to be accessed from multiple viewpoints, with the
-    /// executor using both the payload and the wake signal, and the wakers emitted by the
-    /// wake signal using the wake signal. All access is via shared references to ensure no
-    /// aliasing violations, with `UnsafeCell` used when mutation of the contents is needed.
-    /// (Outer) mutation of the fields only occurs by the executor, ensuring thread-safety.
+    /// The executor accesses pinned tasks through shared references. Only the owning thread
+    /// accesses this cell; wakers retain independent pooled tokens, not task storage.
     payload: UnsafeCell<Option<Payload<F, R, T>>>,
 
     /// `None` if the task has not been initialized yet.
     ///
-    /// We use `UnsafeCell` to allow the `Task` to be accessed from multiple viewpoints, with the
-    /// executor using both the payload and the wake signal, and the wakers emitted by the
-    /// wake signal using the wake signal. All access is via shared references to ensure no
-    /// aliasing violations, with `UnsafeCell` used when mutation of the contents is needed.
-    /// (Outer) mutation of the fields only occurs by the executor, ensuring thread-safety.
+    /// Initialized once on the owning thread, then accessed only through shared references.
     wake_signal: UnsafeCell<Option<WakeSignal>>,
 
     options: TaskOptions,
@@ -62,8 +55,6 @@ where
     #[cfg(all(debug_assertions, test))]
     diagnostic_waker_registry: Arc<DiagnosticWakerRegistry>,
 
-    // Technically, the wakers also touch the wake signal from other threads but that is
-    // private business of the wake signal and nothing that is visible to this type.
     _single_threaded: PhantomData<*const ()>,
 
     _requires_pin: PhantomPinned,
@@ -141,35 +132,6 @@ where
 
     fn created_reporter(&self) -> TaskCreatedReporter {
         self.options.created_reporter(self.sink.clone())
-    }
-
-    #[cfg_attr(test, mutants::skip)] // Trivial forwarder.
-    fn consume_awakened(&self) -> bool {
-        // SAFETY: The `Task` is single-threaded and after initialization, we only ever create
-        // shared references to the wake signal, so creating a shared reference here is valid.
-        // Before initialization, we do not create any escaping references to the wake signal.
-        unsafe {
-            self.wake_signal
-                .get()
-                .as_ref()
-                .expect("UnsafeCell pointer cannot be null")
-                .as_ref()
-                .expect("task must be initialized before consume_awakened()")
-                .consume_awakened()
-        }
-    }
-
-    fn is_awakened(&self) -> bool {
-        // SAFETY: The task owner reads initialized wake metadata only on its owning thread.
-        unsafe {
-            self.wake_signal
-                .get()
-                .as_ref()
-                .expect("UnsafeCell pointer cannot be null")
-                .as_ref()
-                .expect("task must be initialized before checking its wake state")
-                .is_awakened()
-        }
     }
 
     fn clear_queued_notification(&self) {
@@ -255,20 +217,14 @@ where
                 .expect("task must be initialized before poll()")
         };
 
-        // SAFETY: It is pinned together with the `Task` that contains it, the `Pin` wrapper just
-        // goes lost in the whole `UnsafeCell` and `Option` layering.
-        let wake_signal = unsafe { Pin::new_unchecked(wake_signal) };
-
         let poll_result = {
-            // SAFETY: The borrowed polling waker cannot escape this block. Clones retain the
-            // independently pooled state and may outlive both the poll and the task.
-            let waker = unsafe { wake_signal.waker_ref() };
+            let waker = wake_signal.waker();
 
             // Unit tests wrap the waker to exercise clone backtrace diagnostics.
             #[cfg(all(debug_assertions, test))]
-            let waker = DiagnosticWaker::with_inner_and_registry(waker.clone(), Arc::clone(&self.diagnostic_waker_registry));
+            let waker = &DiagnosticWaker::with_inner_and_registry(waker.clone(), Arc::clone(&self.diagnostic_waker_registry));
 
-            let mut cx = task::Context::from_waker(&waker);
+            let mut cx = task::Context::from_waker(waker);
 
             // Runtime integrations can provide a remote result target that receives captured
             // panics. Plain executor tasks retain the fail-fast behavior.
@@ -291,7 +247,7 @@ where
     fn finish_panicked(
         self: Pin<&Self>,
         maybe_payload: &mut Option<Payload<F, R, T>>,
-        wake_signal: Pin<&WakeSignal>,
+        wake_signal: &WakeSignal,
         panic: TaskPanicPayload,
     ) -> task::Poll<()> {
         let payload = maybe_payload.as_mut().expect("a polled task retains its payload");
@@ -537,16 +493,6 @@ pub(crate) trait TypeErasedTask {
     /// Captures independently owned data for task-created telemetry.
     fn created_reporter(&self) -> TaskCreatedReporter;
 
-    /// Swaps the task's "is awakened" flag to false and returns its previous value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the task has not been initialized.
-    fn consume_awakened(&self) -> bool;
-
-    /// Returns whether a wake arrived without consuming it.
-    fn is_awakened(&self) -> bool;
-
     /// Records that the executor drained this task's queued wake notification.
     fn clear_queued_notification(&self);
 
@@ -657,29 +603,24 @@ mod tests {
         let (tx, _rx) = event_pool.rent();
         let task = pin!(Task::new(pending::<u64>(), tx));
         let task = task.as_ref();
-        // SAFETY: Tests use this only as an opaque identity.
-        let fake_task_ref = unsafe { crate::TaskRef::fake() };
-        let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(1)));
-        let signal = WakeSignal::new_with_parts(
-            Arc::clone(&queue),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Waker::noop().clone(),
-            fake_task_ref,
-        );
+        let fake_task_id = crate::TaskId::fake();
+        let shared = Arc::new(crate::wake::WakeShared::new(Waker::noop().clone()));
+        let signal = WakeSignal::new(&shared, fake_task_id);
         task.initialize(signal);
         // SAFETY: Initialization populated the pinned wake-signal slot.
         let signal = unsafe { &*task.wake_signal.get() }.as_ref().unwrap();
-        // SAFETY: The signal remains pinned with the task.
-        let signal = unsafe { Pin::new_unchecked(signal) };
-        // SAFETY: The pinned signal remains alive for this borrow.
-        let waker = unsafe { signal.waker_ref() };
+        let waker = signal.waker();
         waker.wake_by_ref();
-        assert!(signal.has_queued_notification());
+        assert_eq!(shared.awakened.lock().unwrap().len(), 1);
 
-        task.clear_queued_notification();
+        {
+            let mut queue = shared.awakened.lock().unwrap();
+            queue.clear();
+            task.clear_queued_notification();
+        }
+        waker.wake_by_ref();
 
-        assert!(!signal.has_queued_notification());
-        drop(waker);
+        assert_eq!(shared.awakened.lock().unwrap().len(), 1);
         task.abort();
     }
 

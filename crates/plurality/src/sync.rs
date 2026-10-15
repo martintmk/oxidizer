@@ -112,6 +112,31 @@ impl<T, A: Allocator> Arc<T, A> {
 }
 
 impl<T: ?Sized, A: Allocator> Arc<T, A> {
+    /// Transfers this handle's ownership into a raw pointer without changing the reference count.
+    ///
+    /// Reconstruct the handle with [`Arc::from_raw`] to release its ownership. Otherwise the value
+    /// and its pool slot remain retained.
+    #[must_use]
+    #[inline]
+    pub fn into_raw(this: Self) -> NonNull<T> {
+        let slot = this.slot;
+        forget(this);
+        slot
+    }
+
+    /// Reconstructs one owning handle transferred through [`Arc::into_raw`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an unconsumed pointer returned by `Arc::<T, A>::into_raw`, with the same
+    /// pointee type, metadata, and allocator type. Each transferred ownership must be reconstructed
+    /// exactly once. A pointer obtained only through [`Arc::as_ptr`] does not transfer ownership.
+    #[must_use]
+    #[inline]
+    pub unsafe fn from_raw(ptr: NonNull<T>) -> Self {
+        Self::from_value(ptr)
+    }
+
     #[inline]
     pub(crate) fn from_value(value: NonNull<T>) -> Self {
         Self {

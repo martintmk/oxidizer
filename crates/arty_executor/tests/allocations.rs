@@ -35,6 +35,27 @@ fn spawn_complete_once(executor: &Executor, tasks: &TaskSet) -> Poll<Result<(), 
     handle.as_mut().poll(&mut Context::from_waker(Waker::noop()))
 }
 
+#[expect(clippy::waker_clone_wake, reason = "measure both consuming and borrowed wake ownership paths")]
+fn spawn_wake_complete_once(executor: &Executor, tasks: &TaskSet) -> Poll<Result<(), JoinError>> {
+    let mut first_poll = true;
+    let mut handle = pin!(tasks.add(
+        std::future::poll_fn(move |cx| {
+            if first_poll {
+                first_poll = false;
+                cx.waker().clone().wake();
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }),
+        TaskOptions::default(),
+    ));
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    handle.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
 fn spawn_remote_complete_once(executor: &Executor, tasks: &TaskSet, result_pool: &RemotePool) -> Poll<Result<(), JoinError>> {
     let (result_tx, mut handle) = result_pool.channel();
     tasks.add_with_remote_result(async {}, TaskOptions::default(), result_tx);
@@ -86,6 +107,36 @@ fn spawn_and_complete_one_only_allocates_debug_bookkeeping() {
     assert_ne!(bytes, 0, "debug bookkeeping must be visible to the allocation tracker");
 
     assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    executor.begin_shutdown();
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+}
+
+#[test]
+fn spawn_wake_and_complete_reuses_wake_tokens_and_queue_storage() {
+    let executor = Executor::builder().build();
+    let tasks = executor.tasks();
+    for _ in 0..WARM_UP_OPERATIONS {
+        assert_eq!(spawn_wake_complete_once(&executor, &tasks), Poll::Ready(Ok(())));
+    }
+
+    let session = Session::new().no_stdout().no_file();
+    let operation = session.operation("spawn_wake_and_complete");
+    {
+        let _span = operation.measure_thread().iterations(MEASURED_OPERATIONS as u64);
+        for _ in 0..MEASURED_OPERATIONS {
+            assert_eq!(spawn_wake_complete_once(&executor, &tasks), Poll::Ready(Ok(())));
+        }
+    }
+    let (allocations, bytes) = allocation_totals(&session, "spawn_wake_and_complete");
+    assert_eq!(allocations, EXPECTED_ALLOCATIONS_PER_OPERATION * MEASURED_OPERATIONS as u64);
+    #[cfg(not(debug_assertions))]
+    assert_eq!(
+        bytes, 0,
+        "pooled wake-token creation, cloning, waking, and reclamation must not allocate"
+    );
+    #[cfg(debug_assertions)]
+    assert_ne!(bytes, 0);
+
     executor.begin_shutdown();
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
 }

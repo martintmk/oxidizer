@@ -30,11 +30,14 @@
 //! only is there no "remove" function but similarly, there is no "cancel" function - once a task
 //! has started executing, the only thing that can terminate it is the task itself, by completing.
 //!
-//! In a steady state, the executor is allocation-free, as all memory used by the executor is
-//! reused for new tasks when old ones complete.
+//! Task storage and shared wake tokens are pooled. The task map and wake queue reuse their
+//! capacity, avoiding allocations in warmed workloads within their existing capacity. Retained
+//! wakers keep their token slots occupied, so additional tasks may require pool growth.
 //!
 //! Cloned task wakers may outlive their tasks. After completion or cancellation, an escaped waker
 //! remains callable but becomes an inert no-op and cannot delay executor shutdown.
+//! Wake notifications carry never-reused task identities, which are looked up in the executor's
+//! task map before task storage is accessed. A stale notification cannot target a later task.
 //!
 //! Join handles may outlive the executor and report shutdown cancellation through [`JoinError`].
 //! A panic in a directly registered executor task remains fail-fast.
@@ -49,6 +52,7 @@ mod panic;
 mod ptr_hash;
 pub mod remote;
 mod task;
+mod task_id;
 mod task_options;
 mod task_ref;
 mod task_set;
@@ -64,6 +68,7 @@ pub use join_handle::*;
 pub use panic::*;
 pub(crate) use ptr_hash::*;
 pub(crate) use task::*;
+pub(crate) use task_id::*;
 pub use task_options::*;
 pub(crate) use task_ref::*;
 pub use task_set::*;
