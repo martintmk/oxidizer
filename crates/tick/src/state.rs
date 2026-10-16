@@ -239,7 +239,6 @@ mod tests {
     struct PanicWake;
 
     impl Wake for PanicWake {
-        #[expect(clippy::panic, reason = "this test verifies timer-lock resilience to a panicking registration waker")]
         fn wake(self: StdArc<Self>) {
             panic!("registration wake panic");
         }

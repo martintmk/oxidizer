@@ -124,9 +124,7 @@ impl AsyncWorker {
         clock: InactiveClock,
         signal: Arc<WorkerSignal>,
     ) -> Self {
-        let (clock, clock_driver) = clock.activate_with_timer_registration_waker(
-            WorkerSignal::timer_registration_waker(&signal),
-        );
+        let (clock, clock_driver) = clock.activate_with_timer_registration_waker(WorkerSignal::timer_registration_waker(&signal));
         let timer_registrations_wake_driver = clock_driver.timer_registrations_wake_driver();
         let shutdown_signal = dispatcher.shutdown_signal();
 
@@ -207,11 +205,7 @@ impl AsyncWorker {
         self.suspend_with(timer_schedule, WorkerSignal::wait);
     }
 
-    fn suspend_with(
-        &mut self,
-        mut timer_schedule: TimerSchedule,
-        mut wait: impl FnMut(&WorkerSignal, Duration) -> bool,
-    ) {
+    fn suspend_with(&mut self, mut timer_schedule: TimerSchedule, mut wait: impl FnMut(&WorkerSignal, Duration) -> bool) {
         let mut remaining = EXECUTOR_FAILSAFE_INTERVAL;
         while !remaining.is_zero() {
             let timeout = timer_schedule.wait_timeout(remaining);
@@ -683,7 +677,7 @@ mod tests {
         let (command_tx, command_rx) = channel::unbounded();
         let control = ClockControl::new()
             .auto_advance(Duration::from_millis(1))
-            .auto_advance_limit(EXECUTOR_FAILSAFE_INTERVAL.saturating_add(TIMER_POLL_INTERVAL));
+            .auto_advance_limit(EXECUTOR_FAILSAFE_INTERVAL);
         let signal = Arc::new(WorkerSignal::default());
         let mut worker = test_worker(
             command_tx,
@@ -784,25 +778,33 @@ mod tests {
             Arc::clone(&signal),
         );
         let clock = worker.builtins.as_ref().unwrap().clock().clone();
-        let mut later = clock.delay(Duration::from_secs(120));
-        assert!(Pin::new(&mut later).poll(&mut std::task::Context::from_waker(Waker::noop())).is_pending());
+        let mut later = clock.delay(Duration::from_mins(2));
+        assert!(
+            Pin::new(&mut later)
+                .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert!(!signal.is_notified());
         let later_schedule = worker.advance_running_timers(true);
-        let mut earlier = clock.delay(Duration::from_secs(60));
+        let mut earlier = clock.delay(Duration::from_mins(1));
 
         worker.suspend_with(later_schedule, |signal, _| {
-            assert!(Pin::new(&mut earlier)
-                .poll(&mut std::task::Context::from_waker(Waker::noop()))
-                .is_pending());
+            assert!(
+                Pin::new(&mut earlier)
+                    .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             signal.wait(Duration::ZERO)
         });
 
         let earlier_schedule = worker.advance_running_timers(false);
         assert!(earlier_schedule.next_deadline < later_schedule.next_deadline);
         let mut earliest = clock.delay(Duration::from_secs(30));
-        assert!(Pin::new(&mut earliest)
-            .poll(&mut std::task::Context::from_waker(Waker::noop()))
-            .is_pending());
+        assert!(
+            Pin::new(&mut earliest)
+                .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         assert!(!signal.is_notified());
     }
 
@@ -818,20 +820,25 @@ mod tests {
             signal,
         );
         let clock = worker.builtins.as_ref().unwrap().clock().clone();
-        let mut earlier = clock.delay(Duration::from_secs(60));
-        let mut later = clock.delay(Duration::from_secs(120));
-        assert!(Pin::new(&mut earlier)
-            .poll(&mut std::task::Context::from_waker(Waker::noop()))
-            .is_pending());
-        assert!(Pin::new(&mut later).poll(&mut std::task::Context::from_waker(Waker::noop())).is_pending());
+        let mut earlier = clock.delay(Duration::from_mins(1));
+        let mut later = clock.delay(Duration::from_mins(2));
+        assert!(
+            Pin::new(&mut earlier)
+                .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(
+            Pin::new(&mut later)
+                .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let stale_schedule = worker.advance_running_timers(true);
         assert!(!worker.signal.wait(Duration::ZERO));
 
         drop(earlier);
         let revised_schedule = worker.advance_running_timers(false);
 
-        assert!(stale_schedule.wait_timeout(EXECUTOR_FAILSAFE_INTERVAL)
-            <= revised_schedule.wait_timeout(EXECUTOR_FAILSAFE_INTERVAL));
+        assert!(stale_schedule.wait_timeout(EXECUTOR_FAILSAFE_INTERVAL) <= revised_schedule.wait_timeout(EXECUTOR_FAILSAFE_INTERVAL));
     }
 
     #[test]

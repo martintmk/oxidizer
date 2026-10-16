@@ -152,16 +152,14 @@ mod tests {
 
     #[test]
     fn system_registration_waker_is_reported_by_the_driver() {
-        let (_, driver) =
-            InactiveClock::default().activate_with_timer_registration_waker(Waker::noop().clone());
+        let (_, driver) = InactiveClock::default().activate_with_timer_registration_waker(Waker::noop().clone());
 
         assert!(driver.timer_registrations_wake_driver());
     }
 
     #[test]
     fn controlled_clock_does_not_report_a_driver_registration_waker() {
-        let (_, driver) = InactiveClock::from(ClockControl::new())
-            .activate_with_timer_registration_waker(Waker::noop().clone());
+        let (_, driver) = InactiveClock::from(ClockControl::new()).activate_with_timer_registration_waker(Waker::noop().clone());
 
         assert!(!driver.timer_registrations_wake_driver());
     }
