@@ -77,9 +77,3 @@ mod testing;
 mod wake_diagnostic;
 #[cfg(all(debug_assertions, test))]
 pub(crate) use wake_diagnostic::*;
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod task_mock;
-#[cfg(test)]
-pub(crate) use task_mock::*;

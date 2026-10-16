@@ -17,7 +17,8 @@ use tick::SimpleClock;
 use crate::remote::Sender as RemoteSender;
 use crate::wake::WakeShared;
 use crate::{
-    BuildPointerHasher, CycleOutcome, ERR_POISONED_LOCK, JoinEventLake, JoinHandle, Task, TaskOptions, TaskRef, TypeErasedTask, WakeSignal,
+    BuildNumericHasher, CycleOutcome, ERR_POISONED_LOCK, JoinEventLake, JoinHandle, RegisteredTask, Task, TaskIdSource, TaskOptions,
+    TaskRef, TypeErasedTask, WakeSignal,
 };
 
 /// The real implementation of the executor, shared by different public "client" API surfaces.
@@ -50,7 +51,7 @@ struct ReentrancySafeState {
     /// any `execute_cycle()` call yet.
     ///
     /// This is a `VecDeque` because we do not require set characteristics and a deque is faster.
-    new_tasks: VecDeque<TaskRef>,
+    new_tasks: VecDeque<RegisteredTask>,
 
     /// Storage for all the tasks registered with the executor. Once a task has been registered,
     /// the executor only sees it as a [`TypeErasedTask`][crate::TypeErasedTask], with only the
@@ -60,6 +61,9 @@ struct ReentrancySafeState {
     /// Storage for result channels. Managed endpoints retain detached pool slots independently,
     /// allowing join handles to outlive the executor safely.
     join_events: JoinEventLake,
+
+    /// Next never-reused executor-local task identity.
+    next_task_id: TaskIdSource,
 
     /// In shutdown mode, all tasks are cancelled and retired. New submissions produce a
     /// shutdown join error without registering a task.
@@ -75,7 +79,7 @@ struct ExclusiveState {
     /// All the tasks we want to poll.
     ///
     /// This is a `VecDeque` because we do not require set characteristics and a deque is faster.
-    active: VecDeque<TaskRef>,
+    active: VecDeque<RegisteredTask>,
 
     /// The inactive set contains all the tasks that we consider to be in a state where polling
     /// will not make any progress. We will move them back to the active set after a waker notifies
@@ -85,13 +89,12 @@ struct ExclusiveState {
     /// mean it gets polled multiple times per cycle, though - we explicitly poll every task at
     /// most once per cycle, to avoid getting stuck on a hyperactive task.
     ///
-    /// We use a `PointerHasher` for efficient hashing because we know via white-box knowledge
-    /// that `TaskRef` is a thin wrapper around a pointer.
-    inactive: HashSet<TaskRef, BuildPointerHasher>,
+    /// Registered inactive tasks, keyed and hashed by their never-reused numeric identity.
+    inactive: HashSet<RegisteredTask, BuildNumericHasher>,
 
     /// Tasks that completed during this cycle and can be released after their independently pooled
     /// wake state has been retired.
-    completed: VecDeque<TaskRef>,
+    completed: VecDeque<RegisteredTask>,
 
     /// Used to measure the time spent during/between executor cycle processing and during shutdown.
     /// This is a very fast clock designed to be cheap to poll many times each millisecond (if we
@@ -128,11 +131,12 @@ impl ExecutorCore {
                 new_tasks: VecDeque::new(),
                 task_storage: MultiPool::new(),
                 join_events: JoinEventLake::new(),
+                next_task_id: TaskIdSource::default(),
                 shutting_down: false,
             }),
             exclusive: RefCell::new(ExclusiveState {
                 active: VecDeque::new(),
-                inactive: HashSet::with_hasher(BuildPointerHasher::default()),
+                inactive: HashSet::with_hasher(BuildNumericHasher::default()),
                 completed: VecDeque::new(),
                 clock: SimpleClock::new_system().with_fast_instant(true),
                 last_cycle_ended: None,
@@ -197,8 +201,10 @@ impl ExecutorCore {
             let (task, output) = create(&state.join_events, self.sink.clone());
 
             let task_ref = TaskRef::new(state.task_storage.alloc_box(task));
+            let task_id = state.next_task_id.take_next();
+            let registered = RegisteredTask::new(task_id, task_ref);
 
-            let wake_signal = WakeSignal::new(Arc::clone(&self.wake), task_ref);
+            let wake_signal = WakeSignal::new(Arc::clone(&self.wake), task_id);
 
             // SAFETY: The task is alive (we own it and just created it) and we are on the thread
             // where it was created (because we just created it). The executor is the only thing that
@@ -210,7 +216,7 @@ impl ExecutorCore {
 
             task.initialize(wake_signal);
             let reporter = task.created_reporter();
-            state.new_tasks.push_back(task_ref);
+            state.new_tasks.push_back(registered);
             (reporter, output)
         };
 
@@ -320,23 +326,20 @@ impl ExecutorCore {
 
         {
             // First, we simply drain the "awakened" queue, which is the preferred
-            // way to wake up tasks. This is a fast TaskRef move, so the lock here is
+            // way to wake up tasks. This is a fast TaskId move, so the lock here is
             // hopefully short and mostly uncontended.
             let mut awakened = self.wake.awakened.lock().expect(ERR_POISONED_LOCK);
 
             if !awakened.is_empty() {
                 // Process each contiguous slice in FIFO order, avoiding per-task ring-buffer
-                // bookkeeping. TaskRef is Copy, so clearing once also avoids drain cleanup.
+                // bookkeeping. TaskId is Copy, so clearing once also avoids drain cleanup.
                 for slice in <[_; 2]>::from(awakened.as_slices()) {
-                    for &task_ref in slice {
-                        // SAFETY: Retirement removes every queued notification before task
-                        // storage is released, so every queued reference still targets a live task.
-                        unsafe { task_ref.as_task() }.clear_queued_notification();
+                    for &task_id in slice {
                         // It is theoretically possible for a completed task to be awakened, in which case
                         // we do nothing. We detect this by ensuring that the task was in the "inactive" set
                         // before we react to the wake notification. This also eliminates spurious wakes.
-                        if state_exclusive.inactive.remove(&task_ref) {
-                            state_exclusive.active.push_back(task_ref);
+                        if let Some(task) = state_exclusive.inactive.take(&task_id) {
+                            state_exclusive.active.push_back(task);
 
                             TASKS_ACTIVATED_VIA_AWAKENED_SET.with(Event::observe_once);
                         } else {
@@ -362,18 +365,15 @@ impl ExecutorCore {
         // This means we need to inspect every task in `inactive` to see if it has
         // been awakened. This scales very poorly with large (1000+) task sets, which
         // is why we avoid it if at all possible.
-        state_exclusive.inactive.retain(|task_ref| {
-            // SAFETY: The task is alive (we own it and just created it) and we are on the thread
-            // where it was created (because we just created it). The executor is the only thing that
-            // creates references to the tasks and it only ever creates temporary non-overlapping
-            // references narrowly bounded to individual code blocks, ensuring that aliasing rules
-            // are upheld. Anything outside `ExecutorCore` only passes `TaskRef` by value, never
-            // dereferencing it. Reentrant logic for registering new tasks cannot touch existing tasks.
+        state_exclusive.inactive.retain(|registered| {
+            let task_ref = registered.task_ref();
+            // SAFETY: The task is live in `inactive`, this is its owner thread, and executor task
+            // references are temporary and non-overlapping.
             let task = unsafe { task_ref.as_task() };
 
             if task.consume_awakened() {
                 TASKS_ACTIVATED_VIA_PROBE.with(Event::observe_once);
-                state_exclusive.active.push_back(*task_ref);
+                state_exclusive.active.push_back(*registered);
                 false
             } else {
                 true
@@ -385,18 +385,15 @@ impl ExecutorCore {
         let completed_before = state_exclusive.completed.len();
         let inactive_before = state_exclusive.inactive.len();
 
-        while let Some(task_ref) = state_exclusive.active.pop_front() {
-            // SAFETY: The task is alive (we own it and just created it) and we are on the thread
-            // where it was created (because we just created it). The executor is the only thing that
-            // creates references to the tasks and it only ever creates temporary non-overlapping
-            // references narrowly bounded to individual code blocks, ensuring that aliasing rules
-            // are upheld. Anything outside `ExecutorCore` only passes `TaskRef` by value, never
-            // dereferencing it. Reentrant logic for registering new tasks cannot touch existing tasks.
+        while let Some(registered) = state_exclusive.active.pop_front() {
+            let task_ref = registered.task_ref();
+            // SAFETY: The task is live in `active`, this is its owner thread, and executor task
+            // references are temporary and non-overlapping.
             let task = unsafe { task_ref.as_task() };
 
             if self.reentrancy_safe.borrow().shutting_down {
                 task.abort();
-                state_exclusive.completed.push_back(task_ref);
+                state_exclusive.completed.push_back(registered);
                 continue;
             }
 
@@ -404,12 +401,12 @@ impl ExecutorCore {
                 task::Poll::Ready(()) => {
                     // The task has completed and retired its independently pooled wake state, so it
                     // can move to the completed list for release at the end of this cycle.
-                    state_exclusive.completed.push_back(task_ref);
+                    state_exclusive.completed.push_back(registered);
                 }
                 task::Poll::Pending => {
                     // The task is still pending, so we move it to the inactive set.
                     // It will return to the active set once something jiggles its waker.
-                    state_exclusive.inactive.insert(task_ref);
+                    state_exclusive.inactive.insert(registered);
                     // A wake may have fallen back to the embedded signal while this task was
                     // already active and therefore absent from the probe scan. Re-arm the probe
                     // after reclassification so the next cycle cannot suspend past that wake.
@@ -451,10 +448,10 @@ impl ExecutorCore {
 
         // We drop all completed tasks after their completion/cancellation path has retired any
         // independently held wake metadata.
-        for task_ref in state_exclusive.completed.drain(..) {
+        for registered in state_exclusive.completed.drain(..) {
             // SAFETY: Draining removes each completed task exactly once, after its wake metadata
             // has been retired by completion or cancellation.
-            unsafe { task_ref.release() };
+            unsafe { registered.task_ref().release() };
         }
 
         if record_cycle_metric && completed_before > 0 {
@@ -524,10 +521,6 @@ impl ExecutorCore {
 
     fn prepare_task_abort(wake: &WakeShared, state_exclusive: &mut ExclusiveState, state_reentrant: &mut ReentrancySafeState) -> usize {
         let mut awakened = wake.awakened.lock().expect(ERR_POISONED_LOCK);
-        for &task_ref in awakened.iter() {
-            // SAFETY: Shutdown has not released task storage yet; every queued reference remains live.
-            unsafe { task_ref.as_task() }.clear_queued_notification();
-        }
         awakened.clear();
         drop(awakened);
 
@@ -547,8 +540,8 @@ impl ExecutorCore {
             }
         }
 
-        for task_ref in active.drain(..).chain(inactive.drain()).chain(new.drain(..)) {
-            completed.push_back(task_ref);
+        for registered in active.drain(..).chain(inactive.drain()).chain(new.drain(..)) {
+            completed.push_back(registered);
         }
 
         aborted_count
@@ -560,13 +553,10 @@ impl ExecutorCore {
             .len()
             .checked_sub(aborted_count)
             .expect("prepared task count cannot exceed completed task count");
-        for &task_ref in state_exclusive.completed.range(abort_start..) {
-            // SAFETY: The task is alive (we own it and just created it) and we are on the thread
-            // where it was created (because we just created it). The executor is the only thing that
-            // creates references to the tasks and it only ever creates temporary non-overlapping
-            // references narrowly bounded to individual code blocks, ensuring that aliasing rules
-            // are upheld. Anything outside `ExecutorCore` only passes `TaskRef` by value, never
-            // dereferencing it. Reentrant logic for registering new tasks cannot touch existing tasks.
+        for &registered in state_exclusive.completed.range(abort_start..) {
+            let task_ref = registered.task_ref();
+            // SAFETY: The task is live in `completed`, this is its owner thread, and executor task
+            // references are temporary and non-overlapping.
             let task = unsafe { task_ref.as_task() };
 
             task.abort();

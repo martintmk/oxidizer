@@ -17,6 +17,7 @@ use events_once::PooledLocalSender;
 use observed::Sink;
 
 use crate::remote::Sender as RemoteSender;
+use crate::telemetry;
 #[cfg(all(debug_assertions, test))]
 use crate::{DiagnosticWaker, DiagnosticWakerRegistry};
 use crate::{TaskCreatedReporter, TaskOptions, TaskPanicPayload, WakeSignal, discard_task_panic_payload};
@@ -172,20 +173,6 @@ where
         }
     }
 
-    fn clear_queued_notification(&self) {
-        // SAFETY: The executor calls this only for a live initialized task while draining its
-        // wake queue.
-        unsafe {
-            self.wake_signal
-                .get()
-                .as_ref()
-                .expect("UnsafeCell pointer cannot be null")
-                .as_ref()
-                .expect("task must be initialized before clearing a wake notification")
-                .clear_queued_notification();
-        }
-    }
-
     #[cfg_attr(test, mutants::skip)] // Mutation causes resources not to be released, leading to executor shutdown never happening.
     fn abort(self: Pin<&Self>) {
         // SAFETY: Initialized wake metadata is retired only by the task's owner.
@@ -269,6 +256,10 @@ where
             let waker = DiagnosticWaker::with_inner_and_registry(waker.clone(), Arc::clone(&self.diagnostic_waker_registry));
 
             let mut cx = task::Context::from_waker(&waker);
+
+            if wake_signal.take_detached_unreported() {
+                telemetry::report_waker_detached(&self.sink);
+            }
 
             // Runtime integrations can provide a remote result target that receives captured
             // panics. Plain executor tasks retain the fail-fast behavior.
@@ -547,9 +538,6 @@ pub(crate) trait TypeErasedTask {
     /// Returns whether a wake arrived without consuming it.
     fn is_awakened(&self) -> bool;
 
-    /// Records that the executor drained this task's queued wake notification.
-    fn clear_queued_notification(&self);
-
     /// Clears the inner state of the task, entering a form where no further polling is possible
     /// and any future-specific state is dropped.
     ///
@@ -649,38 +637,6 @@ mod tests {
         } else {
             assert_eq!(result, task::Poll::Ready(Err(Disconnected)));
         }
-    }
-
-    #[test]
-    fn clear_queued_notification_forwards_to_the_wake_signal() {
-        let event_pool = LocalEventPool::<u64>::new();
-        let (tx, _rx) = event_pool.rent();
-        let task = pin!(Task::new(pending::<u64>(), tx));
-        let task = task.as_ref();
-        // SAFETY: Tests use this only as an opaque identity.
-        let fake_task_ref = unsafe { crate::TaskRef::fake() };
-        let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(1)));
-        let signal = WakeSignal::new_with_parts(
-            Arc::clone(&queue),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Waker::noop().clone(),
-            fake_task_ref,
-        );
-        task.initialize(signal);
-        // SAFETY: Initialization populated the pinned wake-signal slot.
-        let signal = unsafe { &*task.wake_signal.get() }.as_ref().unwrap();
-        // SAFETY: The signal remains pinned with the task.
-        let signal = unsafe { Pin::new_unchecked(signal) };
-        // SAFETY: The pinned signal remains alive for this borrow.
-        let waker = unsafe { signal.waker_ref() };
-        waker.wake_by_ref();
-        assert!(signal.has_queued_notification());
-
-        task.clear_queued_notification();
-
-        assert!(!signal.has_queued_notification());
-        drop(waker);
-        task.abort();
     }
 
     #[test]
@@ -823,6 +779,39 @@ mod tests {
         let completed = events.iter().find(|event| event.name() == "arty.rt.task.succeeded").unwrap();
         assert_eq!(completed.field_metrics()[0].field_key(), "polls");
         assert!((completed.field_metrics()[0].value() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn observed_task_reports_one_detached_waker_event() {
+        let event_pool = LocalEventPool::<u64>::new();
+        let (tx, _rx) = event_pool.rent();
+        let (sink, processor) = test_emitter(TEST_ID);
+        let task = pin!(Task::new_with_options(
+            std::future::poll_fn(|cx| {
+                std::thread::scope(|scope| {
+                    let waker = cx.waker();
+                    scope.spawn(move || {
+                        drop(waker.clone());
+                        drop(waker.clone());
+                    });
+                });
+                task::Poll::Ready(42)
+            }),
+            tx,
+            TaskOptions::observed(sink.transfer_context(), crate::TaskPlacement::Any),
+            sink,
+        ));
+        let task = task.as_ref();
+        task.initialize(WakeSignal::fake());
+        task.created_reporter().report();
+
+        assert!(task.poll().is_ready());
+
+        let events = processor.events();
+        assert_eq!(
+            events.iter().filter(|event| event.name() == "arty.rt.task.waker.detached").count(),
+            1
+        );
     }
 
     #[test]
