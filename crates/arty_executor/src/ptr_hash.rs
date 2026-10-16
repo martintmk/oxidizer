@@ -3,11 +3,9 @@
 
 use std::hash::{BuildHasherDefault, Hasher};
 
-/// We want to minimize the cost of hashing data that is already highly unique. In this sense,
-/// using pointers as hashes is appealing.
+/// A low-cost hasher for numeric identities and pointer addresses that are already unique.
 ///
-/// However, pointers tend to look very similar near the start of the value, with only the end
-/// differing.
+/// Sequential IDs and nearby pointers tend to differ in only a small region:
 ///
 /// ```text
 /// 0x0000000012341234
@@ -16,15 +14,14 @@ use std::hash::{BuildHasherDefault, Hasher};
 /// 0x0001C00B59636363
 /// ```
 ///
-/// This can lead to unbalanced hash tables, as the first few bits are the same for all pointers.
-/// We do not necessarily know which bits are the most significant, so we xor the pointer with its
-/// own bit-reversed value to help spread around the entropy. This results in a hash-quality value.
+/// This can lead to unbalanced hash tables. Combining the value with its bit-reversed form spreads
+/// the distinguishing bits across the result without the cost of a general-purpose keyed hash.
 #[derive(Debug, Default)]
-pub(crate) struct PointerHasher {
+pub(crate) struct NumericHasher {
     value: u64,
 }
 
-impl Hasher for PointerHasher {
+impl Hasher for NumericHasher {
     #[cfg_attr(test, mutants::skip)] // Difficult to test without getting silly and hardcoding results.
     fn finish(&self) -> u64 {
         self.value
@@ -38,17 +35,16 @@ impl Hasher for PointerHasher {
             u64::from(u32::from_ne_bytes(
                 bytes
                     .try_into()
-                    .expect("PointerHasher input must represent a 32-bit or 64-bit pointer"),
+                    .expect("NumericHasher input must be a 32-bit or 64-bit numeric identity"),
             ))
         };
 
-        self.value ^= input_raw;
-        self.value ^= input_raw.reverse_bits();
+        self.value = self.value.rotate_left(17) ^ input_raw ^ input_raw.reverse_bits();
     }
 }
 
-/// Builder for [`PointerHasher`].
-pub(crate) type BuildPointerHasher = BuildHasherDefault<PointerHasher>;
+/// Builder for [`NumericHasher`].
+pub(crate) type BuildNumericHasher = BuildHasherDefault<NumericHasher>;
 
 #[cfg(test)]
 mod tests {
@@ -56,8 +52,8 @@ mod tests {
 
     #[test]
     fn same_same() {
-        let mut hasher1 = PointerHasher::default();
-        let mut hasher2 = PointerHasher::default();
+        let mut hasher1 = NumericHasher::default();
+        let mut hasher2 = NumericHasher::default();
 
         hasher1.write(&1u64.to_ne_bytes());
         hasher2.write(&1u64.to_ne_bytes());
@@ -67,7 +63,7 @@ mod tests {
 
     #[test]
     fn accepts_32_bit_input() {
-        let mut hasher = PointerHasher::default();
+        let mut hasher = NumericHasher::default();
 
         hasher.write(&1u32.to_ne_bytes());
 
@@ -75,8 +71,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "PointerHasher input must represent a 32-bit or 64-bit pointer")]
+    #[should_panic(expected = "NumericHasher input must be a 32-bit or 64-bit numeric identity")]
     fn rejects_other_input_widths() {
-        PointerHasher::default().write(&[1]);
+        NumericHasher::default().write(&[1]);
     }
 }

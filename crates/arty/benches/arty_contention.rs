@@ -17,26 +17,31 @@
 //! is one coordination workload rather than a claim about general runtime
 //! performance.
 //!
-//! Callgrind is intentionally omitted because it cannot model the scheduling
-//! and mutex contention this workload is intended to expose.
+//! Callgrind cannot model the relocated-cache scheduling and mutex contention
+//! faithfully. The retained-waker case is included because its deterministic
+//! three-poll transition isolates cloned-waker wake and rescheduling overhead.
 
 use std::hint::black_box;
+use std::pin::Pin;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use arty::runtime::{Runtime, WorkersPolicy};
-use arty::task::Builtins;
-use criterion::{BenchmarkId, Criterion, Throughput};
+use arty::task::{Builtins, JoinHandle};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 #[cfg(target_os = "linux")]
 use gungraun::{Callgrind, CallgrindMetrics, LibraryBenchmarkConfig};
 use metabench::benchmark;
 use performables::arc::{Arc, PerThread};
 use performables::sync::mutex::Mutex;
-use thread_aware::{Thread, ThreadAware};
+use thread_aware::{Thread, ThreadAware, Unaware};
 
 const INNER_OPERATIONS: usize = 10;
 const CONCURRENCY: usize = 10;
 const CACHE_ENTRIES: usize = 8;
 const WORKERS: [usize; 2] = [1, 8];
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct CacheState {
@@ -189,6 +194,85 @@ async fn tokio_outer(cache: Cache) {
     }
 }
 
+#[derive(Debug)]
+struct ArtyRetainedWakeCase {
+    _runtime: Runtime,
+    retained_waker: Option<Waker>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ArtyRetainedWakeCase {
+    fn new() -> Self {
+        let runtime = Runtime::builder()
+            .workers(WorkersPolicy::exactly(1))
+            .build()
+            .expect("benchmark runtime construction must succeed");
+        let (waker_tx, waker_rx) = sync_channel(1);
+        let handle = runtime.scheduler().spawn_anywhere(Unaware(waker_tx), retained_io_driver_task);
+        let retained_waker = waker_rx
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("benchmark task must reach its initial pending state");
+        Self {
+            _runtime: runtime,
+            retained_waker: Some(retained_waker),
+            handle: Some(handle),
+        }
+    }
+
+    fn wake_and_join(&mut self) {
+        self.retained_waker
+            .take()
+            .expect("benchmark task retained its polling waker")
+            .wake();
+        let handle = self.handle.take().expect("benchmark case runs exactly once");
+        futures::executor::block_on(handle).expect("benchmark task completes after its retained wake");
+    }
+}
+
+#[derive(Debug)]
+struct RetainedWakeFuture {
+    poll_count: u8,
+    retained_waker: Option<Waker>,
+    first_waker: Option<SyncSender<Waker>>,
+}
+
+impl Future for RetainedWakeFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.poll_count = this.poll_count.saturating_add(1);
+        match this.poll_count {
+            1 => {
+                let retained_waker = cx.waker().clone();
+                this.first_waker
+                    .take()
+                    .expect("benchmark future sends its first waker once")
+                    .send(retained_waker.clone())
+                    .expect("benchmark setup receives the retained waker");
+                this.retained_waker = Some(retained_waker);
+                Poll::Pending
+            }
+            2 => {
+                this.retained_waker
+                    .as_ref()
+                    .expect("benchmark future retained its first polling waker")
+                    .wake_by_ref();
+                Poll::Pending
+            }
+            _ => Poll::Ready(()),
+        }
+    }
+}
+
+fn retained_io_driver_task(_: Builtins, Unaware(first_waker): Unaware<SyncSender<Waker>>) -> RetainedWakeFuture {
+    RetainedWakeFuture {
+        poll_count: 0,
+        retained_waker: None,
+        first_waker: Some(first_waker),
+    }
+}
+
 fn configured_criterion() -> Criterion {
     Criterion::default()
         .sample_size(50)
@@ -225,6 +309,16 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         });
     }
     group.finish();
+
+    let mut retained_waker = criterion.benchmark_group(ARTY_RETAINED_WAKE.group_name());
+    retained_waker.bench_function(BenchmarkId::new(ARTY_RETAINED_WAKE.benchmark_name(), "io_driver"), |bencher| {
+        bencher.iter_batched_ref(
+            ArtyRetainedWakeCase::new,
+            ArtyRetainedWakeCase::wake_and_join,
+            BatchSize::PerIteration,
+        );
+    });
+    retained_waker.finish();
 }
 
 #[benchmark(ARTY, "arty_contention/relocated_cache", "Arty")]
@@ -241,6 +335,12 @@ fn tokio_workload(case: &TokioCase, concurrency: u64) -> Duration {
     case.run(usize::try_from(concurrency).expect("benchmark concurrency fits in usize"))
 }
 
+#[benchmark(ARTY_RETAINED_WAKE, "arty_contention/retained_waker", "Arty")]
+#[bench::io_driver(&mut ArtyRetainedWakeCase::new())]
+fn arty_retained_wake(case: &mut ArtyRetainedWakeCase) {
+    case.wake_and_join();
+}
+
 #[cfg(target_os = "linux")]
 metabench::main!(
     criterion = {
@@ -255,7 +355,7 @@ metabench::main!(
                 .format([CallgrindMetrics::Default, CallgrindMetrics::BranchSim]),
         );
     },
-    benchmarks = [ARTY, TOKIO],
+    benchmarks = [ARTY, TOKIO, ARTY_RETAINED_WAKE],
 );
 
 #[cfg(not(target_os = "linux"))]
@@ -265,5 +365,5 @@ metabench::main!(
         benchmarks = criterion_benchmarks,
         unit = "ns",
     },
-    benchmarks = [ARTY, TOKIO],
+    benchmarks = [ARTY, TOKIO, ARTY_RETAINED_WAKE],
 );

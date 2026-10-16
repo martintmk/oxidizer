@@ -42,6 +42,26 @@ fn spawn_remote_complete_once(executor: &Executor, tasks: &TaskSet, result_pool:
     Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop()))
 }
 
+fn spawn_cloned_waker_complete_once(executor: &Executor, tasks: &TaskSet) -> Poll<Result<(), JoinError>> {
+    let mut first_poll = true;
+    let mut handle = pin!(tasks.add(
+        std::future::poll_fn(move |cx| {
+            if first_poll {
+                first_poll = false;
+                let retained_waker = cx.waker().clone();
+                retained_waker.wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }),
+        TaskOptions::default(),
+    ));
+    let _ = executor.execute_cycle();
+    let _ = executor.execute_cycle();
+    handle.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
 fn allocation_totals(session: &Session, operation_name: &str) -> (u64, u64) {
     session
         .to_report()
@@ -118,6 +138,40 @@ fn remote_spawn_reuses_cross_thread_result_channel_storage() {
     );
     #[cfg(not(debug_assertions))]
     assert_eq!(bytes, 0, "warmed remote result channels must reuse pooled storage");
+    #[cfg(debug_assertions)]
+    assert_ne!(bytes, 0, "debug bookkeeping must be visible to the allocation tracker");
+
+    executor.begin_shutdown();
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+}
+
+#[test]
+fn cloned_waker_state_reuses_pooled_storage() {
+    let executor = Executor::builder().build();
+    let tasks = executor.tasks();
+
+    for _ in 0..WARM_UP_OPERATIONS {
+        assert_eq!(spawn_cloned_waker_complete_once(&executor, &tasks), Poll::Ready(Ok(())));
+    }
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+
+    let session = Session::new().no_stdout().no_file();
+    let operation = session.operation("spawn_cloned_waker_complete_one");
+    {
+        let _span = operation.measure_thread().iterations(MEASURED_OPERATIONS as u64);
+        for _ in 0..MEASURED_OPERATIONS {
+            assert_eq!(spawn_cloned_waker_complete_once(&executor, &tasks), Poll::Ready(Ok(())));
+        }
+    }
+
+    let (allocations, bytes) = allocation_totals(&session, "spawn_cloned_waker_complete_one");
+    assert_eq!(
+        allocations,
+        EXPECTED_ALLOCATIONS_PER_OPERATION * MEASURED_OPERATIONS as u64,
+        "warmed cloned-waker tasks must reuse detached wake-state storage"
+    );
+    #[cfg(not(debug_assertions))]
+    assert_eq!(bytes, 0, "warmed detached waker states must return to their plurality pool");
     #[cfg(debug_assertions)]
     assert_ne!(bytes, 0, "debug bookkeeping must be visible to the allocation tracker");
 

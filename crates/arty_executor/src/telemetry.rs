@@ -33,6 +33,10 @@ pub(crate) fn report_panicked(sink: &Sink, polls: u64) {
     emit!(sink, TaskPanicked { polls });
 }
 
+pub(crate) fn report_waker_detached(sink: &Sink) {
+    emit!(sink, WakerDetached);
+}
+
 #[event("arty.rt.task.spawned")]
 #[counter(name = "arty.rt.task.spawned")]
 struct TaskCreated {
@@ -57,6 +61,14 @@ struct TaskPanicked {
     polls: u64,
 }
 
+/// Counts tasks that create independently owned wake state.
+///
+/// This records the first owned clone of a task's borrowed polling waker. It does not imply that
+/// the owned waker crossed a thread or outlived the poll.
+#[event("arty.rt.task.waker.detached")]
+#[counter(name = "arty.rt.task.waker.detached")]
+struct WakerDetached;
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -70,6 +82,7 @@ mod tests {
 
         report_created(&sink, TaskPlacement::SameThread);
         report_succeeded(&sink, 3);
+        report_waker_detached(&sink);
 
         let events = processor.events();
         assert_eq!(events[0].name(), "arty.rt.task.spawned");
@@ -78,5 +91,7 @@ mod tests {
         assert_eq!(events[1].field_metrics()[0].field_key(), "polls");
         assert_eq!(events[1].field_metrics()[0].metric().unit(), "{poll}");
         assert!((events[1].field_metrics()[0].value() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(events[2].name(), "arty.rt.task.waker.detached");
+        assert!(events[2].dimensions().is_empty());
     }
 }

@@ -1,13 +1,55 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 
 use plurality::{Box as PoolBox, coerce};
 
 use crate::TypeErasedTask;
+
+/// Executor-local task identity.
+///
+/// Values are never reused, so notifications remain harmless after their task storage is
+/// released or its plurality slot is reused.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct TaskId {
+    index: u32,
+    generation: u32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TaskIdSource {
+    next_index: u32,
+    generation: u32,
+}
+
+impl TaskIdSource {
+    pub(crate) fn take_next(&mut self) -> TaskId {
+        let id = TaskId {
+            index: self.next_index,
+            generation: self.generation,
+        };
+        let (next_index, wrapped) = self.next_index.overflowing_add(1);
+        self.next_index = next_index;
+        if wrapped {
+            self.generation = self
+                .generation
+                .checked_add(1)
+                .expect("task ID generations must not wrap because stale IDs must never identify a new task");
+        }
+        id
+    }
+}
+
+impl TaskId {
+    #[cfg(test)]
+    pub(crate) const fn fake() -> Self {
+        Self { index: 0, generation: 0 }
+    }
+}
 
 /// Allows a task to be referenced by the executor and its resources released, without knowing
 /// the exact type of the task, only that it implements [`TypeErasedTask`].
@@ -19,32 +61,49 @@ pub(crate) struct TaskRef {
     inner: NonNull<dyn TypeErasedTask>,
 }
 
+/// A live executor task paired with its never-reused identity.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct RegisteredTask {
+    id: TaskId,
+    task_ref: TaskRef,
+}
+
+impl RegisteredTask {
+    pub(crate) fn new(id: TaskId, task_ref: TaskRef) -> Self {
+        Self { id, task_ref }
+    }
+
+    pub(crate) fn task_ref(self) -> TaskRef {
+        self.task_ref
+    }
+}
+
+impl Borrow<TaskId> for RegisteredTask {
+    fn borrow(&self) -> &TaskId {
+        &self.id
+    }
+}
+
+impl PartialEq for RegisteredTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for RegisteredTask {}
+
+impl Hash for RegisteredTask {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
 impl TaskRef {
     pub(crate) fn new<T: TypeErasedTask + 'static>(inner: PoolBox<T>) -> Self {
         let inner: PoolBox<dyn TypeErasedTask> = PoolBox::unsize(inner, coerce!(dyn TypeErasedTask));
         Self {
             inner: PoolBox::into_raw(inner),
         }
-    }
-
-    /// For test purposes, we can create a fake instance.
-    ///
-    /// # Safety
-    ///
-    /// The "value" of the fake task reference is undefined. It is only for use as a
-    /// placeholder and actually dereferencing it or accessing its contents is invalid.
-    #[cfg(test)]
-    pub(crate) unsafe fn fake() -> Self {
-        use crate::MockTypeErasedTask;
-
-        let inner = NonNull::<MockTypeErasedTask>::dangling().as_ptr();
-        let inner: *mut dyn TypeErasedTask = inner;
-
-        // SAFETY: The typed dangling pointer is non-null, and the coercion above supplies valid
-        // trait-object metadata. The resulting pointer remains a placeholder and is never
-        // dereferenced or released.
-        let inner = unsafe { NonNull::new_unchecked(inner) };
-        Self { inner }
     }
 
     /// # Safety
@@ -87,65 +146,45 @@ impl TaskRef {
 // was created on.
 unsafe impl Send for TaskRef {}
 
-impl PartialEq for TaskRef {
-    #[cfg_attr(test, mutants::skip)] // Liable to cause test timeouts, as collection logic gets wonky.
-    fn eq(&self, other: &Self) -> bool {
-        ptr::addr_eq(self.inner.as_ptr(), other.inner.as_ptr())
-    }
-}
-
-impl Eq for TaskRef {}
-
-impl Hash for TaskRef {
-    #[cfg_attr(test, mutants::skip)] // Liable to cause test timeouts, as collection logic gets wonky.
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.as_ptr().cast::<()>().hash(state);
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::hash::DefaultHasher;
-
-    use plurality::MultiPool;
-
     use super::*;
-    use crate::MockTypeErasedTask;
 
     #[test]
-    fn same_task_refs_eq() {
-        let pool = MultiPool::new();
-        let task_ref1 = TaskRef::new(pool.alloc_box(MockTypeErasedTask::new()));
-        let task_ref2 = task_ref1;
+    fn task_ids_are_monotonic() {
+        let mut source = TaskIdSource::default();
+        let first = source.take_next();
+        let second = source.take_next();
 
-        assert_eq!(task_ref1, task_ref2);
-
-        // Their hashes must also be equal.
-        let mut hasher1 = DefaultHasher::new();
-        task_ref1.hash(&mut hasher1);
-        let hash1 = hasher1.finish();
-
-        let mut hasher2 = DefaultHasher::new();
-        task_ref2.hash(&mut hasher2);
-        let hash2 = hasher2.finish();
-
-        assert_eq!(hash1, hash2);
-
-        // SAFETY: This is the only release of the pooled task and no references remain.
-        unsafe { task_ref1.release() };
+        assert_ne!(first, second);
+        assert_eq!(source.next_index, 2);
+        assert_eq!(source.generation, 0);
     }
 
     #[test]
-    fn different_task_refs_not_eq() {
-        let pool = MultiPool::new();
-        let task_ref1 = TaskRef::new(pool.alloc_box(MockTypeErasedTask::new()));
-        let task_ref2 = TaskRef::new(pool.alloc_box(MockTypeErasedTask::new()));
+    fn task_id_index_wrap_advances_generation() {
+        let mut source = TaskIdSource {
+            next_index: u32::MAX,
+            generation: 7,
+        };
 
-        assert_ne!(task_ref1, task_ref2);
+        assert_eq!(
+            source.take_next(),
+            TaskId {
+                index: u32::MAX,
+                generation: 7
+            }
+        );
+        assert_eq!(source.take_next(), TaskId { index: 0, generation: 8 });
+    }
 
-        // SAFETY: The first pooled task is released exactly once and no references remain.
-        unsafe { task_ref1.release() };
-        // SAFETY: The second pooled task is released exactly once and no references remain.
-        unsafe { task_ref2.release() };
+    #[test]
+    fn task_id_generation_wrap_is_rejected() {
+        let mut source = TaskIdSource {
+            next_index: u32::MAX,
+            generation: u32::MAX,
+        };
+
+        testing_aids::assert_panic!(source.take_next());
     }
 }
