@@ -20,8 +20,7 @@ use crate::runtime::worker::protocol::AsyncWorkerCommand;
 use crate::runtime::worker::signal::WorkerSignal;
 use crate::task::{Builtins, Scheduler};
 
-/// System-clock timer registration does not notify the worker, so keep polling the timer driver at
-/// the timer resolution even while the executor is idle.
+/// Controlled clocks advance on time reads, so retain their timer-resolution polling while idle.
 const TIMER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// All supported progress paths notify the worker. This periodic executor cycle remains only as a
@@ -29,6 +28,25 @@ const TIMER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const EXECUTOR_FAILSAFE_INTERVAL: Duration = Duration::from_secs(1);
 
 const COMMANDS_PER_CYCLE: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+struct TimerSchedule {
+    observed_at: Instant,
+    next_deadline: Option<Instant>,
+    registrations_wake_driver: bool,
+}
+
+impl TimerSchedule {
+    fn wait_timeout(self, maximum: Duration) -> Duration {
+        if !self.registrations_wake_driver {
+            return maximum.min(TIMER_POLL_INTERVAL);
+        }
+
+        self.next_deadline.map_or(maximum, |deadline| {
+            deadline.saturating_duration_since(self.observed_at).min(maximum)
+        })
+    }
+}
 
 /// The async worker has exclusive use of a runtime thread, one per processor selected by
 /// the configured processor-count policy. The worker executes async tasks that are
@@ -105,7 +123,8 @@ impl AsyncWorker {
         clock: InactiveClock,
         signal: Arc<WorkerSignal>,
     ) -> Self {
-        let (clock, clock_driver) = clock.activate();
+        let (clock, clock_driver) =
+            clock.activate_with_timer_registration_waker(WorkerSignal::waker(&signal));
         let shutdown_signal = dispatcher.shutdown_signal();
 
         let executor = Executor::builder()
@@ -168,23 +187,30 @@ impl AsyncWorker {
         }
 
         // Advances the timers registered with the clock.
-        self.advance_running_timers();
+        let timer_schedule = self.advance_running_timers();
 
         if matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted {
-            self.suspend();
+            self.suspend(timer_schedule);
         }
 
         ControlFlow::Continue(())
     }
 
-    fn suspend(&mut self) {
-        self.suspend_with(WorkerSignal::wait);
+    fn suspend(&mut self, timer_schedule: TimerSchedule) {
+        self.suspend_with(timer_schedule, WorkerSignal::wait);
     }
 
-    fn suspend_with(&mut self, mut wait: impl FnMut(&WorkerSignal, Duration) -> bool) {
+    fn suspend_with(
+        &mut self,
+        mut timer_schedule: TimerSchedule,
+        mut wait: impl FnMut(&WorkerSignal, Duration) -> bool,
+    ) {
         let mut remaining = EXECUTOR_FAILSAFE_INTERVAL;
         while !remaining.is_zero() {
-            let timeout = remaining.min(TIMER_POLL_INTERVAL);
+            let timeout = timer_schedule.wait_timeout(remaining);
+            if timeout.is_zero() {
+                return;
+            }
             // A notification arriving before this wait is retained by WorkerSignal.
             if wait(&self.signal, timeout) {
                 return;
@@ -192,19 +218,28 @@ impl AsyncWorker {
             if self.shutdown_signal.load(Ordering::Acquire) {
                 return;
             }
-            self.advance_running_timers();
+            timer_schedule = self.advance_running_timers();
             remaining = remaining.saturating_sub(timeout);
+
+            if timer_schedule.registrations_wake_driver {
+                return;
+            }
         }
     }
 
-    fn advance_running_timers(&mut self) {
+    fn advance_running_timers(&mut self) -> TimerSchedule {
         let now = self
             .builtins
             .as_ref()
             .expect("running workers retain their built-in services")
             .clock()
             .instant();
-        _ = self.clock_driver.advance_timers(now);
+        let next_deadline = self.clock_driver.advance_timers(now).ok().flatten();
+        TimerSchedule {
+            observed_at: now,
+            next_deadline,
+            registrations_wake_driver: self.clock_driver.timer_registrations_wake_driver(),
+        }
     }
 
     #[cfg_attr(test, mutants::skip)] // Mutation testing requires a fine level of control over what is in the channel, which is too bothersome just for mutation testing.
@@ -276,10 +311,8 @@ impl Drop for AsyncWorker {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))] // Test scaffolding is not runtime behavior.
 mod tests {
-    #[cfg(not(miri))]
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
-    #[cfg(not(miri))]
     use std::task::{Wake, Waker};
     use std::thread;
 
@@ -651,8 +684,13 @@ mod tests {
         let observed_clock = control.to_clock();
         let start = observed_clock.instant();
         let mut waits = Vec::new();
+        let timer_schedule = TimerSchedule {
+            observed_at: start,
+            next_deadline: None,
+            registrations_wake_driver: false,
+        };
 
-        worker.suspend_with(|_, timeout| {
+        worker.suspend_with(timer_schedule, |_, timeout| {
             waits.push(timeout);
             false
         });
@@ -679,13 +717,130 @@ mod tests {
         );
         let observed_clock = control.to_clock();
         let start = observed_clock.instant();
+        let timer_schedule = TimerSchedule {
+            observed_at: start,
+            next_deadline: None,
+            registrations_wake_driver: false,
+        };
 
-        worker.suspend_with(|_, timeout| {
+        worker.suspend_with(timer_schedule, |_, timeout| {
             assert_eq!(timeout, TIMER_POLL_INTERVAL);
             true
         });
 
         assert_eq!(observed_clock.instant(), start);
+    }
+
+    // These suspension tests inject wait outcomes because the public runtime API cannot
+    // deterministically stop a worker between deadline inspection and its native wait.
+    #[test]
+    fn system_clock_suspension_waits_for_the_known_deadline() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let signal = Arc::new(WorkerSignal::default());
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            InactiveClock::default(),
+            signal,
+        );
+        let observed_at = Instant::now();
+        let timer_schedule = TimerSchedule {
+            observed_at,
+            next_deadline: Some(observed_at + Duration::from_millis(100)),
+            registrations_wake_driver: true,
+        };
+        let mut waits = Vec::new();
+
+        worker.suspend_with(timer_schedule, |_, timeout| {
+            waits.push(timeout);
+            true
+        });
+
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0], Duration::from_millis(100));
+    }
+
+    #[test]
+    fn earlier_timer_registration_while_preparing_to_wait_is_retained() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let signal = Arc::new(WorkerSignal::default());
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            InactiveClock::default(),
+            Arc::clone(&signal),
+        );
+        let clock = worker.builtins.as_ref().unwrap().clock().clone();
+        let mut later = clock.delay(Duration::from_secs(120));
+        assert!(Pin::new(&mut later).poll(&mut std::task::Context::from_waker(Waker::noop())).is_pending());
+        assert!(signal.wait(Duration::ZERO));
+        let later_schedule = worker.advance_running_timers();
+        let mut earlier = clock.delay(Duration::from_secs(60));
+
+        worker.suspend_with(later_schedule, |signal, _| {
+            assert!(Pin::new(&mut earlier)
+                .poll(&mut std::task::Context::from_waker(Waker::noop()))
+                .is_pending());
+            signal.wait(Duration::ZERO)
+        });
+
+        let earlier_schedule = worker.advance_running_timers();
+        assert!(earlier_schedule.next_deadline < later_schedule.next_deadline);
+    }
+
+    #[test]
+    fn cancelling_the_earliest_timer_cannot_extend_the_stale_wait() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let signal = Arc::new(WorkerSignal::default());
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            InactiveClock::default(),
+            signal,
+        );
+        let clock = worker.builtins.as_ref().unwrap().clock().clone();
+        let mut earlier = clock.delay(Duration::from_secs(60));
+        let mut later = clock.delay(Duration::from_secs(120));
+        assert!(Pin::new(&mut earlier)
+            .poll(&mut std::task::Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(Pin::new(&mut later).poll(&mut std::task::Context::from_waker(Waker::noop())).is_pending());
+        assert!(worker.signal.wait(Duration::ZERO));
+        let stale_schedule = worker.advance_running_timers();
+
+        drop(earlier);
+        let revised_schedule = worker.advance_running_timers();
+
+        assert!(stale_schedule.wait_timeout(EXECUTOR_FAILSAFE_INTERVAL)
+            <= revised_schedule.wait_timeout(EXECUTOR_FAILSAFE_INTERVAL));
+    }
+
+    #[test]
+    fn shutdown_observed_after_a_timed_wait_ends_suspension() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let signal = Arc::new(WorkerSignal::default());
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            InactiveClock::default(),
+            signal,
+        );
+        let timer_schedule = worker.advance_running_timers();
+        let shutdown = Arc::clone(&worker.shutdown_signal);
+        let mut waits = 0;
+
+        worker.suspend_with(timer_schedule, |_, timeout| {
+            waits += 1;
+            assert_eq!(timeout, EXECUTOR_FAILSAFE_INTERVAL);
+            shutdown.store(true, Ordering::Release);
+            false
+        });
+
+        assert_eq!(waits, 1);
     }
 
     #[cfg(not(miri))]

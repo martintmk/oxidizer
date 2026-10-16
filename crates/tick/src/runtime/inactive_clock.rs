@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::marker::PhantomData;
+use std::task::Waker;
 
 use thread_aware::{Thread, ThreadAware};
 
@@ -134,6 +135,19 @@ impl<S> InactiveClock<S> {
         let driver = ClockDriver::new(state);
 
         (clock, driver)
+    }
+
+    /// Activates the clock and wakes the driver when a system-clock timer registration becomes
+    /// the earliest pending deadline.
+    ///
+    /// Runtime integrations can use this edge notification to sleep until the currently known
+    /// deadline without polling for timers registered after the driver inspected the timer set.
+    /// Controlled clocks ignore the driver waker because their timers advance through their
+    /// controller.
+    #[must_use]
+    pub fn activate_with_timer_registration_waker(self, waker: Waker) -> (Clock, ClockDriver) {
+        self.state.set_timer_registration_waker(waker);
+        self.activate()
     }
 }
 

@@ -514,7 +514,7 @@ impl Clock {
         match self.clock_state() {
             #[cfg(any(feature = "test-util", test))]
             ClockState::ClockControl(control) => control.register_timer(when, waker),
-            ClockState::System(timers) => timers.with_timers(|t| t.register(when, waker)),
+            ClockState::System(timers) => timers.register(when, waker),
         }
     }
 

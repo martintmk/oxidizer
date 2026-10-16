@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::task::Waker;
 use std::time::Instant;
 
 use performables::arc::{Arc, PerThread};
@@ -58,6 +59,22 @@ impl ClockState {
         }
     }
 
+    pub(crate) fn set_timer_registration_waker(&self, waker: Waker) {
+        match self {
+            Self::System(timers) => timers.set_registration_waker(waker),
+            #[cfg(any(feature = "test-util", test))]
+            Self::ClockControl(_) => {}
+        }
+    }
+
+    pub(crate) fn timer_registrations_wake_driver(&self) -> bool {
+        match self {
+            Self::System(timers) => timers.has_registration_waker(),
+            #[cfg(any(feature = "test-util", test))]
+            Self::ClockControl(_) => false,
+        }
+    }
+
     #[cfg_attr(test, mutants::skip)] // causes test timeout
     pub(crate) fn is_unique(&self) -> bool {
         match self {
@@ -81,14 +98,20 @@ pub(crate) enum SynchronizedTimers {
     /// the same timers regardless of thread coordinate. Used by clocks driven by a single global
     /// driver task (e.g. the Tokio-driven clock created by [`Clock::new_tokio`][crate::Clock::new_tokio]).
     #[cfg(any(feature = "rt-shared", test))]
-    Shared(std::sync::Arc<Mutex<Timers>>),
+    Shared(std::sync::Arc<Mutex<SystemTimers>>),
 
     /// Per-thread isolated timer storage. Within one runtime owner,
     /// [`ThreadAware::relocate`] creates a fresh timer set on the destination
     /// thread, enabling thread-isolated runtimes to operate on independent
     /// timers with no cross-thread lock contention. A cross-owner move retains
     /// the current set instead.
-    Isolated(Arc<Mutex<Timers>, PerThread>),
+    Isolated(Arc<Mutex<SystemTimers>, PerThread>),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SystemTimers {
+    timers: Timers,
+    registration_waker: Option<Waker>,
 }
 
 impl ThreadAware for SynchronizedTimers {
@@ -103,24 +126,59 @@ impl ThreadAware for SynchronizedTimers {
 
 impl SynchronizedTimers {
     pub(crate) fn new_isolated() -> Self {
-        Self::Isolated(Arc::new_with(|| Mutex::new(Timers::default())))
+        Self::Isolated(Arc::new_with(|| Mutex::new(SystemTimers::default())))
     }
 
     #[cfg(any(feature = "rt-shared", test))]
     pub(crate) fn new_shared() -> Self {
-        Self::Shared(std::sync::Arc::new(Mutex::new(Timers::default())))
+        Self::Shared(std::sync::Arc::new(Mutex::new(SystemTimers::default())))
     }
 
     pub(super) fn with_timers<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Timers) -> R,
     {
-        let mut timers = match self {
+        self.with_state(|state| f(&mut state.timers))
+    }
+
+    fn with_state<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut SystemTimers) -> R,
+    {
+        let mut state = match self {
             #[cfg(any(feature = "rt-shared", test))]
             Self::Shared(timers) => timers.lock(),
             Self::Isolated(timers) => timers.lock(),
         };
-        f(&mut timers)
+        f(&mut state)
+    }
+
+    pub(crate) fn register(&self, when: Instant, waker: Waker) -> crate::timers::TimerKey {
+        let (key, registration_waker) = self.with_state(|state| {
+            let previous = state.timers.next_timer();
+            let key = state.timers.register(when, waker);
+            let registration_waker = previous
+                .is_none_or(|previous| when < previous)
+                .then(|| state.registration_waker.clone())
+                .flatten();
+            (key, registration_waker)
+        });
+
+        // Invoke notification hooks outside the timer lock. Custom waker panics are unsupported,
+        // but must not poison timer storage or make a reentrant timer operation deadlock.
+        if let Some(waker) = registration_waker {
+            waker.wake();
+        }
+
+        key
+    }
+
+    fn set_registration_waker(&self, waker: Waker) {
+        self.with_state(|state| state.registration_waker = Some(waker));
+    }
+
+    fn has_registration_waker(&self) -> bool {
+        self.with_state(|state| state.registration_waker.is_some())
     }
 
     #[cfg_attr(test, mutants::skip)] // Causes test timeout.
@@ -141,7 +199,21 @@ impl SynchronizedTimers {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+    use std::time::Duration;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: StdArc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn clock_state_send_and_sync() {
@@ -158,5 +230,20 @@ mod tests {
 
         drop(clone);
         assert!(timers.is_unique());
+    }
+
+    #[test]
+    fn registration_wakes_only_when_the_earliest_deadline_moves_earlier() {
+        let timers = SynchronizedTimers::new_isolated();
+        let wakes = StdArc::new(CountWakes(AtomicUsize::new(0)));
+        timers.set_registration_waker(Waker::from(StdArc::clone(&wakes)));
+        let anchor = Instant::now();
+
+        timers.register(anchor + Duration::from_secs(2), Waker::noop().clone());
+        timers.register(anchor + Duration::from_secs(3), Waker::noop().clone());
+        timers.register(anchor + Duration::from_secs(2), Waker::noop().clone());
+        timers.register(anchor + Duration::from_secs(1), Waker::noop().clone());
+
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
     }
 }
