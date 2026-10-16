@@ -199,6 +199,7 @@ impl SynchronizedTimers {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Wake;
@@ -212,6 +213,35 @@ mod tests {
     impl Wake for CountWakes {
         fn wake(self: StdArc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReentrantRegistration {
+        timers: SynchronizedTimers,
+        when: Instant,
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for ReentrantRegistration {
+        fn wake(self: StdArc<Self>) {
+            let lock_available = match &self.timers {
+                SynchronizedTimers::Shared(timers) => timers.try_lock().is_some(),
+                SynchronizedTimers::Isolated(timers) => timers.try_lock().is_some(),
+            };
+            assert!(lock_available, "registration wakers must run outside the timer lock");
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+            self.timers.register(self.when, Waker::noop().clone());
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicWake;
+
+    impl Wake for PanicWake {
+        #[expect(clippy::panic, reason = "this test verifies timer-lock resilience to a panicking registration waker")]
+        fn wake(self: StdArc<Self>) {
+            panic!("registration wake panic");
         }
     }
 
@@ -245,5 +275,37 @@ mod tests {
         timers.register(anchor + Duration::from_secs(1), Waker::noop().clone());
 
         assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn registration_waker_can_reenter_timer_registration() {
+        let timers = SynchronizedTimers::new_isolated();
+        let anchor = Instant::now();
+        let wake = StdArc::new(ReentrantRegistration {
+            timers: timers.clone(),
+            when: anchor + Duration::from_secs(3),
+            wakes: AtomicUsize::new(0),
+        });
+        timers.set_registration_waker(Waker::from(StdArc::clone(&wake)));
+
+        timers.register(anchor + Duration::from_secs(2), Waker::noop().clone());
+
+        assert_eq!(wake.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(timers.with_timers(|timers| timers.len()), 2);
+    }
+
+    #[test]
+    fn registration_waker_panic_does_not_poison_timer_state() {
+        let timers = SynchronizedTimers::new_isolated();
+        timers.set_registration_waker(Waker::from(StdArc::new(PanicWake)));
+        let anchor = Instant::now();
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            timers.register(anchor + Duration::from_secs(2), Waker::noop().clone());
+        }));
+        assert!(outcome.is_err());
+
+        timers.register(anchor + Duration::from_secs(3), Waker::noop().clone());
+        assert_eq!(timers.with_timers(|timers| timers.len()), 2);
     }
 }
