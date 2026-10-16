@@ -40,11 +40,11 @@ fn wait_until_deadline<S>(
 }
 
 impl WorkerSignal {
-    pub(crate) fn wait(&self, timeout: Duration) {
-        self.wait_before_park(timeout, || {});
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        self.wait_before_park(timeout, || {})
     }
 
-    fn wait_before_park(&self, timeout: Duration, mut before_park: impl FnMut()) {
+    fn wait_before_park(&self, timeout: Duration, mut before_park: impl FnMut()) -> bool {
         let start = std::time::Instant::now();
         let mut notified = Some(self.notified.lock());
         wait_until_deadline(
@@ -69,7 +69,9 @@ impl WorkerSignal {
             },
         );
         let mut notified = notified.expect("the final timed wait always replaced its notification guard");
+        let was_notified = *notified;
         *notified = false;
+        was_notified
     }
 
     pub(crate) fn waker(signal: &Arc<Self>) -> Waker {
@@ -130,11 +132,11 @@ mod tests {
         let waker = WorkerSignal::waker(&signal);
         waker.wake_by_ref();
         assert!(*signal.notified.lock());
-        signal.wait(Duration::ZERO);
+        assert!(signal.wait(Duration::ZERO));
         assert!(!*signal.notified.lock());
         waker.wake();
         assert!(*signal.notified.lock());
-        signal.wait(Duration::ZERO);
+        assert!(signal.wait(Duration::ZERO));
         assert!(!*signal.notified.lock());
     }
 
@@ -144,7 +146,7 @@ mod tests {
 
         assert!(signal.mark_notified());
         assert!(!signal.mark_notified());
-        signal.wait(Duration::ZERO);
+        assert!(signal.wait(Duration::ZERO));
         assert!(signal.mark_notified());
     }
 
@@ -213,7 +215,7 @@ mod tests {
         let signal = WorkerSignal::default();
         let timeout = Duration::from_millis(20);
         let start = std::time::Instant::now();
-        signal.wait(timeout);
+        assert!(!signal.wait(timeout));
         assert!(start.elapsed() >= timeout);
         assert!(!*signal.notified.lock());
     }

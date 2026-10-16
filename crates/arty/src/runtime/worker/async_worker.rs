@@ -20,9 +20,13 @@ use crate::runtime::worker::protocol::AsyncWorkerCommand;
 use crate::runtime::worker::signal::WorkerSignal;
 use crate::task::{Builtins, Scheduler};
 
-/// If we have nothing to do, we wait for something to happen for this long before executing
-/// another executor cycle (just in case something has showed up that we did not notice).
-const SUSPEND_SLEEP_DURATION: Duration = Duration::from_millis(1);
+/// System-clock timer registration does not notify the worker, so keep polling the timer driver at
+/// the timer resolution even while the executor is idle.
+const TIMER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// All supported progress paths notify the worker. This periodic executor cycle remains only as a
+/// fail-safe for an unobserved wake.
+const EXECUTOR_FAILSAFE_INTERVAL: Duration = Duration::from_secs(1);
 
 const COMMANDS_PER_CYCLE: usize = 256;
 
@@ -164,15 +168,43 @@ impl AsyncWorker {
         }
 
         // Advances the timers registered with the clock.
-        _ = self.clock_driver.advance_timers(Instant::now());
+        self.advance_running_timers();
 
         if matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted {
-            // Retain the donor's timer cadence, including externally controlled clocks.
-            // A notification arriving before this wait is retained by WorkerSignal.
-            self.signal.wait(SUSPEND_SLEEP_DURATION);
+            self.suspend();
         }
 
         ControlFlow::Continue(())
+    }
+
+    fn suspend(&mut self) {
+        self.suspend_with(WorkerSignal::wait);
+    }
+
+    fn suspend_with(&mut self, mut wait: impl FnMut(&WorkerSignal, Duration) -> bool) {
+        let mut remaining = EXECUTOR_FAILSAFE_INTERVAL;
+        while !remaining.is_zero() {
+            let timeout = remaining.min(TIMER_POLL_INTERVAL);
+            // A notification arriving before this wait is retained by WorkerSignal.
+            if wait(&self.signal, timeout) {
+                return;
+            }
+            if self.shutdown_signal.load(Ordering::Acquire) {
+                return;
+            }
+            self.advance_running_timers();
+            remaining = remaining.saturating_sub(timeout);
+        }
+    }
+
+    fn advance_running_timers(&mut self) {
+        let now = self
+            .builtins
+            .as_ref()
+            .expect("running workers retain their built-in services")
+            .clock()
+            .instant();
+        _ = self.clock_driver.advance_timers(now);
     }
 
     #[cfg_attr(test, mutants::skip)] // Mutation testing requires a fine level of control over what is in the channel, which is too bothersome just for mutation testing.
@@ -600,6 +632,60 @@ mod tests {
 
         command_tx.send(AsyncWorkerCommand::Shutdown).unwrap();
         worker.run();
+    }
+
+    #[test]
+    fn idle_suspension_polls_controlled_time_without_rechecking_the_executor() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let control = ClockControl::new()
+            .auto_advance(Duration::from_millis(1))
+            .auto_advance_limit(EXECUTOR_FAILSAFE_INTERVAL.saturating_add(TIMER_POLL_INTERVAL));
+        let signal = Arc::new(WorkerSignal::default());
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            control.clone().into(),
+            signal,
+        );
+        let observed_clock = control.to_clock();
+        let start = observed_clock.instant();
+        let mut waits = Vec::new();
+
+        worker.suspend_with(|_, timeout| {
+            waits.push(timeout);
+            false
+        });
+
+        assert!(waits.iter().all(|timeout| *timeout == TIMER_POLL_INTERVAL));
+        assert_eq!(waits.into_iter().sum::<Duration>(), EXECUTOR_FAILSAFE_INTERVAL);
+        assert_eq!(
+            observed_clock.instant().saturating_duration_since(start),
+            EXECUTOR_FAILSAFE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn retained_notification_ends_suspension_before_timer_polling() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let control = ClockControl::new();
+        let signal = Arc::new(WorkerSignal::default());
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            control.clone().into(),
+            signal,
+        );
+        let observed_clock = control.to_clock();
+        let start = observed_clock.instant();
+
+        worker.suspend_with(|_, timeout| {
+            assert_eq!(timeout, TIMER_POLL_INTERVAL);
+            true
+        });
+
+        assert_eq!(observed_clock.instant(), start);
     }
 
     #[cfg(not(miri))]
