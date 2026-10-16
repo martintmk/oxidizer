@@ -17,10 +17,9 @@ use events_once::PooledLocalSender;
 use observed::Sink;
 
 use crate::remote::Sender as RemoteSender;
-use crate::telemetry;
 #[cfg(all(debug_assertions, test))]
 use crate::{DiagnosticWaker, DiagnosticWakerRegistry};
-use crate::{TaskCreatedReporter, TaskOptions, TaskPanicPayload, WakeSignal, discard_task_panic_payload};
+use crate::{TaskCreatedReporter, TaskOptions, TaskPanicPayload, WakeSignal, discard_task_panic_payload, telemetry};
 
 /// A task registered with the async task executor, in its fully typed form.
 ///

@@ -3,15 +3,98 @@
 
 //! Public executor contracts for retained and panicking task wakers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::poll_fn;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Poll, Wake, Waker};
 
 use arty_executor::{CycleOutcome, Executor, TaskOptions};
+
+#[test]
+fn borrowed_duplicate_wakes_schedule_one_follow_up_poll() {
+    let executor = Executor::builder().build();
+    let polls = Rc::new(Cell::new(0));
+    let mut task = executor.tasks().add(
+        poll_fn({
+            let polls = Rc::clone(&polls);
+            move |cx| {
+                polls.set(polls.get() + 1);
+                if polls.get() == 1 {
+                    for _ in 0..8 {
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }
+        }),
+        TaskOptions::default(),
+    );
+
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
+    assert_eq!(polls.get(), 1);
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(polls.get(), 2);
+    assert!(
+        std::pin::Pin::new(&mut task)
+            .poll(&mut std::task::Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+
+    executor.begin_shutdown();
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+}
+
+#[test]
+fn cross_thread_wake_during_poll_schedules_a_follow_up_poll() {
+    let executor = Executor::builder().build();
+    let polls = Rc::new(Cell::new(0));
+    let (waker_tx, waker_rx) = mpsc::channel();
+    let (woken_tx, woken_rx) = mpsc::channel();
+    let mut waker_tx = Some(waker_tx);
+    let mut task = executor.tasks().add(
+        poll_fn({
+            let polls = Rc::clone(&polls);
+            move |cx| {
+                polls.set(polls.get() + 1);
+                if let Some(waker_tx) = waker_tx.take() {
+                    waker_tx.send(cx.waker().clone()).unwrap();
+                    woken_rx.recv().unwrap();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }
+        }),
+        TaskOptions::default(),
+    );
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let waker: Waker = waker_rx.recv().unwrap();
+            waker.wake_by_ref();
+            drop(waker);
+            woken_tx.send(()).unwrap();
+        });
+
+        assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
+    });
+    assert_eq!(polls.get(), 1);
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(polls.get(), 2);
+    assert!(
+        std::pin::Pin::new(&mut task)
+            .poll(&mut std::task::Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+
+    executor.begin_shutdown();
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+}
 
 #[test]
 fn retained_waker_is_noop_after_shutdown() {

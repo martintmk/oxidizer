@@ -247,14 +247,14 @@ impl ExecutorCore {
             CYCLE_GAP_MILLIS.with(|x| x.observe_millis(cycle_gap));
         }
 
-        {
+        let probed_embedded_wake_signals = {
             let mut state_reentrant = self.reentrancy_safe.borrow_mut();
 
             self.accept_new_tasks(&mut state_exclusive, &mut state_reentrant);
-            self.activate_awakened_tasks(&mut state_exclusive);
-        }
+            self.activate_awakened_tasks(&mut state_exclusive)
+        };
 
-        self.poll_active_tasks(&mut state_exclusive);
+        self.poll_active_tasks(&mut state_exclusive, probed_embedded_wake_signals);
 
         if self.reentrancy_safe.borrow().shutting_down {
             let aborted_count = {
@@ -315,7 +315,7 @@ impl ExecutorCore {
         mem::swap(&mut state_exclusive.active, &mut state_reentrant.new_tasks);
     }
 
-    fn activate_awakened_tasks(&self, state_exclusive: &mut ExclusiveState) {
+    fn activate_awakened_tasks(&self, state_exclusive: &mut ExclusiveState) -> bool {
         // There are two ways to activate tasks:
         // 1. by receiving an explicit wake signal via the `awakened` set (preferred, fast).
         // 2. by probing the embedded wake signals (slower).
@@ -359,7 +359,7 @@ impl ExecutorCore {
         // We use Acquire ordering as we are acquiring the synchronization block for the
         // wake-up flags inside the task wake signals.
         if !self.wake.probe_embedded_wake_signals.swap(false, atomic::Ordering::Acquire) {
-            return;
+            return false;
         }
 
         // This means we need to inspect every task in `inactive` to see if it has
@@ -379,9 +379,10 @@ impl ExecutorCore {
                 true
             }
         });
+        true
     }
 
-    fn poll_active_tasks(&self, state_exclusive: &mut ExclusiveState) {
+    fn poll_active_tasks(&self, state_exclusive: &mut ExclusiveState, probed_embedded_wake_signals: bool) {
         let completed_before = state_exclusive.completed.len();
         let inactive_before = state_exclusive.inactive.len();
 
@@ -407,10 +408,10 @@ impl ExecutorCore {
                     // The task is still pending, so we move it to the inactive set.
                     // It will return to the active set once something jiggles its waker.
                     state_exclusive.inactive.insert(registered);
-                    // A wake may have fallen back to the embedded signal while this task was
-                    // already active and therefore absent from the probe scan. Re-arm the probe
-                    // after reclassification so the next cycle cannot suspend past that wake.
-                    if task.is_awakened() {
+                    // A probe earlier in this cycle may have cleared the global flag while this
+                    // task was active and absent from the scan. Only those cycles need to inspect
+                    // the task flags and re-arm the probe after reclassification.
+                    if probed_embedded_wake_signals && task.is_awakened() {
                         self.wake.probe_embedded_wake_signals.store(true, atomic::Ordering::Release);
                     }
                 }
@@ -713,19 +714,21 @@ mod tests {
         waker.wake_by_ref();
 
         let mut state = core.exclusive.borrow_mut();
-        core.activate_awakened_tasks(&mut state);
+        assert!(!core.activate_awakened_tasks(&mut state));
         {
             let _queue_guard = core.wake.awakened.lock().unwrap();
             waker.wake_by_ref();
         }
-        core.activate_awakened_tasks(&mut state);
+        let probed_embedded_wake_signals = core.activate_awakened_tasks(&mut state);
+        assert!(probed_embedded_wake_signals);
         assert!(!core.wake.probe_embedded_wake_signals.load(atomic::Ordering::Relaxed));
 
-        core.poll_active_tasks(&mut state);
+        core.poll_active_tasks(&mut state, probed_embedded_wake_signals);
 
         assert!(core.wake.probe_embedded_wake_signals.load(atomic::Ordering::Relaxed));
-        core.activate_awakened_tasks(&mut state);
-        core.poll_active_tasks(&mut state);
+        let probed_embedded_wake_signals = core.activate_awakened_tasks(&mut state);
+        assert!(probed_embedded_wake_signals);
+        core.poll_active_tasks(&mut state, probed_embedded_wake_signals);
         assert_eq!(polls.get(), 3);
         drop(state);
         drop(handle);
