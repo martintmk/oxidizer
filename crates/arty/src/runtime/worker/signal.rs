@@ -41,6 +41,10 @@ fn wait_until_deadline<S>(
 
 impl WorkerSignal {
     pub(crate) fn wait(&self, timeout: Duration) {
+        self.wait_before_park(timeout, || {});
+    }
+
+    fn wait_before_park(&self, timeout: Duration, mut before_park: impl FnMut()) {
         let start = std::time::Instant::now();
         let mut notified = Some(self.notified.lock());
         wait_until_deadline(
@@ -53,6 +57,7 @@ impl WorkerSignal {
             },
             |_| start.elapsed(),
             |notified, remaining| {
+                before_park();
                 let (guard, elapsed) = self.ready.wait_timeout(
                     notified
                         .take()
@@ -80,8 +85,16 @@ impl WorkerSignal {
     }
 
     fn notify(&self) {
-        *self.notified.lock() = true;
-        self.wake_waiter();
+        // A waiter checks and consumes this flag under the same mutex before parking, so only the
+        // transition from clear to set needs a native notification.
+        if self.mark_notified() {
+            self.wake_waiter();
+        }
+    }
+
+    fn mark_notified(&self) -> bool {
+        let mut notified = self.notified.lock();
+        !std::mem::replace(&mut *notified, true)
     }
 
     #[cfg_attr(test, mutants::skip)] // Removing the native notification strands the smoke test; flag handling is tested separately.
@@ -126,6 +139,16 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_notifications_are_coalesced_until_consumed() {
+        let signal = WorkerSignal::default();
+
+        assert!(signal.mark_notified());
+        assert!(!signal.mark_notified());
+        signal.wait(Duration::ZERO);
+        assert!(signal.mark_notified());
+    }
+
+    #[test]
     fn remote_wake_releases_a_waiter() {
         if is_mutation_testing() {
             return;
@@ -143,6 +166,43 @@ mod tests {
         WorkerSignal::waker(&signal).wake_by_ref();
         done_rx.recv_timeout(TEST_TIMEOUT).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn wake_while_preparing_to_wait_is_retained() {
+        if is_mutation_testing() {
+            return;
+        }
+        let signal = Arc::new(WorkerSignal::default());
+        let (preparing_tx, preparing_rx) = mpsc::channel();
+        let (park_tx, park_rx) = mpsc::channel();
+        let (wake_started_tx, wake_started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = Arc::clone(&signal);
+        let worker = thread::spawn(move || {
+            let mut rendezvous = Some((preparing_tx, park_rx));
+            waiter.wait_before_park(TEST_TIMEOUT.saturating_mul(2), || {
+                if let Some((preparing_tx, park_rx)) = rendezvous.take() {
+                    preparing_tx.send(()).unwrap();
+                    park_rx.recv().unwrap();
+                }
+            });
+            done_tx.send(()).unwrap();
+        });
+        preparing_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        let waker = WorkerSignal::waker(&signal);
+        let notifier = thread::spawn(move || {
+            wake_started_tx.send(()).unwrap();
+            waker.wake();
+        });
+        wake_started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        park_tx.send(()).unwrap();
+
+        done_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        worker.join().unwrap();
+        notifier.join().unwrap();
+        assert!(!*signal.notified.lock());
     }
 
     #[test]
