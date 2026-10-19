@@ -30,7 +30,7 @@ fn into_entries_returns_all_fields() {
         tenant_id: 42,
         is_active: true,
     };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("tenant_id", 42i64));
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("is_active", true));
@@ -58,7 +58,7 @@ fn renamed_entries_have_new_keys() {
         status: 200,
         untouched: true,
     };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("http.method", "GET"));
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("http.status_code", 200i64));
@@ -87,7 +87,7 @@ fn exclude_flags_on_all_entries() {
         log_only: 2,
         both: 3,
     };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("metric_only", 1i64).exclude_from_logs());
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("log_only", 2i64));
@@ -121,7 +121,7 @@ fn dimension_opts_field_into_metric_dimension() {
         metric_only: 3,
         log_only: 4,
     };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 4);
     // #[dimension(metric = "plain_dim")]: dimension keyed by the field name.
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("plain_dim", 1i64).metric_dimension());
@@ -167,7 +167,7 @@ fn combined_entries() {
         internal_tag: 2,
         plain: true,
     };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 4);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("ctx.trace_id", 1i64));
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("ctx.request_id", "abc"));
@@ -202,7 +202,7 @@ fn mixed_value_types_in_entries() {
         label: PublicString("prod".into()),
         user_email: PiiString("user@example.com".into()),
     };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("count", 5i64));
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("ratio", 0.75));
@@ -225,8 +225,58 @@ fn empty_enrichment_produces_no_entries() {
     struct EmptyCtx {}
 
     let ctx = EmptyCtx {};
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert!(entries.is_empty());
+}
+
+#[test]
+fn optional_entries_preserve_order_and_placeholders() {
+    #[derive(Debug, Enrichment)]
+    struct OptionalCtx {
+        #[unredacted]
+        first: i64,
+        #[unredacted]
+        #[if_none(drop)]
+        optional: Option<i64>,
+        #[unredacted]
+        #[if_none("missing")]
+        last: Option<i64>,
+    }
+
+    let entries = OptionalCtx {
+        first: 1,
+        optional: None,
+        last: None,
+    }
+    .into_entries()
+    .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], ExpectedEnrichmentEntry::new("first", 1_i64));
+    assert_eq!(entries[1], ExpectedEnrichmentEntry::new("last", "missing"));
+
+    let entries = OptionalCtx {
+        first: 1,
+        optional: Some(2),
+        last: Some(3),
+    }
+    .into_entries()
+    .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0], ExpectedEnrichmentEntry::new("first", 1_i64));
+    assert_eq!(entries[1], ExpectedEnrichmentEntry::new("optional", 2_i64));
+    assert_eq!(entries[2], ExpectedEnrichmentEntry::new("last", 3_i64));
+}
+
+#[test]
+fn dropping_all_optional_entries_produces_an_empty_iterator() {
+    #[derive(Debug, Enrichment)]
+    struct OptionalCtx {
+        #[unredacted]
+        #[if_none(drop)]
+        value: Option<i64>,
+    }
+
+    assert!(OptionalCtx { value: None }.into_entries().next().is_none());
 }
 
 // ================================================================================================
@@ -245,7 +295,7 @@ fn borrowed_enrichment_single_lifetime() {
 
     let label = String::from("borrowed");
     let ctx = BorrowedCtx { label: &label, count: 7 };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("label", "borrowed"));
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("count", 7i64));
@@ -264,7 +314,7 @@ fn borrowed_enrichment_multiple_lifetimes() {
     let a = String::from("alpha");
     let b = String::from("beta");
     let ctx = MultiCtx { first: &a, second: &b };
-    let entries = ctx.into_entries();
+    let entries = ctx.into_entries().collect::<Vec<_>>();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("first", "alpha"));
     assert_eq!(entries[1], ExpectedEnrichmentEntry::new("second", "beta"));
@@ -283,10 +333,8 @@ fn hand_written_enrichment_is_accepted_by_enrich() {
     struct Computed(i64);
 
     impl observed::enrichment::Enrichment for Computed {
-        fn into_entries(self) -> Vec<EnrichmentEntry> {
-            (0..self.0)
-                .map(|i| EnrichmentEntry::unclassified(if i == 0 { "first" } else { "second" }, i))
-                .collect()
+        fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+            (0..self.0).map(|i| EnrichmentEntry::unclassified(if i == 0 { "first" } else { "second" }, i))
         }
     }
 
@@ -331,7 +379,8 @@ fn entry_order_is_preserved_and_duplicate_keys_are_kept() {
         second: 2,
         third: 3,
     }
-    .into_entries();
+    .into_entries()
+    .collect::<Vec<_>>();
     let keys: Vec<_> = entries.iter().map(|e| e.key().as_str()).collect();
     assert_eq!(keys, ["first", "second", "third"]);
 
@@ -367,7 +416,7 @@ fn raw_identifier_entry_uses_its_plain_name() {
         r#type: i64,
     }
 
-    let entries = RawIdentifierCtx { r#type: 1 }.into_entries();
+    let entries = RawIdentifierCtx { r#type: 1 }.into_entries().collect::<Vec<_>>();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0], ExpectedEnrichmentEntry::new("type", 1i64));

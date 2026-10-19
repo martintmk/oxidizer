@@ -164,7 +164,7 @@ impl Sink {
     pub fn composite(children: impl IntoIterator<Item = Self>) -> Self {
         fn push(states: &mut Vec<SingleSinkState>, state: SingleSinkState) {
             assert!(
-                !states.iter().any(|known| known.enrichment.ptr_eq(&state.enrichment)),
+                !states.iter().any(|known| known.enrichment == state.enrichment),
                 "Sink::composite received the same leaf twice (id {}); \
                  remove the duplicate or the overlap between nested composites",
                 state.id,
@@ -443,8 +443,7 @@ enum SinkInner {
     Single(SingleSinkState),
     /// Routes one `emit!` call through each leaf in turn. Children are the
     /// flattened leaf states of every sink passed to [`Sink::composite`],
-    /// each sharing its enrichment slot (`Arc`-backed) with the originating
-    /// sink.
+    /// each preserving the originating sink's enrichment slot identity.
     Composite { children: Vec<SingleSinkState> },
     /// A sink that drops every event and ignores enrichment.
     Noop,
@@ -531,8 +530,11 @@ mod tests {
         struct UnreachableEnrichment;
 
         impl Enrichment for UnreachableEnrichment {
-            fn into_entries(self) -> Vec<EnrichmentEntry> {
-                panic!("a no-op sink transfer must not materialize enrichment entries")
+            fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+                fn fail() -> std::iter::Empty<EnrichmentEntry> {
+                    panic!("a no-op sink transfer must not materialize enrichment entries")
+                }
+                fail()
             }
         }
 

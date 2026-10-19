@@ -3921,7 +3921,6 @@ dependencies = [
  "smallvec",
  "static_assertions",
  "thread_aware",
- "thread_local",
  "tick",
  "tokio",
 ]

@@ -9,6 +9,7 @@ use std::task::{self, Poll};
 
 use performables::arc::Arc;
 
+use super::enrichment_trait::collect_entries;
 use super::entry::EnrichmentEntry;
 use crate::context::{Transfer, Transferred};
 use crate::enrichment::Enrichment;
@@ -46,17 +47,17 @@ impl<F: Future> Future for Enriched<F> {
 }
 
 fn entries(sink: &Sink, enrichment: impl Enrichment) -> Option<Arc<[EnrichmentEntry]>> {
-    sink.supports_enrichment().then(|| enrichment.into_entries().into())
+    if !sink.supports_enrichment() {
+        return None;
+    }
+    collect_entries(enrichment.into_entries())
 }
 
 fn targeted_entries(sink: &Sink, target: SinkId, enrichment: impl Enrichment) -> Option<Arc<[EnrichmentEntry]>> {
-    sink.supports_enrichment().then(|| {
-        enrichment
-            .into_entries()
-            .into_iter()
-            .map(move |entry| entry.with_target(target))
-            .collect()
-    })
+    if !sink.supports_enrichment() {
+        return None;
+    }
+    collect_entries(enrichment.into_entries().map(move |entry| entry.with_target(target)))
 }
 
 /// Extension trait that adds methods for enriching an async block of code.
@@ -149,8 +150,11 @@ mod tests {
     struct UnreachableEnrichment;
 
     impl Enrichment for UnreachableEnrichment {
-        fn into_entries(self) -> Vec<EnrichmentEntry> {
-            panic!("a no-op sink must not materialize enrichment entries")
+        fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+            fn fail() -> std::iter::Empty<EnrichmentEntry> {
+                panic!("a no-op sink must not materialize enrichment entries")
+            }
+            fail()
         }
     }
 

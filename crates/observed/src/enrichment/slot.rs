@@ -7,12 +7,13 @@
 
 use std::any::type_name;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use performables::arc::Arc;
 use smallvec::{SmallVec, smallvec};
 use thread_aware::{Thread, ThreadAware};
-use thread_local::ThreadLocal;
 
+use super::enrichment_trait::collect_entries;
 use crate::SinkId;
 use crate::enrichment::{Enrichment, EnrichmentEntry};
 
@@ -23,6 +24,15 @@ pub(crate) type OptEnrichmentNode = Option<Arc<EnrichmentNode>>;
 /// case without heap-spilling; larger fan-outs spill to the heap transparently.
 const INLINE_SLOT_CAPACITY: usize = 3;
 
+const INLINE_ACTIVE_SLOT_CAPACITY: usize = 4;
+
+thread_local! {
+    // A shared inline list avoids a ThreadLocal allocation and its buckets per sink.
+    // Only active heads are retained; a HashMap would allocate even for one sink.
+    static HEADS: RefCell<SmallVec<[(usize, Arc<EnrichmentNode>); INLINE_ACTIVE_SLOT_CAPACITY]>> =
+        const { RefCell::new(SmallVec::new_const()) };
+}
+
 /// A single node in the linked enrichment chain.
 #[derive(Debug, Clone)]
 pub(crate) struct EnrichmentNode {
@@ -31,8 +41,8 @@ pub(crate) struct EnrichmentNode {
 }
 
 /// Thread-local slot per sink, holding the current enrichment chain tail.
-#[derive(Clone)]
-pub(crate) struct Slot(Arc<ThreadLocal<RefCell<OptEnrichmentNode>>>);
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Slot(usize);
 
 impl thread_aware::ThreadAware for Slot {
     fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {
@@ -42,25 +52,45 @@ impl thread_aware::ThreadAware for Slot {
 
 impl Slot {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(ThreadLocal::new()))
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let mut id = NEXT_ID.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .expect("creating more than usize::MAX slots exhausts their unique identities");
+            match NEXT_ID.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Self(id),
+                Err(current) => id = current,
+            }
+        }
     }
 
     pub(crate) fn current(&self) -> OptEnrichmentNode {
-        let cell = self.0.get()?;
-        cell.borrow().clone()
-    }
-
-    /// Returns `true` if both handles address the same thread-local storage.
-    ///
-    /// Slot identity is preserved by `Sink::clone` and by folding a leaf into a
-    /// composite, so this identifies the underlying leaf sink.
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        HEADS.with(|heads| {
+            heads
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == self.0)
+                .map(|(_, head)| Arc::clone(head))
+        })
     }
 
     fn replace(&self, node: OptEnrichmentNode) -> OptEnrichmentNode {
-        let cell = self.0.get_or(|| RefCell::new(None));
-        cell.replace(node)
+        HEADS.with(|heads| {
+            let mut heads = heads.borrow_mut();
+            if let Some(index) = heads.iter().position(|(id, _)| *id == self.0) {
+                match node {
+                    Some(node) => Some(std::mem::replace(&mut heads[index].1, node)),
+                    None => Some(heads.swap_remove(index).1),
+                }
+            } else {
+                if let Some(node) = node {
+                    heads.push((self.0, node));
+                }
+                None
+            }
+        })
     }
 
     /// Pushes entries onto the enrichment chain and returns a guard.
@@ -73,14 +103,20 @@ impl Slot {
             return Guard::empty();
         }
 
-        let prev = {
-            let cell = self.0.get_or(|| RefCell::new(None));
+        let prev = HEADS.with(|heads| {
+            let mut heads = heads.borrow_mut();
+            let index = heads.iter().position(|(id, _)| *id == self.0);
             let next = Arc::new(EnrichmentNode {
                 entries,
-                parent: cell.borrow().clone(),
+                parent: index.map(|index| Arc::clone(&heads[index].1)),
             });
-            cell.borrow_mut().replace(next)
-        };
+            if let Some(index) = index {
+                Some(std::mem::replace(&mut heads[index].1, next))
+            } else {
+                heads.push((self.0, next));
+                None
+            }
+        });
         Guard {
             slots: smallvec![(self.clone(), prev)],
         }
@@ -164,7 +200,7 @@ impl Drop for AppliedGuard<'_> {
 ///
 /// Created by [`Sink::transfer_context`](crate::Sink::transfer_context).
 /// Carries one `(slot, head)` pair per leaf sink that contributed to the
-/// capture - slot identity (the `Arc<ThreadLocal<…>>` inside [`Slot`])
+/// capture - the unique identity inside [`Slot`]
 /// is preserved across `Sink::clone`, so each pair addresses the *same*
 /// enrichment chain on whichever thread the transfer is applied on.
 ///
@@ -212,21 +248,20 @@ impl EnrichmentTransfer {
     /// Broadcast within the transfer's known slots; transfers with no
     /// captured slots are left unchanged.
     ///
-    /// Emptiness is tested while the entries are still an owned `Vec`, so an
-    /// empty layer skips the shared-slice allocation as well as the chain
-    /// nodes. [`push_entries`](Self::push_entries) relies on this and on the
-    /// same check in [`push_for`](Self::push_for) for its non-empty input.
+    /// The iterator is checked before allocating its shared slice, so an empty
+    /// layer skips the shared-slice allocation as well as the chain nodes.
+    /// [`push_entries`](Self::push_entries) relies on this and on the same
+    /// check in [`push_for`](Self::push_for) for its non-empty input.
     pub(crate) fn push(&mut self, additional_enrichment: impl Enrichment) {
         if self.slots.is_empty() {
             return;
         }
 
-        let entries = additional_enrichment.into_entries();
-        if entries.is_empty() {
+        let Some(entries) = collect_entries(additional_enrichment.into_entries()) else {
             return;
-        }
+        };
 
-        self.push_entries(&Arc::from(entries));
+        self.push_entries(&entries);
     }
 
     /// Same as [`push`](Self::push), but marks every entry as targeted at
@@ -237,12 +272,11 @@ impl EnrichmentTransfer {
             return;
         }
 
-        let entries = additional_enrichment.into_entries();
-        if entries.is_empty() {
+        let Some(entries) = collect_entries(additional_enrichment.into_entries().map(|entry| entry.with_target(target))) else {
             return;
-        }
+        };
 
-        self.push_entries(&entries.into_iter().map(|entry| entry.with_target(target)).collect());
+        self.push_entries(&entries);
     }
 
     /// Layers `entries` onto every captured chain as a single new node.
@@ -274,24 +308,27 @@ mod coverage_tests {
     struct TestEnrichment(&'static str);
 
     impl Enrichment for TestEnrichment {
-        fn into_entries(self) -> Vec<EnrichmentEntry> {
-            vec![EnrichmentEntry::unclassified(self.0, 1_i64)]
+        fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+            [EnrichmentEntry::unclassified(self.0, 1_i64)].into_iter()
         }
     }
 
     struct EmptyEnrichment;
 
     impl Enrichment for EmptyEnrichment {
-        fn into_entries(self) -> Vec<EnrichmentEntry> {
-            Vec::new()
+        fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+            std::iter::empty()
         }
     }
 
     struct UnreachableEnrichment;
 
     impl Enrichment for UnreachableEnrichment {
-        fn into_entries(self) -> Vec<EnrichmentEntry> {
-            panic!("an empty transfer must not materialize enrichment entries")
+        fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+            fn fail() -> std::iter::Empty<EnrichmentEntry> {
+                panic!("an empty transfer must not materialize enrichment entries")
+            }
+            fail()
         }
     }
 
@@ -307,13 +344,13 @@ mod coverage_tests {
     }
 
     #[test]
-    fn ptr_eq_identifies_shared_thread_local_storage() {
+    fn clones_identify_the_same_slot() {
         // Slot identity is what lets a transfer address the same chain after a
         // `Sink::clone`, so a clone must compare equal and a fresh slot must not.
         let slot = Slot::new();
 
-        assert!(slot.ptr_eq(&slot.clone()));
-        assert!(!slot.ptr_eq(&Slot::new()));
+        assert_eq!(slot, slot.clone());
+        assert_ne!(slot, Slot::new());
     }
 
     #[test]
@@ -379,7 +416,69 @@ mod coverage_tests {
 
         relocated.relocate(None, &destination);
 
-        assert!(slot.ptr_eq(&relocated));
+        assert_eq!(slot, relocated);
+    }
+
+    #[test]
+    fn inactive_slots_are_not_retained_in_thread_local_storage() {
+        let slot = Slot::new();
+        assert!(slot.replace(None).is_none());
+        {
+            let _guard = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("k", 1_i64)]));
+            HEADS.with(|heads| assert!(heads.borrow().iter().any(|(id, _)| *id == slot.0)));
+        }
+        HEADS.with(|heads| assert!(heads.borrow().iter().all(|(id, _)| *id != slot.0)));
+    }
+
+    #[test]
+    fn empty_capture_masks_and_restores_an_active_head() {
+        let slot = Slot::new();
+        let mut transfer = EnrichmentTransfer::default();
+        transfer.add_slot(&slot);
+        let _guard = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("previous", 1_i64)]));
+
+        {
+            let _applied = transfer.apply();
+            assert!(slot.current().is_none());
+        }
+
+        assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "previous");
+    }
+
+    #[test]
+    fn merged_guard_restores_repeated_mutations_of_the_same_slot() {
+        let slot = Slot::new();
+        let first = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("first", 1_i64)]));
+        let second = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("second", 2_i64)]));
+
+        drop(Guard::merge([first, second]));
+
+        assert!(slot.current().is_none());
+    }
+
+    #[test]
+    fn transfer_is_thread_local_and_restores_destination_context() {
+        let slot = Slot::new();
+        let _source = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("source", 1_i64)]));
+        let mut transfer = EnrichmentTransfer::default();
+        transfer.add_slot(&slot);
+
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    assert!(slot.current().is_none());
+                    let _destination = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("destination", 2_i64)]));
+                    {
+                        let _applied = transfer.apply();
+                        assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "source");
+                    }
+                    assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "destination");
+                })
+                .join()
+                .unwrap();
+        });
+
+        assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "source");
     }
 
     #[test]

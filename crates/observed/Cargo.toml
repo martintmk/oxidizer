@@ -45,9 +45,8 @@ performables = { workspace = true }
 
 # 3rd-party
 pin-project = { workspace = true }
-smallvec = { workspace = true }
+smallvec = { workspace = true, features = ["const_new"] }
 thread_aware = { workspace = true, features = ["std", "derive"] }
-thread_local = { workspace = true }
 tick = { workspace = true }
 
 [dev-dependencies]

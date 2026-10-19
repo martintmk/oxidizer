@@ -128,8 +128,8 @@ impl EventProcessor for FailingProcessor {
 struct EmptyEnrichment;
 
 impl Enrichment for EmptyEnrichment {
-    fn into_entries(self) -> Vec<EnrichmentEntry> {
-        Vec::new()
+    fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry> {
+        std::iter::empty()
     }
 }
 

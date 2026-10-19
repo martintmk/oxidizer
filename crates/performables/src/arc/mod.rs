@@ -1014,7 +1014,7 @@ impl<T: Clone> From<&[T]> for Arc<[T], PerProcess> {
 
 impl<T> FromIterator<T> for Arc<[T], PerProcess> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self::from(iter.into_iter().collect::<Vec<_>>())
+        Self::from_state(StdArc::from_iter(iter))
     }
 }
 

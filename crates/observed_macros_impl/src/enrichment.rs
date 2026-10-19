@@ -4,7 +4,7 @@
 //! Implementation of the `#[derive(Enrichment)]` macro.
 //!
 //! Generates an `Enrichment` trait implementation that converts a struct into
-//! a `Vec<EnrichmentEntry>`.
+//! an iterator of owned `EnrichmentEntry` values.
 //!
 //! Unlike `#[event(...)]`, enrichment fields cannot *be* a metric value;
 //! they can only opt in as metric **dimensions** via `#[dimension(metric)]` or
@@ -152,28 +152,48 @@ fn generate_enrichment_impl(def: &EnrichmentDef) -> TokenStream {
     crate::field_attrs::extend_where_clause(&mut generics, predicates);
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let entry_stmts: Vec<TokenStream> = def.fields.iter().map(generate_entry_stmt).collect();
+    let drops_entries = def
+        .fields
+        .iter()
+        .any(|field| matches!(field.shared.if_none.as_ref(), Some(IfNone::Drop)));
+    let entry_exprs: Vec<TokenStream> = def
+        .fields
+        .iter()
+        .map(|field| {
+            let entry = generate_entry_expr(field);
+            if drops_entries && !matches!(field.shared.if_none.as_ref(), Some(IfNone::Drop)) {
+                quote! { ::core::option::Option::Some(#entry) }
+            } else {
+                entry
+            }
+        })
+        .collect();
     let field_count = def.fields.len();
+    let entry_type = if drops_entries {
+        quote! { ::core::option::Option<::observed::__private::EnrichmentEntry> }
+    } else {
+        quote! { ::observed::__private::EnrichmentEntry }
+    };
+    let flatten = drops_entries.then(|| quote! { .flatten() });
 
     quote! {
         const _: () = {
             impl #impl_generics ::observed::enrichment::Enrichment for #struct_ident #ty_generics #where_clause {
-                fn into_entries(self) -> ::std::vec::Vec<::observed::__private::EnrichmentEntry> {
-                    let mut entries = ::std::vec::Vec::with_capacity(#field_count);
-                    #(#entry_stmts)*
-                    entries
+                fn into_entries(self) -> impl ::core::iter::Iterator<Item = ::observed::__private::EnrichmentEntry> {
+                    let entries: [#entry_type; #field_count] = [#(#entry_exprs),*];
+                    ::core::iter::IntoIterator::into_iter(entries) #flatten
                 }
             }
         };
     }
 }
 
-/// Generates a statement that pushes this field's `EnrichmentEntry` onto `entries`.
+/// Generates this field's entry, optionally omitted for `#[if_none(drop)]`.
 ///
 /// `Option<T>` fields behave like in `#[event(...)]`: on `None`,
 /// `#[if_none(...)]` decides whether the entry is dropped or filled with
 /// a placeholder string (default `"n/a"`).
-fn generate_entry_stmt(field: &EnrichmentFieldDef) -> TokenStream {
+fn generate_entry_expr(field: &EnrichmentFieldDef) -> TokenStream {
     let field_ident = &field.ident;
     // Unraw-ed so a field written as `r#type` is exported under the domain key
     // `type`; `field_ident` keeps the raw form because it addresses the field.
@@ -203,7 +223,7 @@ fn generate_entry_stmt(field: &EnrichmentFieldDef) -> TokenStream {
             metric_key.as_deref(),
             borrowed_str,
         );
-        return quote! { entries.push(#entry); };
+        return entry;
     }
 
     let some_entry = entry_ctor(&key, redaction, &quote! { __val }, exclude, metric_key.as_deref(), borrowed_str);
@@ -211,11 +231,7 @@ fn generate_entry_stmt(field: &EnrichmentFieldDef) -> TokenStream {
     // On `None`, `#[if_none(...)]` decides whether the entry is dropped
     // or filled with a placeholder string (default `"n/a"`).
     match field.shared.if_none.clone().unwrap_or_default() {
-        IfNone::Drop => quote! {
-            if let ::core::option::Option::Some(__val) = self.#field_ident {
-                entries.push(#some_entry);
-            }
-        },
+        IfNone::Drop => quote! { self.#field_ident.map(|__val| #some_entry) },
         IfNone::Fill(placeholder) => {
             let fill_entry = entry_ctor(
                 &key,
@@ -228,8 +244,8 @@ fn generate_entry_stmt(field: &EnrichmentFieldDef) -> TokenStream {
             );
             quote! {
                 match self.#field_ident {
-                    ::core::option::Option::Some(__val) => entries.push(#some_entry),
-                    ::core::option::Option::None => entries.push(#fill_entry),
+                    ::core::option::Option::Some(__val) => #some_entry,
+                    ::core::option::Option::None => #fill_entry,
                 }
             }
         }

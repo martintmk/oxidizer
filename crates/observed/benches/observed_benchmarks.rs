@@ -30,7 +30,9 @@ const EMIT_ENRICHMENT: &str = "observed_benchmarks/emit_enrichment";
 const SINK_OPERATIONS: &str = "observed_benchmarks/sink_operations";
 const ALLOCATION: &str = "observed_benchmarks/allocation";
 const ENRICHMENT_TRANSFER: &str = "observed_benchmarks/enrichment_transfer";
-const BENCH_SINK_IDS: [&str; 3] = ["bench-0", "bench-1", "bench-2"];
+const BENCH_SINK_IDS: [&str; 8] = [
+    "bench-0", "bench-1", "bench-2", "bench-3", "bench-4", "bench-5", "bench-6", "bench-7",
+];
 
 #[event("bench.simple_log")]
 #[info]
@@ -120,6 +122,13 @@ struct BenchEnrich5 {
     cluster: i64,
     #[data_class(BENCH_DC)]
     pod: i64,
+}
+
+#[derive(Enrichment)]
+struct BenchOptionalEnrich {
+    #[unredacted]
+    #[if_none(drop)]
+    val: Option<i64>,
 }
 
 struct SimpleLogProcessor {
@@ -257,6 +266,12 @@ fn attached_poll_state(slot_count: usize) -> AttachedPollState {
     }
 }
 
+fn attached_empty_poll_state() -> AttachedPollState {
+    AttachedPollState {
+        future: Box::pin(AlwaysPending.attach(processor_free_sink().transfer_context())),
+    }
+}
+
 #[metabench::benchmark(EMIT_SIMPLE_LOG, EMIT_PIPELINE, "simple_log_2_fields")]
 #[bench::run(&emit_state())]
 fn emit_simple_log(state: &EmitState) {
@@ -355,6 +370,18 @@ fn enrich_push_pop(sink: &Sink, entry_count: usize) {
     }
 }
 
+#[metabench::benchmark(ENRICH_OPTIONAL_PUSH_POP, EMIT_ENRICHMENT, "enrich_optional_push_pop")]
+#[bench::empty(&processor_free_sink(), false)]
+#[bench::present(&processor_free_sink(), true)]
+fn enrich_optional_push_pop(sink: &Sink, present: bool) {
+    (|| black_box(())).enrich(
+        sink,
+        BenchOptionalEnrich {
+            val: present.then_some(42),
+        },
+    )();
+}
+
 #[metabench::benchmark(CONSTRUCT_PROCESSOR_FREE_SINK, SINK_OPERATIONS, "construct_processor_free_sink")]
 #[bench::run(&tick::SimpleClock::new_system())]
 fn construct_processor_free_sink(clock: &tick::SimpleClock) -> Sink {
@@ -412,7 +439,7 @@ fn poll_pending(future: impl Future<Output = ()>) {
 }
 
 fn composite_sink() -> Sink {
-    Sink::composite(BENCH_SINK_IDS.iter().map(|&id| Sink::builder(id).build()))
+    Sink::composite(BENCH_SINK_IDS[..3].iter().map(|&id| Sink::builder(id).build()))
 }
 
 #[metabench::benchmark(PENDING_ENRICHED_FUTURE, ALLOCATION, "pending_enriched_future_8_polls")]
@@ -464,12 +491,15 @@ fn emit_enrichment_depth(state: &EnrichedEmitState) {
 }
 
 #[metabench::benchmark(POLL_ATTACHED, ENRICHMENT_TRANSFER, "poll_attached")]
+#[bench::empty_slot(attached_empty_poll_state())]
 #[bench::single_slot(attached_poll_state(1))]
 #[bench::three_slots(attached_poll_state(3))]
+#[bench::four_slots(attached_poll_state(4))]
+#[bench::eight_slots(attached_poll_state(8))]
 /// Measures the attached-future hot path that applies borrowed transfer state.
 ///
-/// The single leaf is the lower bound; the small composite represents common
-/// fan-out without treating the result as a per-slot scaling model.
+/// Empty context, inline fan-out, and larger composites cover both first-touch
+/// storage and guards that spill beyond their inline capacity.
 fn poll_attached(mut state: AttachedPollState) -> AttachedPollState {
     let waker = task::Waker::noop();
     let mut cx = task::Context::from_waker(waker);
@@ -511,6 +541,11 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     for (case, count) in [("three_entries", 3), ("five_entries", 5)] {
         enrichment.bench_function(BenchmarkId::new(ENRICH_PUSH_POP.benchmark_name(), case), |bencher| {
             bencher.iter(|| enrich_push_pop(black_box(&sink), count));
+        });
+    }
+    for (case, present) in [("empty", false), ("present", true)] {
+        enrichment.bench_function(BenchmarkId::new(ENRICH_OPTIONAL_PUSH_POP.benchmark_name(), case), |bencher| {
+            bencher.iter(|| enrich_optional_push_pop(black_box(&sink), present));
         });
     }
     enrichment.finish();
@@ -561,10 +596,22 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     allocation.finish();
 
     let mut transfer = criterion.benchmark_group(ENRICHMENT_TRANSFER);
-    for (case, slot_count) in [("single_slot", 1), ("three_slots", 3)] {
+    for (case, slot_count) in [
+        ("empty_slot", 0),
+        ("single_slot", 1),
+        ("three_slots", 3),
+        ("four_slots", 4),
+        ("eight_slots", 8),
+    ] {
         transfer.bench_function(BenchmarkId::new(POLL_ATTACHED.benchmark_name(), case), |bencher| {
             bencher.iter_batched(
-                || attached_poll_state(slot_count),
+                || {
+                    if slot_count == 0 {
+                        attached_empty_poll_state()
+                    } else {
+                        attached_poll_state(slot_count)
+                    }
+                },
                 |state| black_box(poll_attached(state)),
                 BatchSize::SmallInput,
             );
@@ -584,6 +631,7 @@ metabench::main!(
         EMIT_WITH_ENRICHMENTS,
         EMIT_DEEP_ENRICHMENTS,
         ENRICH_PUSH_POP,
+        ENRICH_OPTIONAL_PUSH_POP,
         CONSTRUCT_PROCESSOR_FREE_SINK,
         EMIT_TO_NOOP_SINK,
         ENRICHMENT_COLLECT,

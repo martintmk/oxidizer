@@ -3,6 +3,8 @@
 
 //! Enrichment derive trait for typed enrichment structs.
 
+use performables::arc::Arc;
+
 use crate::enrichment::EnrichmentEntry;
 
 /// Trait implemented by typed enrichment structs that convert into enrichment entries.
@@ -17,8 +19,18 @@ use crate::enrichment::EnrichmentEntry;
 /// See the [`Enrichment` derive macro](crate::Enrichment) for field attributes
 /// and usage examples.
 pub trait Enrichment {
-    /// Converts this enrichment struct into its [`EnrichmentEntry`] items.
+    /// Converts this enrichment struct into an iterator of owned [`EnrichmentEntry`] items.
     ///
     /// The returned order is preserved when the entries are attached to a scope.
-    fn into_entries(self) -> Vec<EnrichmentEntry>;
+    /// Implementations can return an array's iterator instead of allocating a vector.
+    fn into_entries(self) -> impl Iterator<Item = EnrichmentEntry>;
+}
+
+pub(super) fn collect_entries(entries: impl Iterator<Item = EnrichmentEntry>) -> Option<Arc<[EnrichmentEntry]>> {
+    if entries.size_hint().0 > 0 {
+        return Some(entries.collect());
+    }
+    let mut entries = entries.peekable();
+    entries.peek()?;
+    Some(entries.collect())
 }
