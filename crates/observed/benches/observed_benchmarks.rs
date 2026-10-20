@@ -28,6 +28,7 @@ mod otel;
 
 const BENCH_DC: DataClass = DataClass::new("bench", "public");
 const EMIT_PIPELINE: &str = "observed_benchmarks/emit_pipeline";
+const EMIT_COMPOSITE: &str = "observed_benchmarks/emit_composite";
 const EMIT_ENRICHMENT: &str = "observed_benchmarks/emit_enrichment";
 const SINK_OPERATIONS: &str = "observed_benchmarks/sink_operations";
 const ALLOCATION: &str = "observed_benchmarks/allocation";
@@ -131,6 +132,22 @@ struct SimpleLogProcessor {
     redaction_engine: data_privacy::RedactionEngine,
 }
 
+struct TraversalProcessor;
+
+impl observed::processing::EventProcessor for TraversalProcessor {
+    fn is_interested(&self, _description: &observed::metadata::EventDescription) -> bool {
+        true
+    }
+
+    fn process(&self, event: &observed::processing::EventView<'_>) {
+        let _ = black_box(event);
+    }
+
+    fn flush(&self) -> Result<(), observed::FlushError> {
+        Ok(())
+    }
+}
+
 impl observed::processing::EventProcessor for SimpleLogProcessor {
     fn is_interested(&self, _description: &observed::metadata::EventDescription) -> bool {
         true
@@ -211,6 +228,20 @@ fn processor_free_sink() -> Sink {
     Sink::builder("bench").build()
 }
 
+fn traversal_sink(leaf_count: usize) -> Sink {
+    let leaves = BENCH_SINK_IDS[..leaf_count]
+        .iter()
+        .map(|&id| Sink::builder(id).processors(vec![Arc::new(TraversalProcessor)]).build());
+    if leaf_count == 1 {
+        leaves
+            .into_iter()
+            .next()
+            .expect("leaf_count is one in the single-sink benchmark case")
+    } else {
+        Sink::composite(leaves)
+    }
+}
+
 fn enriched_emit_state(depth: usize) -> EnrichedEmitState {
     let state = emit_state();
     let guard = applied_enrichment(&state.sink, depth);
@@ -218,7 +249,11 @@ fn enriched_emit_state(depth: usize) -> EnrichedEmitState {
 }
 
 fn enriched_sink_state(depth: usize) -> EnrichedSinkState {
-    let sink = processor_free_sink();
+    enriched_sink_state_with_slots(1, depth)
+}
+
+fn enriched_sink_state_with_slots(slot_count: usize, depth: usize) -> EnrichedSinkState {
+    let sink = sink_with_slots(slot_count);
     let guard = applied_enrichment(&sink, depth);
     EnrichedSinkState { _guard: guard, sink }
 }
@@ -375,6 +410,18 @@ fn emit_redacted_strings(state: &EmitState) {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
     );
+}
+
+#[metabench::benchmark(EMIT_COMPOSITE_TRAVERSAL, EMIT_COMPOSITE, "emit_composite_traversal")]
+#[bench::single(&traversal_sink(1))]
+#[bench::composite_3(&traversal_sink(3))]
+#[bench::composite_8(&traversal_sink(8))]
+/// Measures sink traversal and one minimal processor call per leaf.
+///
+/// The event payload stays fixed across cases so the 3- and 8-leaf cases
+/// expose composite interest, sampling, and dispatch overhead.
+fn emit_composite_traversal(sink: &Sink) {
+    observed::emit!(sink, SimpleLogEvent { status: 200, retries: 0 });
 }
 
 #[metabench::benchmark(EMIT_WITH_ENRICHMENTS, EMIT_ENRICHMENT, "emit_with_3_enrichments")]
@@ -578,6 +625,15 @@ fn poll_attached(mut state: AttachedPollState) -> AttachedPollState {
     state
 }
 
+#[metabench::benchmark(CAPTURE_ENRICHMENT_CONTEXT, ENRICHMENT_TRANSFER, "capture_enrichment_context")]
+#[bench::single(&enriched_sink_state_with_slots(1, 1))]
+#[bench::composite_3(&enriched_sink_state_with_slots(3, 1))]
+#[bench::composite_8(&enriched_sink_state_with_slots(8, 1))]
+/// Isolates current-slot lookup, captured-head cloning, and transfer assembly.
+fn capture_enrichment_context(state: &EnrichedSinkState) -> Transfer {
+    black_box(state.sink.transfer_context())
+}
+
 fn criterion_benchmarks(criterion: &mut Criterion) {
     let mut emit_pipeline = criterion.benchmark_group(EMIT_PIPELINE);
     let emit = emit_state();
@@ -598,6 +654,21 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         bencher.iter(|| emit_redacted_strings(black_box(&redacted)));
     });
     emit_pipeline.finish();
+
+    let mut emit_composite = criterion.benchmark_group(EMIT_COMPOSITE);
+    let traversal_single = traversal_sink(1);
+    let traversal_3 = traversal_sink(3);
+    let traversal_8 = traversal_sink(8);
+    for (case, sink) in [
+        ("single", &traversal_single),
+        ("composite_3", &traversal_3),
+        ("composite_8", &traversal_8),
+    ] {
+        emit_composite.bench_function(BenchmarkId::new(EMIT_COMPOSITE_TRAVERSAL.benchmark_name(), case), |bencher| {
+            bencher.iter(|| emit_composite_traversal(black_box(sink)));
+        });
+    }
+    emit_composite.finish();
 
     let mut enrichment = criterion.benchmark_group(EMIT_ENRICHMENT);
     let enriched = enriched_emit_state(3);
@@ -688,6 +759,15 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
             );
         });
     }
+    for (case, state) in [
+        ("single", enriched_sink_state_with_slots(1, 1)),
+        ("composite_3", enriched_sink_state_with_slots(3, 1)),
+        ("composite_8", enriched_sink_state_with_slots(8, 1)),
+    ] {
+        transfer.bench_function(BenchmarkId::new(CAPTURE_ENRICHMENT_CONTEXT.benchmark_name(), case), |bencher| {
+            bencher.iter(|| capture_enrichment_context(black_box(&state)));
+        });
+    }
     transfer.finish();
 }
 
@@ -699,6 +779,7 @@ metabench::main!(
         EMIT_WITH_BODY,
         EMIT_METRIC_EVENT,
         EMIT_REDACTED_STRINGS,
+        EMIT_COMPOSITE_TRAVERSAL,
         EMIT_WITH_ENRICHMENTS,
         EMIT_DEEP_ENRICHMENTS,
         ENRICH_PUSH_POP,
@@ -713,5 +794,6 @@ metabench::main!(
         EMIT_ENRICHMENT_DEPTH,
         POLL_ATTACHED,
         POLL_CAPTURED_ENRICHED_FUTURE,
+        CAPTURE_ENRICHMENT_CONTEXT,
     ],
 );
