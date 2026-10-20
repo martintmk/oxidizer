@@ -363,18 +363,27 @@ impl Sink {
     /// It's automatically called by the `emit!` macro expansion, and can be called directly for
     /// [`DynEvent`s](DynEvent)
     pub(crate) fn emit_impl<'a, T: Event, F: FnOnce() -> T + 'a>(&self, state: IntermediateEvent<'a, F>) {
-        if self.is_noop() {
-            return;
-        }
+        let sinks = match &*self.inner {
+            SinkInner::Single(sink) if !sink.processors.is_empty() => slice::from_ref(sink),
+            SinkInner::Composite { children } if children.iter().any(|sink| !sink.processors.is_empty()) => children.as_slice(),
+            SinkInner::Single(_) | SinkInner::Composite { .. } | SinkInner::Noop => return,
+        };
 
         let description = state.description();
         let bitmask = {
             let Some(_guard) = super::try_acquire_reentrancy_guard() else {
                 return;
             };
-            self.sinks_with_shift().fold(0, |bitmask, (sink, shift)| {
-                bitmask | sink.sample_and_ask_processors(&description) << shift
-            })
+            let mut bitmask = 0;
+            let mut shift = 0;
+            for sink in sinks {
+                if sink.processors.is_empty() {
+                    continue;
+                }
+                bitmask |= sink.sample_and_ask_processors(&description) << shift;
+                shift += sink.processors.len();
+            }
+            bitmask
         };
         if bitmask == 0 {
             return;
@@ -383,8 +392,13 @@ impl Sink {
         let event = state.evaluate();
 
         let _guard = super::try_acquire_reentrancy_guard().expect("the reentrancy slot should be free again once the event is built");
-        for (sink, shift) in self.sinks_with_shift() {
-            sink.dispatch(&event, bitmask >> shift);
+        let mut remaining_bitmask = bitmask;
+        for sink in sinks {
+            if sink.processors.is_empty() {
+                continue;
+            }
+            sink.dispatch(&event, remaining_bitmask);
+            remaining_bitmask = remaining_bitmask.checked_shr(sink.processors.len() as u32).unwrap_or(0);
         }
     }
 
