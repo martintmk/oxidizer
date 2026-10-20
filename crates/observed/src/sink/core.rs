@@ -11,7 +11,7 @@ use performables::arc::{Arc as PerformableArc, PerProcess};
 use tick::SimpleClock;
 
 use crate::context::Transfer;
-use crate::enrichment::{EnrichmentEntry, EnrichmentTransfer, Guard, Slot};
+use crate::enrichment::{EnrichmentEntry, EnrichmentTransfer, Guard, PushState, Slot};
 use crate::interop::DynEvent;
 use crate::metadata::{EventDescription, SourceLocation};
 use crate::processing::{EventProcessor, EventView, IntermediateEvent};
@@ -336,6 +336,14 @@ impl Sink {
             SinkInner::Single(state) => state.enrichment.push(entries),
             SinkInner::Composite { children } => Guard::merge(children.iter().map(|c| c.enrichment.push(PerformableArc::clone(&entries)))),
             SinkInner::Noop => Guard::empty(),
+        }
+    }
+
+    pub(crate) fn enrichment_push_state(&self, entries: PerformableArc<[EnrichmentEntry]>) -> PushState {
+        match &*self.inner {
+            SinkInner::Single(state) => PushState::new(entries, [state.enrichment.clone()]),
+            SinkInner::Composite { children } => PushState::new(entries, children.iter().map(|child| child.enrichment.clone())),
+            SinkInner::Noop => PushState::new(entries, std::iter::empty()),
         }
     }
 
