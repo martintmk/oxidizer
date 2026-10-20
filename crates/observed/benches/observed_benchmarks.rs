@@ -427,13 +427,14 @@ fn poll_pending(future: impl Future<Output = ()>) {
     }
 }
 
-fn composite_sink() -> Sink {
-    Sink::composite(BENCH_SINK_IDS[..3].iter().map(|&id| Sink::builder(id).build()))
+fn composite_sink(slot_count: usize) -> Sink {
+    Sink::composite(BENCH_SINK_IDS[..slot_count].iter().map(|&id| Sink::builder(id).build()))
 }
 
 #[metabench::benchmark(PENDING_ENRICHED_FUTURE, ALLOCATION, "pending_enriched_future_8_polls")]
 #[bench::single(&processor_free_sink())]
-#[bench::composite_3(&composite_sink())]
+#[bench::composite_3(&composite_sink(3))]
+#[bench::composite_8(&composite_sink(8))]
 /// Compares per-poll enrichment work without executor scheduling overhead.
 ///
 /// The future stays pending and is driven directly with a no-op waker; the
@@ -444,7 +445,8 @@ fn pending_enriched_future(sink: &Sink) {
 
 #[metabench::benchmark(POLL_PENDING_ENRICHED_FUTURE, ALLOCATION, "poll_pending_enriched_future_8_polls")]
 #[bench::single(pending_enriched_poll_state(&processor_free_sink()))]
-#[bench::composite_3(pending_enriched_poll_state(&composite_sink()))]
+#[bench::composite_3(pending_enriched_poll_state(&composite_sink(3)))]
+#[bench::composite_8(pending_enriched_poll_state(&composite_sink(8)))]
 /// Isolates steady-state enriched polling after construction and TLS first touch.
 fn poll_pending_enriched_future(mut state: PendingEnrichedPollState) -> PendingEnrichedPollState {
     const POLLS: u32 = 8;
@@ -568,8 +570,9 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     allocation.bench_function(BenchmarkId::new(ENRICHMENT_ENTRY_CLONE.benchmark_name(), "run"), |bencher| {
         bencher.iter(|| enrichment_entry_clone(black_box(&entries)));
     });
-    let composite = composite_sink();
-    for (case, case_sink) in [("single", &sink), ("composite_3", &composite)] {
+    let composite_3 = composite_sink(3);
+    let composite_8 = composite_sink(8);
+    for (case, case_sink) in [("single", &sink), ("composite_3", &composite_3), ("composite_8", &composite_8)] {
         allocation.bench_function(BenchmarkId::new(PENDING_ENRICHED_FUTURE.benchmark_name(), case), |bencher| {
             bencher.iter(|| pending_enriched_future(black_box(case_sink)));
         });

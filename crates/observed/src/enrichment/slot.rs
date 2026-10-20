@@ -71,17 +71,21 @@ impl Slot {
         let cell = self.0.get_or(|| RefCell::new(None));
         let mut current = cell.borrow_mut();
         let parent = current.clone();
-        let cached = node.get_or_insert_with(|| {
-            Arc::new(EnrichmentNode {
-                entries: Arc::clone(entries),
-                parent: None,
-            })
-        });
-        let pushed = match Arc::get_mut(cached) {
-            Some(cached_node) => {
-                cached_node.parent = parent;
-                Arc::clone(cached)
-            }
+        let pushed = match node {
+            Some(cached) => match Arc::get_mut(cached) {
+                Some(cached_node) => {
+                    cached_node.parent = parent;
+                    Arc::clone(cached)
+                }
+                None => {
+                    let pushed = Arc::new(EnrichmentNode {
+                        entries: Arc::clone(entries),
+                        parent,
+                    });
+                    *cached = Arc::clone(&pushed);
+                    pushed
+                }
+            },
             None => {
                 let pushed = Arc::new(EnrichmentNode {
                     entries: Arc::clone(entries),
@@ -233,15 +237,13 @@ impl Drop for PushedGuard<'_> {
             let slot = &mut self.state.slots[self.state.previous.len()];
             drop(slot.slot.replace(previous));
 
-            let reusable = if let Some(node) = slot.node.as_mut().and_then(Arc::get_mut) {
-                node.parent = None;
-                true
-            } else {
-                false
-            };
-            if !reusable {
-                slot.node = None;
+            if let Some(node) = slot.node.as_mut() {
+                if let Some(node) = Arc::get_mut(node) {
+                    node.parent = None;
+                    continue;
+                }
             }
+            slot.node = None;
         }
     }
 }
