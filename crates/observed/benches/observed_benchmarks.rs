@@ -33,6 +33,7 @@ const EMIT_ENRICHMENT: &str = "observed_benchmarks/emit_enrichment";
 const SINK_OPERATIONS: &str = "observed_benchmarks/sink_operations";
 const ALLOCATION: &str = "observed_benchmarks/allocation";
 const ENRICHMENT_TRANSFER: &str = "observed_benchmarks/enrichment_transfer";
+const ENRICHED_POLLS: u32 = 8;
 const BENCH_SINK_IDS: [&str; 8] = [
     "bench-0", "bench-1", "bench-2", "bench-3", "bench-4", "bench-5", "bench-6", "bench-7",
 ];
@@ -333,7 +334,7 @@ struct CapturingEnrichedPollState {
     captured: Rc<Cell<Option<Transfer>>>,
 }
 
-fn capturing_enriched_poll_state(sink: Sink) -> CapturingEnrichedPollState {
+fn capturing_enriched_poll_state(sink: &Sink) -> CapturingEnrichedPollState {
     let captured = Rc::new(Cell::new(None));
     let mut state = CapturingEnrichedPollState {
         future: Box::pin(
@@ -341,7 +342,7 @@ fn capturing_enriched_poll_state(sink: Sink) -> CapturingEnrichedPollState {
                 sink: sink.clone(),
                 captured: Rc::clone(&captured),
             }
-            .enrich(&sink, BenchEnrich1 { val: 42 }),
+            .enrich(sink, BenchEnrich1 { val: 42 }),
         ),
         captured,
     };
@@ -509,12 +510,10 @@ impl Future for AlwaysPending {
 }
 
 fn poll_pending(future: impl Future<Output = ()>) {
-    const POLLS: u32 = 8;
-
     let waker = task::Waker::noop();
     let mut cx = task::Context::from_waker(waker);
     let mut future = std::pin::pin!(future);
-    for _ in 0..POLLS {
+    for _ in 0..ENRICHED_POLLS {
         let _ = black_box(future.as_mut().poll(&mut cx));
     }
 }
@@ -541,20 +540,18 @@ fn pending_enriched_future(sink: &Sink) {
 #[bench::composite_8(pending_enriched_poll_state(&composite_sink(8)))]
 /// Isolates steady-state enriched polling after construction and TLS first touch.
 fn poll_pending_enriched_future(mut state: PendingEnrichedPollState) -> PendingEnrichedPollState {
-    const POLLS: u32 = 8;
-
     let waker = task::Waker::noop();
     let mut cx = task::Context::from_waker(waker);
-    for _ in 0..POLLS {
+    for _ in 0..ENRICHED_POLLS {
         let _ = black_box(state.future.as_mut().poll(&mut cx));
     }
     state
 }
 
 #[metabench::benchmark(POLL_CAPTURED_ENRICHED_FUTURE, ENRICHMENT_TRANSFER, "poll_captured_enriched_future_8_polls")]
-#[bench::single(capturing_enriched_poll_state(processor_free_sink()))]
-#[bench::composite_3(capturing_enriched_poll_state(composite_sink(3)))]
-#[bench::composite_8(capturing_enriched_poll_state(composite_sink(8)))]
+#[bench::single(capturing_enriched_poll_state(&processor_free_sink()))]
+#[bench::composite_3(capturing_enriched_poll_state(&composite_sink(3)))]
+#[bench::composite_8(capturing_enriched_poll_state(&composite_sink(8)))]
 /// Measures polling when the active enrichment snapshot is captured each time.
 ///
 /// Each capture outlives the poll guard, forcing the future to evict its shared
@@ -562,11 +559,9 @@ fn poll_pending_enriched_future(mut state: PendingEnrichedPollState) -> PendingE
 /// those nodes, preserving captured snapshot immutability without accumulating
 /// transfers across iterations.
 fn poll_captured_enriched_future(mut state: CapturingEnrichedPollState) -> CapturingEnrichedPollState {
-    const POLLS: u32 = 8;
-
     let waker = task::Waker::noop();
     let mut cx = task::Context::from_waker(waker);
-    for _ in 0..POLLS {
+    for _ in 0..ENRICHED_POLLS {
         let _ = black_box(state.future.as_mut().poll(&mut cx));
         drop(black_box(state.captured.take()));
     }
@@ -634,7 +629,7 @@ fn capture_enrichment_context(state: &EnrichedSinkState) -> Transfer {
     black_box(state.sink.transfer_context())
 }
 
-fn criterion_benchmarks(criterion: &mut Criterion) {
+fn criterion_emit_pipeline(criterion: &mut Criterion) {
     let mut emit_pipeline = criterion.benchmark_group(EMIT_PIPELINE);
     let emit = emit_state();
     emit_pipeline.bench_function(BenchmarkId::new(EMIT_SIMPLE_LOG.benchmark_name(), "run"), |bencher| {
@@ -654,7 +649,9 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         bencher.iter(|| emit_redacted_strings(black_box(&redacted)));
     });
     emit_pipeline.finish();
+}
 
+fn criterion_emit_composite(criterion: &mut Criterion) {
     let mut emit_composite = criterion.benchmark_group(EMIT_COMPOSITE);
     let traversal_single = traversal_sink(1);
     let traversal_3 = traversal_sink(3);
@@ -669,7 +666,9 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         });
     }
     emit_composite.finish();
+}
 
+fn criterion_emit_enrichment(criterion: &mut Criterion) {
     let mut enrichment = criterion.benchmark_group(EMIT_ENRICHMENT);
     let enriched = enriched_emit_state(3);
     enrichment.bench_function(BenchmarkId::new(EMIT_WITH_ENRICHMENTS.benchmark_name(), "run"), |bencher| {
@@ -686,7 +685,9 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         });
     }
     enrichment.finish();
+}
 
+fn criterion_sink_operations(criterion: &mut Criterion) {
     let mut sink_operations = criterion.benchmark_group(SINK_OPERATIONS);
     let clock = tick::SimpleClock::new_system();
     sink_operations.bench_function(BenchmarkId::new(CONSTRUCT_PROCESSOR_FREE_SINK.benchmark_name(), "run"), |bencher| {
@@ -697,7 +698,9 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         bencher.iter(|| emit_to_noop_sink(black_box(&noop)));
     });
     sink_operations.finish();
+}
 
+fn criterion_allocation(criterion: &mut Criterion) {
     let mut allocation = criterion.benchmark_group(ALLOCATION);
     for (case, state) in [("three_entries", enriched_sink_state(3)), ("ten_nested", enriched_sink_state(10))] {
         allocation.bench_function(BenchmarkId::new(ENRICHMENT_COLLECT.benchmark_name(), case), |bencher| {
@@ -708,6 +711,7 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     allocation.bench_function(BenchmarkId::new(ENRICHMENT_ENTRY_CLONE.benchmark_name(), "run"), |bencher| {
         bencher.iter(|| enrichment_entry_clone(black_box(&entries)));
     });
+    let sink = processor_free_sink();
     let composite_3 = composite_sink(3);
     let composite_8 = composite_sink(8);
     for (case, case_sink) in [("single", &sink), ("composite_3", &composite_3), ("composite_8", &composite_8)] {
@@ -739,7 +743,9 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         });
     }
     allocation.finish();
+}
 
+fn criterion_enrichment_transfer(criterion: &mut Criterion) {
     let mut transfer = criterion.benchmark_group(ENRICHMENT_TRANSFER);
     for (case, slot_count) in [("single_slot", 1), ("three_slots", 3), ("eight_slots", 8)] {
         transfer.bench_function(BenchmarkId::new(POLL_ATTACHED.benchmark_name(), case), |bencher| {
@@ -753,7 +759,7 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     for (case, slot_count) in [("single", 1), ("composite_3", 3), ("composite_8", 8)] {
         transfer.bench_function(BenchmarkId::new(POLL_CAPTURED_ENRICHED_FUTURE.benchmark_name(), case), |bencher| {
             bencher.iter_batched(
-                || capturing_enriched_poll_state(sink_with_slots(slot_count)),
+                || capturing_enriched_poll_state(&sink_with_slots(slot_count)),
                 |state| black_box(poll_captured_enriched_future(state)),
                 BatchSize::SmallInput,
             );
@@ -769,6 +775,15 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         });
     }
     transfer.finish();
+}
+
+fn criterion_benchmarks(criterion: &mut Criterion) {
+    criterion_emit_pipeline(criterion);
+    criterion_emit_composite(criterion);
+    criterion_emit_enrichment(criterion);
+    criterion_sink_operations(criterion);
+    criterion_allocation(criterion);
+    criterion_enrichment_transfer(criterion);
 }
 
 metabench::main!(

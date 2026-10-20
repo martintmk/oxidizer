@@ -362,6 +362,10 @@ impl Sink {
     ///
     /// It's automatically called by the `emit!` macro expansion, and can be called directly for
     /// [`DynEvent`s](DynEvent)
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "sink construction limits the processor count to the 64-bit dispatch mask"
+    )]
     pub(crate) fn emit_impl<'a, T: Event, F: FnOnce() -> T + 'a>(&self, state: IntermediateEvent<'a, F>) {
         let sinks = match &*self.inner {
             SinkInner::Single(sink) if !sink.processors.is_empty() => slice::from_ref(sink),
@@ -565,6 +569,17 @@ mod tests {
         assert!(sink.is_noop());
         assert!(sink.current_enrichments().is_empty());
         drop(transfer.apply_current_thread());
+    }
+
+    #[test]
+    fn noop_sink_enrichment_push_state_applies_nothing() {
+        let sink = Sink::noop();
+        let entries = PerformableArc::from(vec![EnrichmentEntry::unclassified("ignored", 1_i64)]);
+        let mut state = sink.enrichment_push_state(entries);
+
+        let _guard = state.apply();
+
+        assert!(sink.current_enrichments().is_empty());
     }
 
     struct DummyDyn;
