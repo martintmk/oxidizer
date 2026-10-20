@@ -30,7 +30,9 @@ const EMIT_ENRICHMENT: &str = "observed_benchmarks/emit_enrichment";
 const SINK_OPERATIONS: &str = "observed_benchmarks/sink_operations";
 const ALLOCATION: &str = "observed_benchmarks/allocation";
 const ENRICHMENT_TRANSFER: &str = "observed_benchmarks/enrichment_transfer";
-const BENCH_SINK_IDS: [&str; 3] = ["bench-0", "bench-1", "bench-2"];
+const BENCH_SINK_IDS: [&str; 8] = [
+    "bench-0", "bench-1", "bench-2", "bench-3", "bench-4", "bench-5", "bench-6", "bench-7",
+];
 
 #[event("bench.simple_log")]
 #[info]
@@ -412,7 +414,7 @@ fn poll_pending(future: impl Future<Output = ()>) {
 }
 
 fn composite_sink() -> Sink {
-    Sink::composite(BENCH_SINK_IDS.iter().map(|&id| Sink::builder(id).build()))
+    Sink::composite(BENCH_SINK_IDS[..3].iter().map(|&id| Sink::builder(id).build()))
 }
 
 #[metabench::benchmark(PENDING_ENRICHED_FUTURE, ALLOCATION, "pending_enriched_future_8_polls")]
@@ -466,10 +468,11 @@ fn emit_enrichment_depth(state: &EnrichedEmitState) {
 #[metabench::benchmark(POLL_ATTACHED, ENRICHMENT_TRANSFER, "poll_attached")]
 #[bench::single_slot(attached_poll_state(1))]
 #[bench::three_slots(attached_poll_state(3))]
+#[bench::eight_slots(attached_poll_state(8))]
 /// Measures the attached-future hot path that applies borrowed transfer state.
 ///
-/// The single leaf is the lower bound; the small composite represents common
-/// fan-out without treating the result as a per-slot scaling model.
+/// The single leaf is the lower bound, the small composite represents common
+/// fan-out, and eight slots exercise storage beyond the inline capacity.
 fn poll_attached(mut state: AttachedPollState) -> AttachedPollState {
     let waker = task::Waker::noop();
     let mut cx = task::Context::from_waker(waker);
@@ -561,7 +564,7 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     allocation.finish();
 
     let mut transfer = criterion.benchmark_group(ENRICHMENT_TRANSFER);
-    for (case, slot_count) in [("single_slot", 1), ("three_slots", 3)] {
+    for (case, slot_count) in [("single_slot", 1), ("three_slots", 3), ("eight_slots", 8)] {
         transfer.bench_function(BenchmarkId::new(POLL_ATTACHED.benchmark_name(), case), |bencher| {
             bencher.iter_batched(
                 || attached_poll_state(slot_count),

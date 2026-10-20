@@ -137,13 +137,31 @@ impl Drop for Guard {
     }
 }
 
+/// Reusable restoration scratch space for an attached future.
+///
+/// Capacity is fixed from the transfer's immutable slot count and retained
+/// only until the attached future is dropped.
+#[derive(Debug)]
+pub(crate) struct ApplyState {
+    previous: SmallVec<[OptEnrichmentNode; INLINE_SLOT_CAPACITY]>,
+}
+
+impl ApplyState {
+    fn new(slot_count: usize) -> Self {
+        Self {
+            previous: SmallVec::with_capacity(slot_count),
+        }
+    }
+}
+
 /// Restores slot heads installed by an [`EnrichmentTransfer`].
 ///
-/// The transfer already owns every captured [`Slot`], so this guard borrows
-/// those handles instead of cloning their reference counts on every apply.
+/// Borrows reusable storage owned by the attached future so transfers with
+/// more than [`INLINE_SLOT_CAPACITY`] slots do not allocate on every poll.
 #[must_use]
 pub(crate) struct AppliedGuard<'a> {
-    slots: SmallVec<[(&'a Slot, OptEnrichmentNode); INLINE_SLOT_CAPACITY]>,
+    slots: &'a [(Slot, OptEnrichmentNode)],
+    state: &'a mut ApplyState,
 }
 
 impl std::fmt::Debug for AppliedGuard<'_> {
@@ -154,7 +172,9 @@ impl std::fmt::Debug for AppliedGuard<'_> {
 
 impl Drop for AppliedGuard<'_> {
     fn drop(&mut self) {
-        for (slot, prev) in self.slots.drain(..).rev() {
+        debug_assert_eq!(self.slots.len(), self.state.previous.len());
+        while let Some(prev) = self.state.previous.pop() {
+            let slot = &self.slots[self.state.previous.len()].0;
             let _ = slot.replace(prev);
         }
     }
@@ -189,13 +209,18 @@ impl EnrichmentTransfer {
     ///
     /// Borrows `self` so the same transfer can be applied repeatedly (e.g.
     /// from a future's `poll` loop) without cloning the captured slots.
-    pub(crate) fn apply(&self) -> AppliedGuard<'_> {
-        let mut slots = SmallVec::with_capacity(self.slots.len());
+    pub(crate) fn apply_state(&self) -> ApplyState {
+        ApplyState::new(self.slots.len())
+    }
+
+    /// Restores captured heads using scratch storage retained by the caller.
+    pub(crate) fn apply<'a>(&'a self, state: &'a mut ApplyState) -> AppliedGuard<'a> {
+        debug_assert!(state.previous.is_empty());
         for (slot, head) in &self.slots {
             let prev = slot.replace(head.clone());
-            slots.push((slot, prev));
+            state.previous.push(prev);
         }
-        AppliedGuard { slots }
+        AppliedGuard { slots: &self.slots, state }
     }
 
     /// Restores captured heads with an owned guard that can outlive this transfer.
@@ -352,7 +377,8 @@ mod coverage_tests {
         transfer.push(TestEnrichment("global"));
         transfer.push_for(SinkId::new("target"), TestEnrichment("targeted"));
 
-        let guard = transfer.apply();
+        let mut state = transfer.apply_state();
+        let guard = transfer.apply(&mut state);
         let entries = chain_entries(&slot.current());
 
         assert_eq!(entries.len(), 2, "both pushes must reach the captured slot");
@@ -391,7 +417,8 @@ mod coverage_tests {
         transfer.push(EmptyEnrichment);
         transfer.push_for(SinkId::new("target"), EmptyEnrichment);
 
-        let guard = transfer.apply();
+        let mut state = transfer.apply_state();
+        let guard = transfer.apply(&mut state);
         assert!(slot.current().is_none());
 
         drop(guard);
@@ -430,10 +457,19 @@ mod coverage_tests {
             })
             .collect();
 
-        {
-            let _guard = transfer.apply();
+        let mut state = transfer.apply_state();
+        let capacity = state.previous.capacity();
+        for _ in 0..2 {
+            {
+                let _guard = transfer.apply(&mut state);
+                for slot in &slots {
+                    assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "captured");
+                }
+            }
+            assert!(state.previous.is_empty());
+            assert_eq!(state.previous.capacity(), capacity);
             for slot in &slots {
-                assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "captured");
+                assert_eq!(chain_entries(&slot.current())[0].key().as_str(), "previous");
             }
         }
 
@@ -477,7 +513,9 @@ mod coverage_tests {
         transfer.add_slot(&slot);
         assert!(format!("{transfer:?}").contains("EnrichmentTransfer"));
 
-        let applied_guard = transfer.apply();
+        let mut state = transfer.apply_state();
+        assert!(format!("{state:?}").contains("ApplyState"));
+        let applied_guard = transfer.apply(&mut state);
         assert!(format!("{applied_guard:?}").contains("AppliedGuard"));
     }
 }
