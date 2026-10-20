@@ -63,6 +63,37 @@ impl Slot {
         cell.replace(node)
     }
 
+    /// Installs a reusable node with one TLS lookup and one mutable borrow.
+    ///
+    /// The replacement is built before the slot changes, so an allocation
+    /// panic leaves the current chain intact.
+    fn push_reusable(&self, entries: &Arc<[EnrichmentEntry]>, node: &mut Option<Arc<EnrichmentNode>>) -> OptEnrichmentNode {
+        let cell = self.0.get_or(|| RefCell::new(None));
+        let mut current = cell.borrow_mut();
+        let parent = current.clone();
+        let cached = node.get_or_insert_with(|| {
+            Arc::new(EnrichmentNode {
+                entries: Arc::clone(entries),
+                parent: None,
+            })
+        });
+        let pushed = match Arc::get_mut(cached) {
+            Some(cached_node) => {
+                cached_node.parent = parent;
+                Arc::clone(cached)
+            }
+            None => {
+                let pushed = Arc::new(EnrichmentNode {
+                    entries: Arc::clone(entries),
+                    parent,
+                });
+                *node = Some(Arc::clone(&pushed));
+                pushed
+            }
+        };
+        std::mem::replace(&mut current, Some(pushed))
+    }
+
     /// Pushes entries onto the enrichment chain and returns a guard.
     ///
     /// An empty layer installs no chain node and records no restoration, so the
@@ -182,28 +213,8 @@ impl PushState {
     pub(crate) fn apply(&mut self) -> PushedGuard<'_> {
         debug_assert!(self.previous.is_empty());
         for slot in &mut self.slots {
-            let parent = slot.slot.current();
-            let cached = slot.node.get_or_insert_with(|| {
-                Arc::new(EnrichmentNode {
-                    entries: Arc::clone(&self.entries),
-                    parent: None,
-                })
-            });
-            let node = match Arc::get_mut(cached) {
-                Some(node) => {
-                    node.parent = parent;
-                    Arc::clone(cached)
-                }
-                None => {
-                    let node = Arc::new(EnrichmentNode {
-                        entries: Arc::clone(&self.entries),
-                        parent,
-                    });
-                    slot.node = Some(Arc::clone(&node));
-                    node
-                }
-            };
-            self.previous.push(slot.slot.replace(Some(node)));
+            let PushSlot { slot, node } = slot;
+            self.previous.push(slot.push_reusable(&self.entries, node));
         }
         PushedGuard { state: self }
     }
@@ -484,6 +495,23 @@ mod coverage_tests {
             assert!(state.slots[0].node.as_ref().unwrap().parent.is_none());
         }
 
+        drop(parent_guard);
+    }
+
+    #[test]
+    fn push_state_restores_the_parent_during_unwind() {
+        let slot = Slot::new();
+        let parent_guard = slot.push(Arc::from(vec![EnrichmentEntry::unclassified("parent", 1_i64)]));
+        let parent = slot.current().unwrap();
+        let mut state = PushState::new(Arc::from(vec![EnrichmentEntry::unclassified("pushed", 2_i64)]), [slot.clone()]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.apply();
+            panic!("exercise pushed guard unwind restoration");
+        }));
+
+        assert!(result.is_err());
+        assert!(Arc::ptr_eq(slot.current().as_ref().unwrap(), &parent));
         drop(parent_guard);
     }
 

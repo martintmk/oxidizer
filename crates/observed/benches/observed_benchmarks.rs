@@ -16,7 +16,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion};
 use data_privacy::{DataClass, Sensitive};
 use observed::__private::EnrichmentEntry;
 use observed::context::{Transfer, Transferred};
-use observed::enrichment::{EnrichFnExt, EnrichFutureExt};
+use observed::enrichment::{EnrichFnExt, EnrichFutureExt, Enriched};
 use observed::{Enrichment, Key, Sink, Value, event};
 use opentelemetry::logs::LoggerProvider;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
@@ -259,6 +259,20 @@ fn attached_poll_state(slot_count: usize) -> AttachedPollState {
     }
 }
 
+struct PendingEnrichedPollState {
+    future: Pin<Box<Enriched<AlwaysPending>>>,
+}
+
+fn pending_enriched_poll_state(sink: &Sink) -> PendingEnrichedPollState {
+    let mut state = PendingEnrichedPollState {
+        future: Box::pin(AlwaysPending.enrich(sink, BenchEnrich1 { val: 42 })),
+    };
+    let waker = task::Waker::noop();
+    let mut cx = task::Context::from_waker(waker);
+    let _ = state.future.as_mut().poll(&mut cx);
+    state
+}
+
 #[metabench::benchmark(EMIT_SIMPLE_LOG, EMIT_PIPELINE, "simple_log_2_fields")]
 #[bench::run(&emit_state())]
 fn emit_simple_log(state: &EmitState) {
@@ -428,6 +442,21 @@ fn pending_enriched_future(sink: &Sink) {
     poll_pending(AlwaysPending.enrich(sink, BenchEnrich1 { val: 42 }));
 }
 
+#[metabench::benchmark(POLL_PENDING_ENRICHED_FUTURE, ALLOCATION, "poll_pending_enriched_future_8_polls")]
+#[bench::single(pending_enriched_poll_state(&processor_free_sink()))]
+#[bench::composite_3(pending_enriched_poll_state(&composite_sink()))]
+/// Isolates steady-state enriched polling after construction and TLS first touch.
+fn poll_pending_enriched_future(mut state: PendingEnrichedPollState) -> PendingEnrichedPollState {
+    const POLLS: u32 = 8;
+
+    let waker = task::Waker::noop();
+    let mut cx = task::Context::from_waker(waker);
+    for _ in 0..POLLS {
+        let _ = black_box(state.future.as_mut().poll(&mut cx));
+    }
+    state
+}
+
 #[metabench::benchmark(KEY_VALUE_CREATION, ALLOCATION, "key_value_creation")]
 #[bench::string_value(false)]
 #[bench::i64_value(true)]
@@ -544,6 +573,13 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
         allocation.bench_function(BenchmarkId::new(PENDING_ENRICHED_FUTURE.benchmark_name(), case), |bencher| {
             bencher.iter(|| pending_enriched_future(black_box(case_sink)));
         });
+        allocation.bench_function(BenchmarkId::new(POLL_PENDING_ENRICHED_FUTURE.benchmark_name(), case), |bencher| {
+            bencher.iter_batched(
+                || pending_enriched_poll_state(case_sink),
+                |state| black_box(poll_pending_enriched_future(state)),
+                BatchSize::SmallInput,
+            );
+        });
     }
     for (case, integer) in [("string_value", false), ("i64_value", true)] {
         allocation.bench_function(BenchmarkId::new(KEY_VALUE_CREATION.benchmark_name(), case), |bencher| {
@@ -592,6 +628,7 @@ metabench::main!(
         ENRICHMENT_COLLECT,
         ENRICHMENT_ENTRY_CLONE,
         PENDING_ENRICHED_FUTURE,
+        POLL_PENDING_ENRICHED_FUTURE,
         KEY_VALUE_CREATION,
         REDACTED_VALUE_CREATION,
         EMIT_ENRICHMENT_DEPTH,
