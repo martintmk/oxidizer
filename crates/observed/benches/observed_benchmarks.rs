@@ -7,8 +7,10 @@
 //! `cargo bench -p observed --features test-util --bench observed_benchmarks`.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::hint::black_box;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{self, Poll};
 
@@ -240,13 +242,17 @@ fn applied_enrichment(sink: &Sink, depth: usize) -> Box<dyn Any> {
 }
 
 fn transfer_with_entries(slot_count: usize) -> Transfer {
-    let sink = if slot_count == 1 {
-        processor_free_sink()
-    } else {
-        Sink::composite(BENCH_SINK_IDS[..slot_count].iter().map(|&id| Sink::builder(id).build()))
-    };
+    let sink = sink_with_slots(slot_count);
 
     (|| sink.transfer_context()).enrich(&sink, BenchEnrich1 { val: 42 })()
+}
+
+fn sink_with_slots(slot_count: usize) -> Sink {
+    if slot_count == 1 {
+        processor_free_sink()
+    } else {
+        composite_sink(slot_count)
+    }
 }
 
 struct AttachedPollState {
@@ -270,6 +276,45 @@ fn pending_enriched_poll_state(sink: &Sink) -> PendingEnrichedPollState {
     let waker = task::Waker::noop();
     let mut cx = task::Context::from_waker(waker);
     let _ = state.future.as_mut().poll(&mut cx);
+    state
+}
+
+struct CaptureOnPoll {
+    sink: Sink,
+    captured: Rc<Cell<Option<Transfer>>>,
+}
+
+impl Future for CaptureOnPoll {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        self.captured.set(Some(self.sink.transfer_context()));
+        Poll::Pending
+    }
+}
+
+struct CapturingEnrichedPollState {
+    future: Pin<Box<Enriched<CaptureOnPoll>>>,
+    captured: Rc<Cell<Option<Transfer>>>,
+}
+
+fn capturing_enriched_poll_state(sink: Sink) -> CapturingEnrichedPollState {
+    let captured = Rc::new(Cell::new(None));
+    let mut state = CapturingEnrichedPollState {
+        future: Box::pin(
+            CaptureOnPoll {
+                sink: sink.clone(),
+                captured: Rc::clone(&captured),
+            }
+            .enrich(&sink, BenchEnrich1 { val: 42 }),
+        ),
+        captured,
+    };
+
+    let waker = task::Waker::noop();
+    let mut cx = task::Context::from_waker(waker);
+    let _ = state.future.as_mut().poll(&mut cx);
+    drop(black_box(state.captured.take()));
     state
 }
 
@@ -459,6 +504,28 @@ fn poll_pending_enriched_future(mut state: PendingEnrichedPollState) -> PendingE
     state
 }
 
+#[metabench::benchmark(POLL_CAPTURED_ENRICHED_FUTURE, ENRICHMENT_TRANSFER, "poll_captured_enriched_future_8_polls")]
+#[bench::single(capturing_enriched_poll_state(processor_free_sink()))]
+#[bench::composite_3(capturing_enriched_poll_state(composite_sink(3)))]
+#[bench::composite_8(capturing_enriched_poll_state(composite_sink(8)))]
+/// Measures polling when the active enrichment snapshot is captured each time.
+///
+/// Each capture outlives the poll guard, forcing the future to evict its shared
+/// reusable nodes. The transfer is then consumed before the next poll rebuilds
+/// those nodes, preserving captured snapshot immutability without accumulating
+/// transfers across iterations.
+fn poll_captured_enriched_future(mut state: CapturingEnrichedPollState) -> CapturingEnrichedPollState {
+    const POLLS: u32 = 8;
+
+    let waker = task::Waker::noop();
+    let mut cx = task::Context::from_waker(waker);
+    for _ in 0..POLLS {
+        let _ = black_box(state.future.as_mut().poll(&mut cx));
+        drop(black_box(state.captured.take()));
+    }
+    state
+}
+
 #[metabench::benchmark(KEY_VALUE_CREATION, ALLOCATION, "key_value_creation")]
 #[bench::string_value(false)]
 #[bench::i64_value(true)]
@@ -612,6 +679,15 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
             );
         });
     }
+    for (case, slot_count) in [("single", 1), ("composite_3", 3), ("composite_8", 8)] {
+        transfer.bench_function(BenchmarkId::new(POLL_CAPTURED_ENRICHED_FUTURE.benchmark_name(), case), |bencher| {
+            bencher.iter_batched(
+                || capturing_enriched_poll_state(sink_with_slots(slot_count)),
+                |state| black_box(poll_captured_enriched_future(state)),
+                BatchSize::SmallInput,
+            );
+        });
+    }
     transfer.finish();
 }
 
@@ -636,5 +712,6 @@ metabench::main!(
         REDACTED_VALUE_CREATION,
         EMIT_ENRICHMENT_DEPTH,
         POLL_ATTACHED,
+        POLL_CAPTURED_ENRICHED_FUTURE,
     ],
 );
