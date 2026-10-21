@@ -60,6 +60,25 @@ stop commands so workers can reject or dispose queued factories without waiting
 for FIFO delivery. The worker must complete executor retirement before its
 unsafe executor storage is dropped.
 
+`ShutdownSignal` is a shared, monotonic flag: the first request starts shutdown
+and later requests are idempotent. Its atomic operations use relaxed ordering
+because the flag carries no data payload. Command channels, locks, and thread
+joins independently synchronize the runtime state.
+
+The worker checks shutdown before admitting commands, after a nonempty command
+batch, and after task polling and timer callbacks. Task commands only register
+deferred futures, so they do not need an individual check; the deferred future
+checks again before invoking its user factory. Synchronous I/O access commands
+have their own admission check. Blocking submissions check at admission and
+again on the pool thread before invoking the callback.
+
+The worker and executor share a fast system clock for cycle measurements, timer
+advancement, and wait budgets. The executor's completion timestamp is reused
+directly for timer advancement. Controlled-clock auto-advancement runs inside
+the timer driver after task polling, independently of cycle timing. Final
+shutdown uses a precise system sample so due timers registered during task
+cancellation are not missed by a coarse clock sample.
+
 ## Scoped borrowed work
 
 [`task/runtime_scheduler.rs`](../src/task/runtime_scheduler.rs) lets

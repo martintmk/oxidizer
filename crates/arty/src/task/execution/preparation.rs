@@ -3,15 +3,14 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use arty_executor::remote::{Pool as RemotePool, Sender as RemoteSender};
 use arty_executor::{TaskOptions, TaskPlacement, TaskSet, discard_task_panic_payload};
 use observed::context::Transfer;
-use performables::arc::Arc;
 use pin_project::pin_project;
 
+use crate::runtime::ShutdownSignal;
 use crate::task::Builtins;
 use crate::task::join::JoinHandle;
 
@@ -20,12 +19,12 @@ pub(crate) struct DeferredTask<FF, F> {
     factory: Option<(FF, Builtins)>,
     #[pin]
     future: Option<F>,
-    shutdown_signal: Arc<AtomicBool>,
+    shutdown_signal: ShutdownSignal,
     cancelled: bool,
 }
 
 impl<FF, F> DeferredTask<FF, F> {
-    pub(crate) fn new(factory: FF, builtins: Builtins, shutdown_signal: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(factory: FF, builtins: Builtins, shutdown_signal: ShutdownSignal) -> Self {
         Self {
             factory: Some((factory, builtins)),
             future: None,
@@ -48,7 +47,7 @@ where
             return Poll::Pending;
         }
         if this.future.as_ref().get_ref().is_none() {
-            if this.shutdown_signal.load(Ordering::Acquire) {
+            if this.shutdown_signal.shutdown_requested() {
                 *this.cancelled = true;
                 return Poll::Pending;
             }
@@ -113,7 +112,7 @@ pub(crate) fn prepare_remote<FF, F, R>(
     future_factory: FF,
     parent_task_enrichment: Transfer,
     placement: TaskPlacement,
-    shutdown_signal: Arc<AtomicBool>,
+    shutdown_signal: ShutdownSignal,
 ) -> (BoxedRemoteFutureFactory, JoinHandle<R>)
 where
     FF: FnOnce(Builtins) -> F + Send + 'static,
@@ -185,6 +184,7 @@ mod tests {
     use std::pin::pin;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Wake, Waker};
 
     use arty_executor::{CycleOutcome, Executor};
@@ -220,7 +220,7 @@ mod tests {
             },
             sink.transfer_context(),
             TaskPlacement::Any,
-            performables::arc::Arc::new(AtomicBool::new(false)),
+            ShutdownSignal::default(),
         );
 
         let executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
@@ -238,7 +238,8 @@ mod tests {
         let (runtime, builtins) = test_builtins();
         let invoked = Arc::new(AtomicBool::new(false));
         let factory_invoked = Arc::clone(&invoked);
-        let shutdown = performables::arc::Arc::new(AtomicBool::new(true));
+        let shutdown = ShutdownSignal::default();
+        shutdown.request_shutdown();
         let mut task = pin!(DeferredTask::new(
             move |_| {
                 factory_invoked.store(true, Ordering::Release);
@@ -257,7 +258,7 @@ mod tests {
 
     /// Drives the executor until it reports that no further progress can be made.
     fn run_to_completion(executor: &Executor) {
-        while executor.execute_cycle() == CycleOutcome::Continue {}
+        while executor.execute_cycle().0 == CycleOutcome::Continue {}
     }
 
     struct PanicWake;
@@ -298,7 +299,7 @@ mod tests {
             |_| -> std::future::Ready<()> { panic_any(Payload(42)) },
             sink.transfer_context(),
             TaskPlacement::Any,
-            performables::arc::Arc::new(AtomicBool::new(false)),
+            ShutdownSignal::default(),
         );
         let executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
         let (_runtime, builtins) = test_builtins();

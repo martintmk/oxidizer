@@ -15,7 +15,7 @@ pub(crate) fn new_guarded_executor(owner_waker: Waker) -> ScopeGuard<Executor, f
     scopeguard::guard(Executor::builder().owner_waker(owner_waker).build(), |executor: Executor| {
         executor.begin_shutdown();
 
-        while executor.execute_cycle() != CycleOutcome::Shutdown {
+        while executor.execute_cycle().0 != CycleOutcome::Shutdown {
             thread::yield_now();
         }
     })

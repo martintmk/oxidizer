@@ -27,11 +27,11 @@ fn retained_waker_is_noop_after_shutdown() {
         TaskOptions::default(),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     let retained = retained.borrow_mut().take().unwrap();
     drop(task);
     executor.begin_shutdown();
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
     drop(executor);
 
     std::thread::spawn(move || {
@@ -68,11 +68,11 @@ fn owner_waker_panic_does_not_prevent_shutdown() {
         }),
         TaskOptions::default(),
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     let retained = retained.borrow_mut().take().unwrap();
 
     assert!(catch_unwind(AssertUnwindSafe(|| retained.wake())).is_err());
     drop(task);
     executor.begin_shutdown();
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
 }

@@ -136,7 +136,7 @@ fn retained_waker_after_executor_drop() -> Waker {
         TaskOptions::default(),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     let retained = captured.borrow_mut().take().expect("the task captured its waker");
     drop(executor);
     drop(handle);
@@ -148,7 +148,7 @@ fn retained_waker_after_executor_drop() -> Waker {
 #[bench::idle(&cycle_state(false))]
 #[bench::pending_task(&cycle_state(true))]
 fn execute_cycle(state: &CycleState) -> CycleOutcome {
-    state.executor.execute_cycle()
+    state.executor.execute_cycle().0
 }
 
 #[metabench::benchmark(ADD_TASK, TASK, "add_task")]
@@ -163,7 +163,7 @@ fn add_task(state: &ExecutorState) -> JoinHandle<()> {
 fn self_waking_task(state: &SelfWakingState) -> CycleOutcome {
     let mut outcome = CycleOutcome::Suspend;
     for _ in 0..SELF_WAKING_POLL_COUNT {
-        outcome = state.executor.execute_cycle();
+        outcome = state.executor.execute_cycle().0;
     }
     outcome
 }
@@ -171,7 +171,7 @@ fn self_waking_task(state: &SelfWakingState) -> CycleOutcome {
 #[metabench::benchmark(CLONE_WAKER_DURING_CYCLE, WAKER, "clone_during_cycle")]
 #[bench::pending_task(&clone_waker_state())]
 fn clone_waker_during_cycle(state: &CloneWakerState) -> CycleOutcome {
-    state.executor.execute_cycle()
+    state.executor.execute_cycle().0
 }
 
 #[metabench::benchmark(RETAINED_WAKER_AFTER_DROP, WAKER, "retained_after_executor_drop")]

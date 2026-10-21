@@ -60,7 +60,7 @@ fn spawn_and_complete_one_only_allocates_debug_bookkeeping() {
     for _ in 0..WARM_UP_OPERATIONS {
         assert_eq!(spawn_complete_once(&executor, &tasks), Poll::Ready(Ok(())));
     }
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
 
     let session = Session::new().no_stdout().no_file();
     let operation = session.operation("spawn_and_complete_one");
@@ -85,9 +85,9 @@ fn spawn_and_complete_one_only_allocates_debug_bookkeeping() {
     #[cfg(debug_assertions)]
     assert_ne!(bytes, 0, "debug bookkeeping must be visible to the allocation tracker");
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     executor.begin_shutdown();
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn remote_spawn_reuses_cross_thread_result_channel_storage() {
     for _ in 0..WARM_UP_OPERATIONS {
         assert_eq!(spawn_remote_complete_once(&executor, &tasks, &result_pool), Poll::Ready(Ok(())));
     }
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
 
     let session = Session::new().no_stdout().no_file();
     let operation = session.operation("spawn_remote_complete_one");
@@ -122,5 +122,5 @@ fn remote_spawn_reuses_cross_thread_result_channel_storage() {
     assert_ne!(bytes, 0, "debug bookkeeping must be visible to the allocation tracker");
 
     executor.begin_shutdown();
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
 }

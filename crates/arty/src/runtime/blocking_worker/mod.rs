@@ -18,6 +18,7 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use performables::sync::mutex::Mutex;
 
+use crate::runtime::ShutdownSignal;
 use crate::runtime::telemetry::events::{BlockingWorkerPoolMode, BlockingWorkerPoolSaturated, SystemMetricCount};
 use crate::task::execution::prepare_blocking;
 use crate::task::join::JoinHandle;
@@ -165,7 +166,7 @@ impl fmt::Debug for JoinableThreadPool {
 pub(crate) struct BlockingWorker {
     pool: BlockingPool,
     is_shutting_down: Arc<AtomicBool>,
-    runtime_shutdown: Arc<AtomicBool>,
+    runtime_shutdown: ShutdownSignal,
     sink: Sink,
     remote_results: RemotePool,
 }
@@ -173,10 +174,10 @@ pub(crate) struct BlockingWorker {
 impl BlockingWorker {
     #[cfg(test)]
     pub(crate) fn new(pool: BlockingPool, sink: Sink) -> Arc<Self> {
-        Self::new_with_shutdown(pool, sink, Arc::new(AtomicBool::new(false)))
+        Self::new_with_shutdown(pool, sink, ShutdownSignal::default())
     }
 
-    pub(crate) fn new_with_shutdown(pool: BlockingPool, sink: Sink, runtime_shutdown: Arc<AtomicBool>) -> Arc<Self> {
+    pub(crate) fn new_with_shutdown(pool: BlockingPool, sink: Sink, runtime_shutdown: ShutdownSignal) -> Arc<Self> {
         Arc::new(Self {
             pool,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
@@ -208,16 +209,16 @@ impl BlockingWorker {
         let identity = Arc::clone(&self.pool.identity);
         let pool = self.pool.clone();
         let shutdown = Arc::clone(&self.is_shutting_down);
-        let runtime_shutdown = Arc::clone(&self.runtime_shutdown);
+        let runtime_shutdown = self.runtime_shutdown.clone();
         let (task, join_handle) = prepare_blocking(&self.remote_results, body);
-        if shutdown.load(Ordering::Acquire) || runtime_shutdown.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire) || runtime_shutdown.shutdown_requested() {
             drop(task);
             return join_handle;
         }
         let join_handle = join_handle.blocking_pool(Arc::clone(&self.pool.identity));
         let task = move || {
             let _scope = BlockingTaskScope::enter(identity);
-            if shutdown.load(Ordering::Acquire) || runtime_shutdown.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Acquire) || runtime_shutdown.shutdown_requested() {
                 drop(task);
             } else {
                 task();
@@ -226,11 +227,7 @@ impl BlockingWorker {
             completion();
         };
 
-        if !self.is_shutting_down.load(Ordering::Acquire)
-            && !self.runtime_shutdown.load(Ordering::Acquire)
-            && self.pool.execute(task)
-            && self.pool.record_saturation_transition()
-        {
+        if self.pool.execute(task) && self.pool.record_saturation_transition() {
             emit!(
                 &self.sink,
                 BlockingWorkerPoolSaturated {
@@ -438,6 +435,7 @@ pub(super) mod blocking_worker_tests {
     use performables::sync::mutex::Mutex;
     use testing_aids::{TEST_TIMEOUT, execute_or_abandon};
 
+    use crate::runtime::ShutdownSignal;
     use crate::runtime::blocking_worker::{
         BlockingJob, BlockingPool, BlockingTaskScope, BlockingWorker, CURRENT_POOL, JoinableThreadPool, is_current_blocking_pool,
     };
@@ -670,8 +668,8 @@ pub(super) mod blocking_worker_tests {
 
     #[test]
     fn runtime_shutdown_cancels_queued_work_before_worker_shutdown() {
-        let runtime_shutdown = Arc::new(AtomicBool::new(false));
-        let worker = BlockingWorker::new_with_shutdown(BlockingPool::new(Some(limit(1))), Sink::noop(), Arc::clone(&runtime_shutdown));
+        let runtime_shutdown = ShutdownSignal::default();
+        let worker = BlockingWorker::new_with_shutdown(BlockingPool::new(Some(limit(1))), Sink::noop(), runtime_shutdown.clone());
         let (started_tx, started_rx) = channel();
         let (release_tx, release_rx) = Event::<()>::boxed();
 
@@ -686,7 +684,7 @@ pub(super) mod blocking_worker_tests {
             let invoked = Arc::clone(&invoked);
             move || invoked.store(true, Ordering::Release)
         });
-        runtime_shutdown.store(true, Ordering::Release);
+        runtime_shutdown.request_shutdown();
         release_tx.send(());
 
         running.join().unwrap();
@@ -698,7 +696,8 @@ pub(super) mod blocking_worker_tests {
 
     #[test]
     fn runtime_shutdown_rejects_new_work_before_worker_shutdown() {
-        let runtime_shutdown = Arc::new(AtomicBool::new(true));
+        let runtime_shutdown = ShutdownSignal::default();
+        runtime_shutdown.request_shutdown();
         let worker = BlockingWorker::new_with_shutdown(BlockingPool::new(Some(limit(1))), Sink::noop(), runtime_shutdown);
         let invoked = Arc::new(AtomicBool::new(false));
 

@@ -66,7 +66,7 @@ impl EventProcessor for ReentrantCycleProcessor {
         let Some(executor) = REENTRANT_TELEMETRY_EXECUTOR.take() else {
             return;
         };
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     }
 
     fn flush(&self) -> Result<(), observed::FlushError> {
@@ -103,7 +103,7 @@ fn completed_result_survives_executor_drop() {
     let mut handle = executor.tasks().add(async { 42 }, TaskOptions::default());
 
     assert!(executor.has_tasks());
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     assert!(!executor.has_tasks());
     drop(executor);
 
@@ -117,7 +117,7 @@ fn retained_handle_reports_shutdown_without_delaying_shutdown() {
 
     executor.begin_shutdown();
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
     assert!(!executor.has_tasks());
     drop(executor);
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(error)) if error.is_shutdown()));
@@ -140,7 +140,7 @@ fn task_set_shutdown_cancels_tasks_without_executor_drop() {
     let mut handle = tasks.add(pending::<()>(), TaskOptions::default());
 
     tasks.begin_shutdown();
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
     assert!(!executor.has_tasks());
     drop(executor);
 
@@ -156,7 +156,7 @@ fn executor_drop_during_thread_local_teardown_is_safe() {
         THREAD_LOCAL_EXECUTOR.with(|slot| {
             let executor = slot.borrow();
             assert_eq!(
-                executor.as_ref().expect("thread-local executor is initialized").execute_cycle(),
+                executor.as_ref().expect("thread-local executor is initialized").execute_cycle().0,
                 CycleOutcome::Suspend
             );
         });
@@ -254,7 +254,7 @@ fn task_created_processor_may_submit_a_nested_task() {
 
     let _outer = tasks.add(async {}, TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any));
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     assert!(nested_completed.get());
 }
 
@@ -264,7 +264,7 @@ fn default_options_emit_lifecycle_events_without_context_enrichment() {
     let executor = Executor::builder().sink(sink).build();
     let _handle = executor.tasks().add(async {}, TaskOptions::default());
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
 
     let events = processor.events();
     assert!(events.iter().any(|event| event.name() == "arty.rt.task.spawned"));
@@ -322,7 +322,7 @@ fn into_future_conversion_may_submit_a_nested_task() {
         TaskOptions::default(),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
     assert!(nested_completed.get());
 }
@@ -415,7 +415,7 @@ fn shutdown_during_into_future_conversion_rejects_the_outer_task() {
     );
 
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(error)) if error.is_shutdown()));
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
 }
 
 struct SubmitOnDrop {
@@ -450,11 +450,11 @@ fn cancelled_future_drop_can_submit_and_receive_shutdown_error() {
         },
         TaskOptions::default(),
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
 
     executor.begin_shutdown();
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
     let mut submitted_handle = submitted.borrow_mut().take().expect("future destructor submitted a task");
     assert!(matches!(
         poll_once(&mut submitted_handle),
@@ -482,14 +482,14 @@ fn shutdown_retires_a_batch_of_queued_tasks() {
             TaskOptions::default(),
         ));
     }
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Suspend);
     for waker in wakers.borrow().iter() {
         waker.wake_by_ref();
     }
 
     executor.begin_shutdown();
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert_eq!(executor.execute_cycle().0, CycleOutcome::Shutdown);
     for mut handle in handles {
         assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(error)) if error.is_shutdown()));
     }

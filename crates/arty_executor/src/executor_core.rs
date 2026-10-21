@@ -94,8 +94,6 @@ struct ExclusiveState {
     completed: VecDeque<TaskRef>,
 
     /// Used to measure the time spent during/between executor cycle processing and during shutdown.
-    /// This is a very fast clock designed to be cheap to poll many times each millisecond (if we
-    /// need to).
     clock: SimpleClock,
 
     // Used to report interval between cycles.
@@ -122,7 +120,7 @@ impl ExecutorCore {
     /// The `owner_waker` is used by the executor to wake up its owner when more work has
     /// arrived for the executor and calling `execute_cycle()` is desirable.
     #[must_use]
-    pub(crate) fn new(owner_waker: task::Waker, sink: Sink) -> Self {
+    pub(crate) fn new(owner_waker: task::Waker, sink: Sink, clock: SimpleClock) -> Self {
         Self {
             reentrancy_safe: RefCell::new(ReentrancySafeState {
                 new_tasks: VecDeque::new(),
@@ -134,7 +132,7 @@ impl ExecutorCore {
                 active: VecDeque::new(),
                 inactive: HashSet::with_hasher(BuildPointerHasher::default()),
                 completed: VecDeque::new(),
-                clock: SimpleClock::new_system().with_fast_instant(true),
+                clock,
                 last_cycle_ended: None,
             }),
             wake: Arc::new(WakeShared::new(
@@ -231,7 +229,7 @@ impl ExecutorCore {
     }
 
     #[must_use]
-    pub(crate) fn execute_cycle(&self) -> CycleOutcome {
+    pub(crate) fn execute_cycle(&self) -> (CycleOutcome, Instant) {
         let mut state_exclusive = self.exclusive.borrow_mut();
 
         let cycle_start_timestamp = state_exclusive.clock.instant();
@@ -286,7 +284,7 @@ impl ExecutorCore {
             // Publish metrics from this cycle.
             EXECUTOR_PUSHER.with(MetricsPusher::push);
 
-            outcome
+            (outcome, cycle_end_timestamp)
         }
     }
 
@@ -703,7 +701,7 @@ mod tests {
 
     #[test]
     fn embedded_wake_racing_active_poll_is_reprobed_after_reclassification() {
-        let core = ExecutorCore::new(task::Waker::noop().clone(), Sink::noop());
+        let core = ExecutorCore::new(task::Waker::noop().clone(), Sink::noop(), SimpleClock::new_system());
         let captured = Rc::new(Cell::new(None));
         let polls = Rc::new(Cell::new(0));
         let handle = core.add_task(
@@ -718,7 +716,7 @@ mod tests {
             }),
             TaskOptions::default(),
         );
-        assert_eq!(core.execute_cycle(), CycleOutcome::Suspend);
+        assert_eq!(core.execute_cycle().0, CycleOutcome::Suspend);
         let waker = captured.take().expect("the first poll captures a waker");
         waker.wake_by_ref();
 
@@ -740,6 +738,6 @@ mod tests {
         drop(state);
         drop(handle);
         core.begin_shutdown();
-        assert_eq!(core.execute_cycle(), CycleOutcome::Shutdown);
+        assert_eq!(core.execute_cycle().0, CycleOutcome::Shutdown);
     }
 }

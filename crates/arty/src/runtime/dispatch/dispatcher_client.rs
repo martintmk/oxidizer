@@ -14,7 +14,6 @@ use performables::arc::Arc;
 #[cfg(test)]
 use performables::sync::channel;
 
-use crate::runtime::Error;
 #[cfg(test)]
 use crate::runtime::blocking_worker::BlockingPool;
 use crate::runtime::blocking_worker::BlockingWorker;
@@ -23,6 +22,7 @@ use crate::runtime::dispatch::WorkerEndpoint;
 use crate::runtime::dispatch::{DispatcherCore, WorkerIndex};
 #[cfg(test)]
 use crate::runtime::thread::waiter::ThreadWaiter;
+use crate::runtime::{Error, ShutdownSignal};
 use crate::task::Builtins;
 use crate::task::join::JoinHandle;
 
@@ -79,7 +79,7 @@ impl DispatcherClient {
         self.core.is_shutting_down()
     }
 
-    pub(crate) fn shutdown_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) fn shutdown_signal(&self) -> ShutdownSignal {
         self.core.shutdown_signal()
     }
 

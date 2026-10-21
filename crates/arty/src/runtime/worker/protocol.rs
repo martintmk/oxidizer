@@ -94,6 +94,7 @@ mod tests {
     use observed::Sink;
 
     use super::*;
+    use crate::runtime::ShutdownSignal;
     use crate::task::execution::prepare_remote;
 
     struct PanicWake(AtomicBool);
@@ -143,7 +144,7 @@ mod tests {
             |_| async { 42 },
             sink.transfer_context(),
             TaskPlacement::Any,
-            performables::arc::Arc::new(AtomicBool::new(false)),
+            ShutdownSignal::default(),
         );
         let mut join = pin!(join);
         let wake = Arc::new(PanicWake(AtomicBool::new(false)));

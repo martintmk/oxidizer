@@ -4,6 +4,7 @@
 use std::task::Waker;
 
 use observed::Sink;
+use tick::SimpleClock;
 
 use crate::{Executor, ExecutorCore};
 
@@ -13,6 +14,7 @@ use crate::{Executor, ExecutorCore};
 pub struct ExecutorBuilder {
     owner_waker: Waker,
     sink: Sink,
+    clock: SimpleClock,
 }
 
 impl ExecutorBuilder {
@@ -21,6 +23,7 @@ impl ExecutorBuilder {
         Self {
             owner_waker: Waker::noop().clone(),
             sink: Sink::noop(),
+            clock: SimpleClock::new_system().with_fast_instant(true),
         }
     }
 
@@ -44,10 +47,18 @@ impl ExecutorBuilder {
         self
     }
 
+    /// Configures the clock used to measure cycles and timestamp their completion.
+    ///
+    /// The default is a system clock with lower-overhead instant retrieval enabled.
+    pub fn clock(mut self, clock: SimpleClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Builds the executor with the configured settings.
     #[must_use]
     pub fn build(self) -> Executor {
-        Executor::new(ExecutorCore::new(self.owner_waker, self.sink))
+        Executor::new(ExecutorCore::new(self.owner_waker, self.sink, self.clock))
     }
 }
 

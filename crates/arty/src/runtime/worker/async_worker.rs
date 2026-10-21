@@ -4,7 +4,6 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arty_executor::{CycleOutcome, Executor, TaskSet};
@@ -16,6 +15,7 @@ use tick::SimpleClock;
 use tick::runtime::{ClockDriver, InactiveClock};
 
 use crate::io::{Io, RuntimeDriverHost};
+use crate::runtime::ShutdownSignal;
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::worker::protocol::AsyncWorkerCommand;
@@ -30,6 +30,14 @@ fn suspend_wait(deadline: Instant, now: Instant) -> Duration {
 
 fn can_suspend(cycle_outcome: CycleOutcome, batch_exhausted: bool) -> bool {
     matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CycleAction {
+    Poll,
+    WaitForIo(Option<Instant>),
+    WaitForSignal(Option<Instant>),
+    Shutdown,
 }
 
 /// The async worker has exclusive use of a runtime thread, one per processor selected by
@@ -75,10 +83,9 @@ pub(crate) struct AsyncWorker {
     // services can release resources needed by shutdown.
     builtins: Option<Builtins>,
 
-    // Published before shutdown commands are queued, so command backlogs can be rejected without
-    // invoking factories that preceded the shutdown command. Acquire loads only need to observe
-    // this published flag; command-channel synchronization owns command contents and ordering.
-    shutdown_signal: Arc<AtomicBool>,
+    // Requested before shutdown commands are queued, so backlogs can be rejected without
+    // invoking factories that preceded the shutdown command.
+    shutdown_signal: ShutdownSignal,
 
     // Becomes None during shutdown when the executor is dropped to cancel and release its tasks.
     executor: Option<Executor>,
@@ -93,10 +100,7 @@ pub(crate) struct AsyncWorker {
     // This drives moves the timers registered with the clock forward.
     clock_driver: ClockDriver,
 
-    // Logical time follows controlled clocks and is used to calculate timer waits.
-    time: SimpleClock,
-    // System timer advancement and I/O wait accounting require precise elapsed time.
-    physical_time: SimpleClock,
+    cycle_clock: SimpleClock,
     signal: Arc<WorkerSignal>,
     _single_threaded: PhantomData<*const ()>,
 }
@@ -119,11 +123,12 @@ impl AsyncWorker {
         let worker_waker = WorkerSignal::waker(&signal);
         let shutdown_signal = dispatcher.shutdown_signal();
         let (clock, clock_driver) = clock.activate(worker_waker.clone());
-        let time = clock.simple_clock().clone();
+        let cycle_clock = SimpleClock::new_system().with_fast_instant(true);
 
         let executor = Executor::builder()
             .owner_waker(worker_waker)
             .sink(blocking_worker.sink().clone())
+            .clock(cycle_clock.clone())
             .build();
         let tasks = executor.tasks();
 
@@ -137,8 +142,7 @@ impl AsyncWorker {
             executor: Some(executor),
             tasks,
             clock_driver,
-            time,
-            physical_time: SimpleClock::new_system(),
+            cycle_clock,
             blocking_worker,
             signal,
             _single_threaded: PhantomData,
@@ -158,66 +162,20 @@ impl AsyncWorker {
     }
 
     fn execute_step(&mut self) -> ControlFlow<()> {
-        let batch_exhausted = self.process_commands();
-
-        if self.shutdown_signal.load(Ordering::Acquire) {
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
-        }
-
-        let Some(executor) = self.executor.as_ref() else {
-            // Executor drop cancels tasks before final timer callbacks can observe their state.
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
+        let action = self.prepare_cycle();
+        let max_wait = match action {
+            CycleAction::Shutdown => return self.finish_shutdown(),
+            CycleAction::WaitForIo(deadline) => self.io_wait(deadline),
+            CycleAction::Poll | CycleAction::WaitForSignal(_) => Duration::ZERO,
         };
 
-        let cycle_outcome = executor.execute_cycle();
-
-        if matches!(cycle_outcome, CycleOutcome::Shutdown) {
-            // An alternate low-level owner initiated executor shutdown. Complete the surrounding
-            // worker shutdown before final timer callbacks run.
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
-        }
-
-        let advance_now = self.timer_now();
-        let next_timer = self.clock_driver.advance_timers(advance_now).ok().flatten();
-        if self.shutdown_signal.load(Ordering::Acquire) {
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
-        }
-        let should_suspend = can_suspend(cycle_outcome, batch_exhausted);
-        let has_primary = RuntimeDriverHost::has_primary_current();
-        let max_wait = if should_suspend {
-            if has_primary {
-                if self.signal.take_notification() {
-                    Duration::ZERO
-                } else {
-                    next_timer.map_or(Duration::MAX, |deadline| suspend_wait(deadline, self.time.instant()))
-                }
-            } else {
-                Duration::ZERO
-            }
-        } else {
-            Duration::ZERO
-        };
         if RuntimeDriverHost::execute_cycle_current(max_wait).is_err() {
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
+            return self.finish_shutdown();
         }
 
-        if should_suspend && !has_primary {
-            match next_timer {
-                Some(deadline) => self.signal.wait(suspend_wait(deadline, self.time.instant())),
+        if let CycleAction::WaitForSignal(deadline) = action {
+            match deadline {
+                Some(deadline) => self.signal.wait(suspend_wait(deadline, self.cycle_clock.instant())),
                 None => self.signal.wait_for_notification(),
             }
         }
@@ -225,11 +183,48 @@ impl AsyncWorker {
         ControlFlow::Continue(())
     }
 
-    fn timer_now(&self) -> Instant {
-        // Reading logical time preserves controlled-clock auto-advance. The precise physical read
-        // prevents system timer advancement from lagging behind a deadline registered during task
-        // cancellation on platforms where consecutive monotonic reads can have different precision.
-        self.time.instant().max(self.physical_time.instant())
+    fn prepare_cycle(&mut self) -> CycleAction {
+        let batch_exhausted = self.process_commands();
+
+        let Some(executor) = self.executor.as_ref() else {
+            return CycleAction::Shutdown;
+        };
+
+        let (cycle_outcome, now) = executor.execute_cycle();
+
+        if matches!(cycle_outcome, CycleOutcome::Shutdown) {
+            return CycleAction::Shutdown;
+        }
+
+        let next_timer = self.clock_driver.advance_timers(now).ok().flatten();
+        if self.shutdown_signal.shutdown_requested() {
+            return CycleAction::Shutdown;
+        }
+
+        if !can_suspend(cycle_outcome, batch_exhausted) {
+            CycleAction::Poll
+        } else if RuntimeDriverHost::has_primary_current() {
+            CycleAction::WaitForIo(next_timer)
+        } else {
+            CycleAction::WaitForSignal(next_timer)
+        }
+    }
+
+    fn io_wait(&self, deadline: Option<Instant>) -> Duration {
+        if self.signal.take_notification() {
+            return Duration::ZERO;
+        }
+
+        // Timer callbacks may have consumed time since the executor completed.
+        deadline.map_or(Duration::MAX, |deadline| suspend_wait(deadline, self.cycle_clock.instant()))
+    }
+
+    fn finish_shutdown(&mut self) -> ControlFlow<()> {
+        self.begin_shutdown();
+        // A coarse sample could precede a due timer registered during task cancellation.
+        let now = SimpleClock::new_system().instant();
+        _ = self.clock_driver.advance_timers(now);
+        ControlFlow::Break(())
     }
 
     #[cfg_attr(test, mutants::skip)] // Mutation testing requires a fine level of control over what is in the channel, which is too bothersome just for mutation testing.
@@ -244,17 +239,26 @@ impl AsyncWorker {
 
         let command_rx = self.command_rx.as_ref().expect("builtins and command channel are dropped together");
 
-        for _ in 0..COMMANDS_PER_CYCLE {
-            if self.shutdown_signal.load(Ordering::Acquire) {
-                self.begin_shutdown();
-                return false;
-            }
+        if self.shutdown_signal.shutdown_requested() {
+            self.begin_shutdown();
+            return false;
+        }
+
+        // Registrations only install deferred tasks; user factories run during polling.
+        // Check the batch before polling, but guard synchronous I/O callbacks individually.
+        let mut batch_exhausted = true;
+        for index in 0..COMMANDS_PER_CYCLE {
             match command_rx.try_recv() {
                 Ok(command) => match command {
                     AsyncWorkerCommand::EnqueueTask { future_factory } => {
                         future_factory.into_inner()(builtins.clone(), &self.tasks);
                     }
                     AsyncWorkerCommand::AccessIo { access } => {
+                        if self.shutdown_signal.shutdown_requested() {
+                            drop(access);
+                            self.begin_shutdown();
+                            return false;
+                        }
                         access.into_inner()(builtins);
                     }
                     AsyncWorkerCommand::Shutdown => {
@@ -267,12 +271,21 @@ impl AsyncWorker {
                 Err(error) => {
                     // Every initialized worker retains its own dispatcher until shutdown.
                     assert!(error.is_empty(), "async worker command channel disconnected without shutdown");
-                    return false;
+                    if index == 0 {
+                        return false;
+                    }
+                    batch_exhausted = false;
+                    break;
                 }
             }
         }
+
+        if self.shutdown_signal.shutdown_requested() {
+            self.begin_shutdown();
+            return false;
+        }
         // An exhausted batch may leave commands queued; do not park before checking again.
-        true
+        batch_exhausted
     }
 
     #[cfg_attr(test, mutants::skip)] // If mutated, shutdown process will never finish - will hang.
@@ -312,7 +325,7 @@ impl Drop for AsyncWorker {
 mod tests {
     #[cfg(not(miri))]
     use std::pin::Pin;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     #[cfg(not(miri))]
     use std::task::Wake;
@@ -362,6 +375,45 @@ mod tests {
             ),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn private_worker_reuses_cycle_time_without_an_extra_clock_read() {
+        // Clock-read counts are private worker-loop policy, not a public runtime guarantee.
+        let (command_tx, command_rx) = channel::unbounded();
+        let control = ClockControl::new();
+        let time = control.to_simple_clock();
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            control.clone().into(),
+            Arc::new(WorkerSignal::default()),
+        );
+        let cycle_control = ClockControl::new();
+        let cycle_time = cycle_control.to_simple_clock();
+        let cycle_start = cycle_time.instant();
+        let executor = Executor::builder().clock(cycle_time.clone()).build();
+        worker.tasks = executor.tasks();
+        worker.executor = Some(executor);
+        worker.cycle_clock = cycle_time.clone();
+        let _task = worker.tasks.add(
+            std::future::poll_fn(|cx| {
+                cx.waker().wake_by_ref();
+                std::task::Poll::<()>::Pending
+            }),
+            TaskOptions::default(),
+        );
+        let before = time.instant();
+        let control = control.auto_advance(Duration::from_secs(1));
+        let cycle_control = cycle_control.auto_advance(Duration::from_secs(1));
+
+        assert!(worker.execute_step().is_continue());
+        let _control = control.auto_advance(Duration::ZERO);
+        let _cycle_control = cycle_control.auto_advance(Duration::ZERO);
+
+        assert_eq!(time.instant().duration_since(before), Duration::from_secs(1));
+        assert_eq!(cycle_time.instant().duration_since(cycle_start), Duration::from_secs(2));
     }
 
     #[test]
@@ -625,12 +677,12 @@ mod tests {
             thread: thread.clone(),
             blocking_worker: Arc::clone(&blocking_worker),
         };
-        let shutdown_signal = Arc::new(AtomicBool::new(false));
+        let shutdown_signal = ShutdownSignal::default();
         let dispatcher = DispatcherClient::new(Arc::new(DispatcherCore::new_with_shutdown(
             ThreadWaiter::new(Vec::new()),
             NonEmpty::new(endpoint),
             sink.clone(),
-            Arc::clone(&shutdown_signal),
+            shutdown_signal,
         )));
         let io_runtime = arty_io_host::IoRuntime::new(sink.clone());
         let io = crate::io::Io::new(io_runtime.clone(), dispatcher.clone(), thread.clone());
@@ -803,7 +855,7 @@ mod tests {
 
         fn queue_shutdown(&mut self) {
             if !self.queued_shutdown {
-                self.worker.shutdown_signal.store(true, Ordering::Release);
+                self.worker.shutdown_signal.request_shutdown();
             }
             if !self.queued_shutdown && self.command_tx.send(AsyncWorkerCommand::Shutdown).is_ok() {
                 self.queued_shutdown = true;
@@ -1221,12 +1273,74 @@ mod tests {
                 })),
             })
             .unwrap();
-        worker.shutdown_signal.store(true, Ordering::Release);
+        worker.shutdown_signal.request_shutdown();
 
         worker.run();
 
         dropped_rx.recv_timeout(TEST_TIMEOUT).unwrap();
         assert!(!invoked.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn private_batch_shutdown_rejects_later_synchronous_io_access() {
+        // Publishing between registration and I/O admission requires the private command channel.
+        let (command_tx, command_rx) = channel::unbounded();
+        let worker = test_worker(
+            command_tx.clone(),
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            InactiveClock::default(),
+            Arc::new(WorkerSignal::default()),
+        );
+        let shutdown = worker.shutdown_signal.clone();
+        let invoked = Arc::new(AtomicBool::new(false));
+        command_tx
+            .send(enqueue(Box::new(move |_, _| {
+                shutdown.request_shutdown();
+            })))
+            .unwrap();
+        command_tx
+            .send(AsyncWorkerCommand::AccessIo {
+                access: crate::runtime::worker::protocol::QueuedIoAccess::new(Box::new({
+                    let invoked = Arc::clone(&invoked);
+                    move |_| invoked.store(true, Ordering::Relaxed)
+                })),
+            })
+            .unwrap();
+
+        worker.run();
+
+        assert!(!invoked.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn private_partial_batch_shutdown_cancels_before_polling() {
+        // Publish inside registration to exercise the partial-batch boundary deterministically.
+        let (command_tx, command_rx) = channel::unbounded();
+        let worker = test_worker(
+            command_tx.clone(),
+            command_rx,
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop()),
+            InactiveClock::default(),
+            Arc::new(WorkerSignal::default()),
+        );
+        let shutdown = worker.shutdown_signal.clone();
+        let invoked = Arc::new(AtomicBool::new(false));
+        command_tx
+            .send(enqueue(Box::new({
+                let invoked = Arc::clone(&invoked);
+                move |_, tasks| {
+                    shutdown.request_shutdown();
+                    drop(tasks.add_test(async move {
+                        invoked.store(true, Ordering::Relaxed);
+                    }));
+                }
+            })))
+            .unwrap();
+
+        worker.run();
+
+        assert!(!invoked.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1240,15 +1354,15 @@ mod tests {
             InactiveClock::default(),
             Arc::new(WorkerSignal::default()),
         );
-        let shutdown_signal = Arc::clone(&worker.shutdown_signal);
+        let shutdown_signal = worker.shutdown_signal.clone();
 
         for index in 0..COMMANDS_PER_CYCLE {
             let invoked = Arc::clone(&invoked);
-            let shutdown_signal = Arc::clone(&shutdown_signal);
+            let shutdown_signal = shutdown_signal.clone();
             command_tx
                 .send(enqueue(Box::new(move |_, tasks| {
                     if index + 1 == COMMANDS_PER_CYCLE {
-                        shutdown_signal.store(true, Ordering::Release);
+                        shutdown_signal.request_shutdown();
                     }
                     drop(tasks.add_test(async move {
                         invoked.fetch_add(1, Ordering::Relaxed);

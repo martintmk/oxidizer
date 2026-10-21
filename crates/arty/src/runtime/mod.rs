@@ -43,6 +43,7 @@ pub(crate) mod dispatch;
 mod error;
 mod handle;
 mod operations;
+mod shutdown_signal;
 pub(crate) mod telemetry;
 pub(crate) mod thread;
 mod worker;
@@ -57,6 +58,7 @@ pub use error::Error;
 pub use handle::Runtime;
 #[doc(inline)]
 pub use operations::RuntimeOperations;
+pub(crate) use shutdown_signal::ShutdownSignal;
 
 /// Implementation details for the runtime entry-point macros.
 #[cfg(feature = "macros")]

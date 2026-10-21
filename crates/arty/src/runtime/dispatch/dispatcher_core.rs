@@ -15,11 +15,11 @@ use performables::sync::channel;
 use performables::sync::mutex::Mutex;
 use thread_aware::Thread;
 
-use crate::runtime::Error;
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::telemetry::events::{RuntimeStopped, RuntimeStopping};
 use crate::runtime::thread::waiter::ThreadWaiter;
 use crate::runtime::worker::protocol::{AsyncWorkerCommand, QueuedIoAccess, QueuedTaskFactory};
+use crate::runtime::{Error, ShutdownSignal};
 use crate::task::Builtins;
 use crate::task::execution::prepare_remote;
 use crate::task::join::JoinHandle;
@@ -59,7 +59,7 @@ pub(crate) struct DispatcherCore {
 
     /// We record whether shutdown has started, both to avoid double-shutdown and to execute
     /// special-case logic in some situations that need special handling during shutdown.
-    shutdown_started: Arc<AtomicBool>,
+    shutdown_started: ShutdownSignal,
     stopped_reported: AtomicBool,
     shutdown_error: Mutex<Option<Error>>,
 
@@ -82,14 +82,14 @@ pub(crate) struct DispatcherCore {
 impl DispatcherCore {
     #[cfg(test)]
     pub(crate) fn new(wait_for_shutdown: ThreadWaiter, worker_endpoints: NonEmpty<WorkerEndpoint>, sink: observed::Sink) -> Self {
-        Self::new_with_shutdown(wait_for_shutdown, worker_endpoints, sink, Arc::new(AtomicBool::new(false)))
+        Self::new_with_shutdown(wait_for_shutdown, worker_endpoints, sink, ShutdownSignal::default())
     }
 
     pub(crate) fn new_with_shutdown(
         wait_for_shutdown: ThreadWaiter,
         worker_endpoints: NonEmpty<WorkerEndpoint>,
         sink: observed::Sink,
-        shutdown_started: Arc<AtomicBool>,
+        shutdown_started: ShutdownSignal,
     ) -> Self {
         let owner = worker_endpoints.first().thread.owner();
         assert!(
@@ -135,7 +135,7 @@ impl DispatcherCore {
     #[cfg_attr(test, mutants::skip)] // Tests hang if mutation removes the shutdown signal or worker notifications.
     fn stop_inner(&self) {
         // If we've already started shutting down, don't do it again.
-        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+        if !self.shutdown_started.request_shutdown() {
             return;
         }
 
@@ -205,11 +205,11 @@ impl DispatcherCore {
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
-        self.shutdown_started.load(Ordering::Acquire)
+        self.shutdown_started.shutdown_requested()
     }
 
-    pub(crate) fn shutdown_signal(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.shutdown_started)
+    pub(crate) fn shutdown_signal(&self) -> ShutdownSignal {
+        self.shutdown_started.clone()
     }
 
     pub(crate) fn remote_results(&self) -> &RemotePool {
@@ -275,7 +275,7 @@ impl DispatcherCore {
             future_factory,
             parent_task_enrichment,
             placement,
-            Arc::clone(&self.shutdown_started),
+            self.shutdown_started.clone(),
         );
 
         // There is nothing we can really do if the worker is already gone and closed the channel.
@@ -453,7 +453,7 @@ mod tests {
         assert!(std::ptr::eq(core.remote_results(), std::ptr::addr_of!(core.remote_results)));
         core.stop();
 
-        assert!(signal.load(Ordering::Acquire));
+        assert!(signal.shutdown_requested());
     }
 
     #[test]

@@ -188,9 +188,6 @@ impl Scheduler {
         F: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        if self.dispatcher.is_shutting_down() {
-            return JoinHandle::shutdown(self.dispatcher.remote_results());
-        }
         let future_factory = match self.spawn_on_current_worker(future_factory) {
             Ok(join_handle) => return join_handle,
             Err(future_factory) => future_factory,
@@ -210,6 +207,9 @@ impl Scheduler {
             };
             if current.thread != self.binding.thread {
                 return Err(future_factory);
+            }
+            if self.dispatcher.is_shutting_down() {
+                return Ok(JoinHandle::shutdown(self.dispatcher.remote_results()));
             }
             let sink = current.builtins.sink().clone();
             let parent_task_enrichment = sink.transfer_context();
