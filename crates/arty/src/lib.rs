@@ -158,7 +158,7 @@ use arty_io_core as _;
 /// - `workers = N` caps the number of async workers. Use an integer literal
 ///   that fits `usize` (an explicit `usize` suffix is fine). If fewer processors
 ///   are available, Arty starts fewer workers; zero fails at construction.
-/// - `workers = "all"` starts one async worker per available processor.
+/// - `workers = all` starts one async worker per available processor.
 ///
 /// A worker limit does not limit blocking-pool threads. Without this option, the
 /// runtime uses [`WorkersPolicy::default`](crate::runtime::WorkersPolicy::default).

@@ -76,13 +76,13 @@ async fn assert_all_workers(cx: Builtins) -> Result<(), arty::task::JoinError> {
 }
 
 #[cfg(not(miri))]
-#[test(workers = "all")]
+#[test(workers = all)]
 async fn test_can_select_all_workers(cx: Builtins) {
     assert_all_workers(cx).await.unwrap();
 }
 
 #[cfg(not(miri))]
-#[arty::main(workers = "all")]
+#[arty::main(workers = all)]
 #[::core::prelude::v1::test]
 async fn main_can_select_all_workers(cx: Builtins) {
     assert_all_workers(cx).await.unwrap();
@@ -123,7 +123,7 @@ mod controlled_time {
     }
 
     #[cfg(not(miri))]
-    #[arty::test(workers = "all")]
+    #[arty::test(workers = all)]
     async fn controlled_test_can_select_all_workers(cx: Builtins, control: ClockControl) {
         assert_eq!(cx.clock().system_time(), UNIX_EPOCH);
         super::assert_all_workers(cx.clone()).await.unwrap();

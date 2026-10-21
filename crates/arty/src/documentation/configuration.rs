@@ -64,7 +64,7 @@
 //! With `macros` enabled, `#[arty::main]` and `#[arty::test]` create and stop
 //! the runtime for you. Both use one worker by default.
 //!
-//! Use `workers = N` to cap the worker count, or `workers = "all"` to use all
+//! Use `workers = N` to cap the worker count, or `workers = all` to use all
 //! available processors. Build the runtime explicitly for
 //! custom clocks, telemetry, blocking pools, stack sizes, or exact worker
 //! policies.

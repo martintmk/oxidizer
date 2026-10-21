@@ -67,14 +67,14 @@ fn worker_policy(mut value: &Expr, runtime_path: &TokenStream) -> syn::Result<To
     {
         return Ok(quote!(#runtime_path::runtime::WorkersPolicy::at_most(#count)));
     }
-    if let Expr::Lit(syn::ExprLit { lit: Lit::Str(policy), .. }) = value
-        && policy.value() == "all"
+    if let Expr::Path(syn::ExprPath { qself: None, path, .. }) = value
+        && path.is_ident("all")
     {
         return Ok(quote!(#runtime_path::runtime::WorkersPolicy::all()));
     }
     Err(syn::Error::new_spanned(
         value,
-        "`workers` must be a nonnegative integer literal, optionally suffixed with `usize`, or \"all\"; use explicit runtime construction for expressions or other processor policies",
+        "`workers` must be a nonnegative integer literal, optionally suffixed with `usize`, or `all`; use explicit runtime construction for expressions or other processor policies",
     ))
 }
 
@@ -344,7 +344,7 @@ mod tests {
     fn all_workers_selects_all_available_processors() {
         for expand in [main, test] {
             let expansion = expand(
-                quote!(workers = "all"),
+                quote!(workers = all),
                 quote! {
                     async fn run(cx: Builtins) {}
                 },
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn controlled_test_can_select_all_workers() {
         let expansion = test(
-            quote!(workers = "all"),
+            quote!(workers = all),
             quote! {
                 async fn run(cx: Builtins, time: ClockControl) {}
             },
@@ -454,7 +454,7 @@ mod tests {
     fn worker_policy_unwraps_nested_expression_groups() {
         for (mut value, expected) in [
             (parse_quote!(4usize), quote!(::arty::runtime::WorkersPolicy::at_most(4usize))),
-            (parse_quote!("all"), quote!(::arty::runtime::WorkersPolicy::all())),
+            (parse_quote!(all), quote!(::arty::runtime::WorkersPolicy::all())),
         ] {
             for _ in 0..2 {
                 value = Expr::Group(syn::ExprGroup {
@@ -481,7 +481,12 @@ mod tests {
             quote!("2"),
             quote!("ALL"),
             quote!(""),
-            quote!(all),
+            quote!("all"),
+            quote!(ALL),
+            quote!(module::all),
+            quote!(::all),
+            quote!(all::<usize>),
+            quote!(<T>::all),
             quote!(true),
             quote!(COUNT),
             quote!(1 + 1),
