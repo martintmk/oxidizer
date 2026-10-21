@@ -12,7 +12,7 @@ use nonempty::NonEmpty;
 use observed::emit;
 use performables::arc::Arc;
 use performables::sync::channel;
-use thread_aware::Thread;
+use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::Error;
 use crate::runtime::blocking_worker::BlockingWorker;
@@ -148,6 +148,18 @@ impl DispatcherCore {
         R: Send + 'static,
     {
         self.enqueue(self.next_worker_index(), TaskPlacement::Any, future_factory)
+    }
+
+    pub(crate) fn spawn_relocating<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
+    where
+        FF: FnOnce(Builtins) -> F + Send + 'static,
+        F: Future<Output = R> + 'static,
+        R: ThreadAware + 'static,
+    {
+        let worker_index = self.next_worker_index();
+        let source = self.worker_endpoints[usize::from(worker_index)].thread.clone();
+        self.enqueue(worker_index, TaskPlacement::Any, future_factory)
+            .relocate_result_from(source)
     }
 
     pub(crate) fn worker_index(&self, thread_id: ThreadId) -> Option<WorkerIndex> {

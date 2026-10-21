@@ -7,6 +7,7 @@ use std::thread::ThreadId;
 
 use arty_executor::remote::Pool as RemotePool;
 use performables::arc::Arc;
+use thread_aware::ThreadAware;
 
 use crate::runtime::Error;
 use crate::runtime::blocking_worker::BlockingWorker;
@@ -81,6 +82,15 @@ impl DispatcherClient {
         self.core.spawn(future_factory)
     }
 
+    pub(crate) fn spawn_relocating<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
+    where
+        FF: FnOnce(Builtins) -> F + Send + 'static,
+        F: Future<Output = R> + 'static,
+        R: ThreadAware + 'static,
+    {
+        self.core.spawn_relocating(future_factory)
+    }
+
     pub(crate) fn spawn_everywhere<M, FF, F, R>(&self, make_factory: M) -> Vec<JoinHandle<R>>
     where
         M: FnMut() -> FF,
@@ -119,7 +129,6 @@ mod tests {
 
     use observed::Sink;
     use performables::sync::channel;
-    use thread_aware::ThreadAware;
 
     use super::*;
     use crate::runtime::blocking_worker::BlockingPool;

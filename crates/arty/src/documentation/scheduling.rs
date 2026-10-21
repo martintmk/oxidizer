@@ -24,8 +24,10 @@
 //! Results from worker-bound `Scheduler::spawn_anywhere` and
 //! `spawn_everywhere` must also implement [`ThreadAware`](crate::core::ThreadAware),
 //! which includes `Send`. Runtime-wide `RuntimeScheduler::spawn_anywhere` accepts
-//! any `Send` result. Joining does not relocate results; relocate worker-aware
-//! returned values explicitly when needed.
+//! any `Send` result. Joining a worker-bound `spawn_anywhere` on an Arty worker
+//! relocates the result to that worker, normally the source. Joining it outside
+//! Arty does not relocate the result. Other submission methods leave results
+//! unchanged.
 //!
 //! # Create local state on a worker
 //!
