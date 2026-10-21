@@ -13,7 +13,7 @@ use crate::runtime::error::Error;
 /// The runtime starts one async worker per selected processor. Pass a
 /// policy to
 /// [`RuntimeBuilder::workers`](crate::runtime::RuntimeBuilder::workers).
-/// [`Default`] lets Arty choose the count. Use [`at_most`](Self::at_most) for
+/// [`Default`] uses one worker. Use [`at_most`](Self::at_most) for
 /// an upper bound, [`exactly`](Self::exactly) when fewer workers would be an
 /// error, or [`all`](Self::all) to require all available processors.
 ///
@@ -27,7 +27,7 @@ use crate::runtime::error::Error;
 ///
 /// let builder = Runtime::builder().workers(WorkersPolicy::at_most(4));
 /// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkersPolicy(WorkersPolicyKind);
 
 impl WorkersPolicy {
@@ -95,7 +95,7 @@ impl WorkersPolicy {
                 return Err(Error::insufficient_processors(count, available.len()));
             }
             WorkersPolicyKind::Exactly(count) | WorkersPolicyKind::AtMost(count) => count.min(available.len()),
-            WorkersPolicyKind::Auto | WorkersPolicyKind::All => {
+            WorkersPolicyKind::All => {
                 return Ok(available.to_builder().take_all().expect("available processor sets are nonempty"));
             }
         };
@@ -107,10 +107,14 @@ impl WorkersPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+impl Default for WorkersPolicy {
+    fn default() -> Self {
+        Self::exactly(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkersPolicyKind {
-    #[default]
-    Auto,
     Exactly(usize),
     AtMost(usize),
     All,
@@ -193,9 +197,9 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
-    fn automatic_count_uses_all_available_processors() {
+    fn default_count_uses_one_processor() {
         let available = SystemHardware::current().processors();
-        assert_eq!(WorkersPolicy::default().select(&available).unwrap().len(), available.len(),);
+        assert_eq!(WorkersPolicy::default().select(&available).unwrap().len(), 1);
     }
 
     #[cfg(not(miri))]

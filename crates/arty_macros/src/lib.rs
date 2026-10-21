@@ -10,7 +10,8 @@
 //!
 //! Both attributes start a runtime, pass its worker capabilities to an
 //! async function, and shut down when that function returns. The optional
-//! `workers = N` argument caps the runtime's async worker count.
+//! `workers = N` argument caps the runtime's async worker count; `workers = "all"`
+//! selects all available processors. Both attributes use one worker by default.
 //!
 //! The application-facing references are
 //! [`arty::main`](https://docs.rs/arty/latest/arty/attr.main.html) and

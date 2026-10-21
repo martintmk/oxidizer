@@ -14,6 +14,27 @@ use arty::runtime::{BlockingPoolPolicy, Error, Runtime, WorkersPolicy};
 use observed_testing::{CapturedEvent, TEST_ID, test_emitter};
 
 #[test]
+fn default_runtime_construction_uses_one_worker() {
+    for runtime in [
+        Runtime::new().unwrap(),
+        Runtime::builder().build().unwrap(),
+        Runtime::builder().workers(WorkersPolicy::default()).build().unwrap(),
+    ] {
+        runtime
+            .scheduler()
+            .block_on(async |cx| {
+                let tasks = cx.scheduler().spawn_everywhere((), |()| async { std::thread::current().id() });
+                assert_eq!(tasks.len(), 1);
+                for task in tasks {
+                    assert_eq!(task.await.unwrap(), cx.thread().id());
+                }
+            })
+            .unwrap();
+        runtime.stop().unwrap();
+    }
+}
+
+#[test]
 fn zero_counts_are_rejected_when_the_runtime_is_built() {
     const EXACT: WorkersPolicy = WorkersPolicy::exactly(0);
     const MAXIMUM: WorkersPolicy = WorkersPolicy::at_most(0);

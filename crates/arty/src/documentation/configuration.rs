@@ -14,7 +14,7 @@
 //!
 //! | Policy | Meaning |
 //! | --- | --- |
-//! | `default()` | Let Arty choose; currently uses all available processors, but that policy may evolve |
+//! | `default()` | Use one worker |
 //! | `all()` | Use all available processors explicitly |
 //! | `at_most(n)` | Use no more than `n`, clamping to available processors |
 //! | `exactly(n)` | Require `n`; return `runtime::Error` if fewer are available |
@@ -62,10 +62,10 @@
 //! # Entry-point attributes
 //!
 //! With `macros` enabled, `#[arty::main]` and `#[arty::test]` create and stop
-//! the runtime for you. By default, `main` chooses workers automatically and
-//! `test` uses one worker.
+//! the runtime for you. Both use one worker by default.
 //!
-//! Use `workers = N` to cap the worker count. Build the runtime explicitly for
+//! Use `workers = N` to cap the worker count, or `workers = "all"` to use all
+//! available processors. Build the runtime explicitly for
 //! custom clocks, telemetry, blocking pools, stack sizes, or exact worker
 //! policies.
 //!

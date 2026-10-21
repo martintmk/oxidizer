@@ -15,10 +15,10 @@
 
 Single-threaded, thread-aware application runtime.
 
-An Arty runtime can have several workers, but each async task stays on one
-worker throughout its life. This lets it use thread-local and non-[`Send`][__link0]
-state across awaits. Thread-aware values can be explicitly relocated when
-starting new work on another worker.
+An Arty runtime defaults to one worker and can be configured with several,
+but each async task stays on one worker throughout its life. This lets it use
+thread-local and non-[`Send`][__link0] state across awaits. Thread-aware values can be
+explicitly relocated when starting new work on another worker.
 
 There is no process-global runtime: each instance owns its workers and
 services. Workers use thread-local bookkeeping rather than a global
@@ -138,7 +138,7 @@ The default feature set enables `rt` and `macros`.
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbGTvrvo-fV-8bX71dk0Y2kEQby4ruQUuQ1Kgb3ChN6fCifzRhZIOCZGFydHllMC41LjCCa2FydHlfbWFjcm9zZTAuNS4wgmhvYnNlcnZlZGYwLjI5LjA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbiqoeEB9OKi4bDNxAWFByDcsbhEwG_0izFxQb1350QabJtLthZIOCZGFydHllMC41LjCCa2FydHlfbWFjcm9zZTAuNS4wgmhvYnNlcnZlZGYwLjI5LjA
  [__link0]: https://doc.rust-lang.org/stable/std/marker/trait.Send.html
  [__link1]: https://docs.rs/arty_macros/0.5.0/arty_macros/?search=main
  [__link10]: https://docs.rs/arty/0.5.0/arty/?search=time::ClockControl

@@ -52,6 +52,42 @@ async fn default_test_runtime_has_exactly_one_worker(cx: Builtins) {
     }
 }
 
+#[arty::main]
+#[::core::prelude::v1::test]
+async fn default_main_runtime_has_exactly_one_worker(cx: Builtins) {
+    let tasks = cx.scheduler().spawn_everywhere((), |()| async { std::thread::current().id() });
+    assert_eq!(tasks.len(), 1);
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), cx.thread().id());
+    }
+}
+
+#[cfg(not(miri))]
+async fn assert_all_workers(cx: Builtins) -> Result<(), arty::task::JoinError> {
+    let available = many_cpus::SystemHardware::current().processors().len();
+    let tasks = cx.scheduler().spawn_everywhere((), |()| async { std::thread::current().id() });
+    assert_eq!(tasks.len(), available);
+    let mut threads = std::collections::HashSet::new();
+    for task in tasks {
+        assert!(threads.insert(task.await?));
+    }
+    assert_eq!(threads.len(), available);
+    Ok(())
+}
+
+#[cfg(not(miri))]
+#[test(workers = "all")]
+async fn test_can_select_all_workers(cx: Builtins) {
+    assert_all_workers(cx).await.unwrap();
+}
+
+#[cfg(not(miri))]
+#[arty::main(workers = "all")]
+#[::core::prelude::v1::test]
+async fn main_can_select_all_workers(cx: Builtins) {
+    assert_all_workers(cx).await.unwrap();
+}
+
 #[test(workers = 4_294_967_295usize)]
 async fn worker_limit_clamps_instead_of_failing_construction(cx: Builtins) {
     assert_eq!(cx.scheduler().spawn(async |_| 42).await.unwrap(), 42);
@@ -76,6 +112,24 @@ mod controlled_time {
     use arty::task::Builtins;
     use arty::time::ClockControl;
     use futures::FutureExt;
+
+    #[arty::test]
+    async fn controlled_test_defaults_to_one_worker(cx: Builtins, _control: ClockControl) {
+        let tasks = cx.scheduler().spawn_everywhere((), |()| async { std::thread::current().id() });
+        assert_eq!(tasks.len(), 1);
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), cx.thread().id());
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[arty::test(workers = "all")]
+    async fn controlled_test_can_select_all_workers(cx: Builtins, control: ClockControl) {
+        assert_eq!(cx.clock().system_time(), UNIX_EPOCH);
+        super::assert_all_workers(cx.clone()).await.unwrap();
+        control.advance(Duration::from_secs(1));
+        assert_eq!(cx.clock().system_time(), UNIX_EPOCH + Duration::from_secs(1));
+    }
 
     trait TestTypes {
         type Context;
