@@ -3,6 +3,7 @@
 
 use std::future::poll_fn;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::{fmt, io};
@@ -22,9 +23,18 @@ impl Drop for RegistryOperation<'_> {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct RegistrationState {
     inner: Mutex<RegistrationInner>,
+    closed: AtomicBool,
+}
+
+impl Default for RegistrationState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(RegistrationInner::default()),
+            closed: AtomicBool::new(false),
+        }
+    }
 }
 
 pub(crate) struct RegistrationEntry {
@@ -61,6 +71,18 @@ impl RegistrationEntry {
 trait NativeRegistration: Send + Sync {
     fn deregister(&self, registry: &Registry) -> io::Result<()>;
     fn try_deregister(&self, registry: &Registry) -> io::Result<()>;
+}
+
+struct OwnerRegistration;
+
+impl NativeRegistration for OwnerRegistration {
+    fn deregister(&self, _registry: &Registry) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn try_deregister(&self, _registry: &Registry) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct SourceCell<S> {
@@ -151,6 +173,7 @@ impl RegistrationState {
     }
 
     pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         let (read_waiter, write_waiter) = {
             let mut inner = self
                 .inner
@@ -165,6 +188,10 @@ impl RegistrationState {
         if let Some(waiter) = write_waiter {
             waiter.wake();
         }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     fn poll(&self, interest: Interest, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
@@ -245,6 +272,166 @@ where
     worker: Arc<WorkerState>,
     token: Token,
     entry: Arc<RegistrationEntry>,
+}
+
+/// A registered Mio source with exclusive source ownership.
+///
+/// This type gives the owner direct source access without a lock. Driver
+/// shutdown closes readiness and removes the native poller. The owner keeps
+/// the source until this value drops.
+///
+/// Dropping this value while the driver is active removes the source
+/// registration through a thread-safe clone of the native registry. Mio binds
+/// a source to one `Poll` for its registered lifetime, so this type does not
+/// expose an operation that moves the source to another registry.
+pub struct ExclusiveRegistered<S>
+where
+    S: Source + Send + 'static,
+{
+    source: S,
+    worker: Arc<WorkerState>,
+    token: Token,
+    entry: Arc<RegistrationEntry>,
+}
+
+impl<S> fmt::Debug for ExclusiveRegistered<S>
+where
+    S: Source + Send + fmt::Debug + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExclusiveRegistered")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> ExclusiveRegistered<S>
+where
+    S: Source + Send + 'static,
+{
+    fn new(source: S, worker: Arc<WorkerState>, token: Token, entry: Arc<RegistrationEntry>) -> Self {
+        Self {
+            source,
+            worker,
+            token,
+            entry,
+        }
+    }
+
+    /// Returns the Mio token assigned to this source.
+    #[must_use]
+    pub const fn token(&self) -> Token {
+        self.token
+    }
+
+    /// Returns a shared reference to the registered source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver is closed.
+    pub fn source(&self) -> Result<&S, RegistrationClosed> {
+        if self.entry.state.is_closed() {
+            Err(RegistrationClosed)
+        } else {
+            Ok(&self.source)
+        }
+    }
+
+    /// Returns an exclusive reference to the registered source.
+    ///
+    /// Read or write until the operation returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Then wait for new readiness.
+    ///
+    /// A source operation that starts before driver shutdown can finish after
+    /// shutdown starts. The driver never accesses or drops the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver is closed.
+    pub fn source_mut(&mut self) -> Result<&mut S, RegistrationClosed> {
+        if self.entry.state.is_closed() {
+            Err(RegistrationClosed)
+        } else {
+            Ok(&mut self.source)
+        }
+    }
+
+    /// Polls for read readiness or driver shutdown.
+    ///
+    /// Call this method only after a read operation returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
+    /// be spurious. This method consumes the accumulated read readiness. It
+    /// does not consume write readiness.
+    ///
+    /// The registration stores only the latest read waker. A later poll can
+    /// replace the waker from an earlier poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver closes before it reports
+    /// more read readiness.
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the poll API follows Future::poll and accepts the caller's task context"
+    )]
+    pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
+        self.entry.state.poll_read(context.waker())
+    }
+
+    /// Polls for write readiness or driver shutdown.
+    ///
+    /// Call this method only after a write operation returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
+    /// be spurious. This method consumes the accumulated write readiness. It
+    /// does not consume read readiness.
+    ///
+    /// The registration stores only the latest write waker. A later poll can
+    /// replace the waker from an earlier poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver closes before it reports
+    /// more write readiness.
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the poll API follows Future::poll and accepts the caller's task context"
+    )]
+    pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
+        self.entry.state.poll_write(context.waker())
+    }
+
+    /// Waits for the requested readiness or driver shutdown.
+    ///
+    /// Readiness is a hint and can be spurious. Multiple events accumulate
+    /// until this future returns them. Reading readiness and writing readiness
+    /// have separate latest-waker slots. Taking one direction does not clear
+    /// the other direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver closes before it reports
+    /// the requested readiness.
+    pub fn readiness(&self, interest: Interest) -> impl Future<Output = Result<Readiness, RegistrationClosed>> + Send + 'static {
+        let state = Arc::clone(&self.entry.state);
+        async move { poll_fn(|context| state.poll(interest, context.waker())).await }
+    }
+}
+
+impl<S> Drop for ExclusiveRegistered<S>
+where
+    S: Source + Send + 'static,
+{
+    fn drop(&mut self) {
+        if !self.worker.begin_deregistration(self.token, &self.entry) {
+            self.entry.close();
+            return;
+        }
+        let _operation = RegistryOperation(&self.worker);
+        if let Err(error) = self.worker.registry().deregister(&mut self.source) {
+            self.worker.record_failure(error);
+        }
+        self.entry.close();
+    }
 }
 
 impl<S> fmt::Debug for Registered<S>
@@ -493,6 +680,33 @@ where
     }
     drop(operation);
     Ok(Registered::new(source, worker, token, entry))
+}
+
+pub(crate) fn register_exclusive<S>(mut source: S, interest: Interest, worker: Arc<WorkerState>) -> io::Result<ExclusiveRegistered<S>>
+where
+    S: Source + Send + 'static,
+{
+    let token = worker.allocate_token()?;
+    let state = Arc::new(RegistrationState::default());
+    let entry = Arc::new(RegistrationEntry::new(state, Arc::new(OwnerRegistration)));
+    worker.begin_registration(token, Arc::clone(&entry))?;
+    let operation = RegistryOperation(&worker);
+    if let Err(error) = worker.registry().register(&mut source, token, interest) {
+        worker.finish_registration(token, &entry, false);
+        entry.close();
+        return Err(error);
+    }
+    if !worker.finish_registration(token, &entry, true) {
+        if let Err(error) = worker.registry().deregister(&mut source) {
+            worker.record_failure(error);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the Arty Mio driver closed while it registered the source",
+        ));
+    }
+    drop(operation);
+    Ok(ExclusiveRegistered::new(source, worker, token, entry))
 }
 
 #[cfg(test)]

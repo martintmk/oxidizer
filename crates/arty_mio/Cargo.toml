@@ -56,3 +56,7 @@ workspace = true
 [[bench]]
 name = "registration"
 harness = false
+
+[[bench]]
+name = "source_access"
+harness = false

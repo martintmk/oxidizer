@@ -17,7 +17,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use arty_io_core::{Cycle, Driver, DriverOptions, DriverRole, IoContext};
-use arty_mio::{MioContext, MioDriver, MioOptions, Readiness, Registered, RegistrationClosed};
+use arty_mio::{ExclusiveRegistered, MioContext, MioDriver, MioOptions, Readiness, Registered, RegistrationClosed};
 use mio::event::Source;
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Interest, Registry, Token};
@@ -32,6 +32,7 @@ assert_impl_all!(MioDriver: Driver);
 assert_impl_all!(Readiness: Copy, Send, Sync, std::fmt::Debug, Eq);
 assert_impl_all!(RegistrationClosed: Send, Sync, std::fmt::Debug, std::fmt::Display, std::error::Error);
 assert_impl_all!(Registered<TcpStream>: Send, Unpin);
+assert_impl_all!(ExclusiveRegistered<TcpStream>: Send, Unpin);
 
 #[test]
 fn primary_driver_registers_and_reports_repeat_readiness() {
@@ -188,6 +189,21 @@ fn drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
 }
 
 #[test]
+fn exclusive_drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
+    let current = std::thread::current().id();
+    let (io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
+    let (deregister_tx, deregister_rx) = mpsc::channel();
+    let registration = io
+        .register_exclusive(recording_source().with_deregister_reporter(deregister_tx), Interest::READABLE)
+        .unwrap();
+
+    drop(registration);
+
+    assert_eq!(deregister_rx.recv().unwrap(), current);
+    driver.shutdown().unwrap();
+}
+
+#[test]
 fn context_clone_registers_on_the_calling_thread_and_relocation_selects_destination_worker() {
     let (mut io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let external = io.clone();
@@ -296,6 +312,36 @@ fn secondary_shutdown_deregisters_live_sources_before_stopping_the_poller() {
 
     assert_eq!(deregister_rx.recv().unwrap(), current);
     assert_eq!(registration.source().err().unwrap(), RegistrationClosed);
+}
+
+#[test]
+fn exclusive_shutdown_can_race_source_access_and_releases_on_the_owner_thread() {
+    let current = std::thread::current().id();
+    let (io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (drop_tx, drop_rx) = mpsc::channel();
+    let registration = io
+        .register_exclusive(recording_source().with_drop_reporter(drop_tx), Interest::READABLE)
+        .unwrap();
+
+    let owner = std::thread::spawn(move || {
+        let mut registration = registration;
+        {
+            let _source = registration.source_mut().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }
+        assert_eq!(registration.source_mut().err().unwrap(), RegistrationClosed);
+        drop(registration);
+    });
+
+    entered_rx.recv().unwrap();
+    driver.shutdown().unwrap();
+    release_tx.send(()).unwrap();
+    owner.join().unwrap();
+
+    assert_ne!(drop_rx.recv().unwrap(), current);
 }
 
 #[test]
@@ -448,6 +494,7 @@ fn recording_source() -> RecordingSource {
     RecordingSource {
         reporter: None,
         deregister_reporter: None,
+        drop_reporter: None,
     }
 }
 
@@ -513,6 +560,7 @@ impl Wake for ChannelWake {
 struct RecordingSource {
     reporter: Option<mpsc::Sender<ThreadId>>,
     deregister_reporter: Option<mpsc::Sender<ThreadId>>,
+    drop_reporter: Option<mpsc::Sender<ThreadId>>,
 }
 
 impl RecordingSource {
@@ -524,6 +572,19 @@ impl RecordingSource {
     fn with_deregister_reporter(mut self, reporter: mpsc::Sender<ThreadId>) -> Self {
         self.deregister_reporter = Some(reporter);
         self
+    }
+
+    fn with_drop_reporter(mut self, reporter: mpsc::Sender<ThreadId>) -> Self {
+        self.drop_reporter = Some(reporter);
+        self
+    }
+}
+
+impl Drop for RecordingSource {
+    fn drop(&mut self) {
+        if let Some(reporter) = &self.drop_reporter {
+            let _ = reporter.send(std::thread::current().id());
+        }
     }
 }
 

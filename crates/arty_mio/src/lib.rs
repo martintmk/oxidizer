@@ -30,7 +30,7 @@
 //!     let io = builtins.io().context::<MioContext>(&MioOptions::default());
 //!     let address = "127.0.0.1:0".parse().expect("the example address is valid");
 //!     let socket = mio::net::UdpSocket::bind(address)?;
-//!     let socket = io.register(socket, Interest::READABLE)?;
+//!     let mut socket = io.register_exclusive(socket, Interest::READABLE)?;
 //!
 //!     loop {
 //!         let mut buffer = [0; 1_024];
@@ -58,7 +58,7 @@ pub use context::MioContext;
 pub use driver::MioDriver;
 pub use options::MioOptions;
 pub use readiness::{Readiness, RegistrationClosed};
-pub use registration::{Registered, SourceMut, SourceRef};
+pub use registration::{ExclusiveRegistered, Registered, SourceMut, SourceRef};
 
 mod context;
 mod driver;

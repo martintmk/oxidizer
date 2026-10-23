@@ -36,7 +36,7 @@ async fn receive(builtins: &Builtins) -> io::Result<()> {
     let io = builtins.io().context::<MioContext>(&MioOptions::default());
     let address = "127.0.0.1:0".parse().expect("the example address is valid");
     let socket = mio::net::UdpSocket::bind(address)?;
-    let socket = io.register(socket, Interest::READABLE)?;
+    let mut socket = io.register_exclusive(socket, Interest::READABLE)?;
 
     loop {
         let mut buffer = [0; 1_024];
@@ -66,5 +66,5 @@ async fn receive(builtins: &Builtins) -> io::Result<()> {
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty_mio">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbEcNJEnjZt3Ebli-Z7Zb_zYcbpOmJjS20ZuAbYg-3-wsKzY9hZIGCaGFydHlfbWlvZTAuMS4w
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQb0gPkGWji-GobSs3nxMG_ff4bdBtE3w0hdbobhZdScbkPjBVhZIGCaGFydHlfbWlvZTAuMS4w
  [__link0]: https://docs.rs/arty_mio/0.1.0/arty_mio/?search=MioContext

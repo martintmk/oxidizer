@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arty::task::Scheduler;
-use arty_mio::{MioContext, Registered, RegistrationClosed};
+use arty_mio::{ExclusiveRegistered, MioContext, RegistrationClosed};
 use fetch_options::SocketOptions;
 use futures::future::{Either, select};
 use http::uri::Scheme;
@@ -264,7 +264,7 @@ impl Dialer for MioDialer {
             apply_buffer_options(&stream, options).map_err(|error| AttemptFailure::new(address, AttemptPhase::SocketOption, error))?;
 
             let registration = context
-                .register(stream, Interest::READABLE | Interest::WRITABLE)
+                .register_exclusive(stream, Interest::READABLE | Interest::WRITABLE)
                 .map_err(|error| AttemptFailure::new(address, AttemptPhase::Registration, error))?;
 
             let info = complete_connect(&registration)
@@ -295,7 +295,7 @@ fn apply_buffer_options(stream: &TcpStream, options: SocketOptions) -> io::Resul
     Ok(())
 }
 
-async fn complete_connect(registration: &Registered<TcpStream>) -> io::Result<MioConnectionInfo> {
+async fn complete_connect(registration: &ExclusiveRegistered<TcpStream>) -> io::Result<MioConnectionInfo> {
     loop {
         registration.readiness(Interest::WRITABLE).await.map_err(registration_closed)?;
 
