@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::{self, IoSlice, Read as _, Write as _};
+use std::mem::MaybeUninit;
 use std::net::{Shutdown, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -13,12 +14,12 @@ use hyper_util::client::legacy::connect::{Connected, Connection};
 use mio::Interest;
 use mio::net::TcpStream;
 
-const READ_BUFFER_SIZE: usize = 16 * 1_024;
-
 type ReadinessFuture = Pin<Box<dyn Future<Output = Result<Readiness, RegistrationClosed>> + Send + 'static>>;
 
 trait StreamIo: Send + Unpin + 'static {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+    /// On success, returns at most `buffer.len()`, initializes that many leading
+    /// entries, and does not inspect the buffer's previous contents.
+    fn read(&mut self, buffer: &mut [MaybeUninit<u8>]) -> io::Result<usize>;
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize>;
     fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> io::Result<usize>;
     fn flush(&mut self) -> io::Result<()>;
@@ -63,7 +64,6 @@ struct RegisteredIo {
 
 struct StreamCore<I> {
     io: I,
-    read_buffer: Box<[u8]>,
     read_wait: Option<ReadinessFuture>,
     write_wait: Option<ReadinessFuture>,
 }
@@ -81,7 +81,6 @@ impl<I> StreamCore<I> {
     fn new(io: I) -> Self {
         Self {
             io,
-            read_buffer: vec![0; READ_BUFFER_SIZE].into_boxed_slice(),
             read_wait: None,
             write_wait: None,
         }
@@ -100,17 +99,22 @@ impl fmt::Debug for MioStream {
 impl<I: StreamIo> StreamCore<I> {
     fn poll_read(&mut self, cx: &mut Context<'_>, mut buf: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
         loop {
-            let available = buf.remaining().min(self.read_buffer.len());
-            if available == 0 {
+            if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
 
-            let result = self.io.read(&mut self.read_buffer[..available]);
+            // SAFETY: `StreamIo::read` preserves initialized bytes and reports
+            // exactly how many leading entries it initialized.
+            let result = self.io.read(unsafe { buf.as_mut() });
 
             match result {
                 Ok(length) => {
                     self.read_wait = None;
-                    buf.put_slice(&self.read_buffer[..length]);
+                    // SAFETY: `StreamIo::read` initialized the first `length`
+                    // entries in the cursor's unfilled region.
+                    unsafe {
+                        buf.advance(length);
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -205,7 +209,11 @@ impl<I: StreamIo> StreamCore<I> {
 }
 
 impl StreamIo for RegisteredIo {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buffer: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
+        // SAFETY: Mio's `TcpStream` delegates to the operating-system socket
+        // read, which only writes to the supplied memory and returns the number
+        // of bytes initialized.
+        let buffer = unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), buffer.len()) };
         self.registration.source_mut().map_err(registration_closed)?.read(buffer)
     }
 
@@ -347,7 +355,32 @@ mod tests {
         let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
 
         assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_ready());
-        assert!(buffer.filled().is_empty());
+        assert_eq!(buffer.filled(), b"");
+    }
+
+    #[test]
+    fn read_initializes_the_full_hyper_buffer_without_an_intermediate_cap() {
+        const LENGTH: usize = 256 * 1_024;
+
+        let expected = (0_u8..=u8::MAX).cycle().take(LENGTH).collect::<Vec<_>>();
+        let mut core = StreamCore::new(ScriptedIo::new(vec![ReadStep::Data(expected.clone())], vec![]));
+        let mut bytes = vec![MaybeUninit::uninit(); LENGTH];
+        let mut buffer = hyper::rt::ReadBuf::uninit(&mut bytes);
+
+        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_ready());
+        assert_eq!(buffer.filled(), expected);
+        assert_eq!(core.io.read_calls(), 1);
+    }
+
+    #[test]
+    fn full_hyper_buffer_skips_io_and_readiness() {
+        let io = ScriptedIo::new(vec![ReadStep::Data(b"unused".to_vec())], vec![]);
+        let mut core = StreamCore::new(io.clone());
+        let mut bytes = [];
+        let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
+
+        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_ready());
+        assert_eq!(io.read_calls(), 0);
     }
 
     #[test]
@@ -423,13 +456,15 @@ mod tests {
     }
 
     impl StreamIo for ScriptedIo {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        fn read(&mut self, buffer: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
             self.read_calls.fetch_add(1, Ordering::SeqCst);
             let step = self.reads.lock().unwrap().pop_front().unwrap_or(ReadStep::WouldBlock);
             match step {
                 ReadStep::Data(data) => {
                     let length = data.len().min(buffer.len());
-                    buffer[..length].copy_from_slice(&data[..length]);
+                    for (destination, source) in buffer.iter_mut().zip(data) {
+                        destination.write(source);
+                    }
                     Ok(length)
                 }
                 ReadStep::Eof => Ok(0),
