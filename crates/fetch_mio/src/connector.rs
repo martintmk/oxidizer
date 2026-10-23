@@ -28,19 +28,15 @@ use crate::{MioConnectionInfo, MioStream};
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
 
-type AttemptFuture = Pin<Box<dyn Future<Output = std::result::Result<MioStream, AttemptFailure>> + Send + 'static>>;
-
 trait Resolver {
     fn resolve(&self, host: String, port: u16) -> impl Future<Output = Result<Vec<SocketAddr>>> + Send + 'static;
 }
 
 trait Dialer {
     type Stream;
+    type Future: Future<Output = std::result::Result<Self::Stream, AttemptFailure>> + Send + Unpin + 'static;
 
-    fn connect(
-        &self,
-        address: SocketAddr,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<Self::Stream, AttemptFailure>> + Send + 'static>>;
+    fn connect(&self, address: SocketAddr) -> Self::Future;
 }
 
 /// Configuration for [`MioConnector`].
@@ -247,7 +243,7 @@ where
     }
 }
 
-fn launch<D>(attempts: &mut Attempts<D::Stream>, index: usize, address: SocketAddr, dialer: &D)
+fn launch<D>(attempts: &mut Attempts<D::Stream, D::Future>, index: usize, address: SocketAddr, dialer: &D)
 where
     D: Dialer,
 {
@@ -262,33 +258,87 @@ struct MioDialer {
 
 impl Dialer for MioDialer {
     type Stream = MioStream;
+    type Future = MioConnectFuture;
 
-    fn connect(&self, address: SocketAddr) -> AttemptFuture {
-        let context = self.context.clone();
-        let options = self.options;
-        Box::pin(async move {
-            let stream = TcpStream::connect(address).map_err(|error| AttemptFailure::new(address, AttemptPhase::Connect, error))?;
-            apply_buffer_options(&stream, options).map_err(|error| AttemptFailure::new(address, AttemptPhase::SocketOption, error))?;
-
-            let registration = context
-                .register_exclusive(stream, Interest::READABLE | Interest::WRITABLE)
-                .map_err(|error| AttemptFailure::new(address, AttemptPhase::Registration, error))?;
-
-            let info = complete_connect(&registration)
-                .await
-                .map_err(|error| AttemptFailure::new(address, AttemptPhase::Connect, error))?;
-
-            if let Some(no_delay) = options.no_delay {
-                registration
-                    .source()
-                    .map_err(registration_closed)
-                    .and_then(|source| source.set_nodelay(no_delay))
-                    .map_err(|error| AttemptFailure::new(address, AttemptPhase::SocketOption, error))?;
-            }
-
-            Ok(MioStream::new(registration, info))
-        })
+    fn connect(&self, address: SocketAddr) -> Self::Future {
+        MioConnectFuture {
+            address,
+            options: self.options,
+            state: MioConnectState::Start(self.context.clone()),
+        }
     }
+}
+
+struct MioConnectFuture {
+    address: SocketAddr,
+    options: SocketOptions,
+    state: MioConnectState,
+}
+
+enum MioConnectState {
+    Start(MioContext),
+    Connecting(ExclusiveRegistered<TcpStream>),
+    Done,
+}
+
+impl Future for MioConnectFuture {
+    type Output = std::result::Result<MioStream, AttemptFailure>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if matches!(this.state, MioConnectState::Start(_)) {
+            let MioConnectState::Start(context) = std::mem::replace(&mut this.state, MioConnectState::Done) else {
+                return Poll::Ready(Err(completed_dial_error(this.address)));
+            };
+            let stream = match TcpStream::connect(this.address) {
+                Ok(stream) => stream,
+                Err(error) => return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::Connect, error))),
+            };
+            if let Err(error) = apply_buffer_options(&stream, this.options) {
+                return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::SocketOption, error)));
+            }
+            let registration = match context.register_exclusive(stream, Interest::READABLE | Interest::WRITABLE) {
+                Ok(registration) => registration,
+                Err(error) => return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::Registration, error))),
+            };
+            this.state = MioConnectState::Connecting(registration);
+        }
+
+        let MioConnectState::Connecting(registration) = &this.state else {
+            return Poll::Ready(Err(completed_dial_error(this.address)));
+        };
+        let info = match poll_complete_connect(registration, cx) {
+            Poll::Ready(Ok(info)) => info,
+            Poll::Ready(Err(error)) => {
+                this.state = MioConnectState::Done;
+                return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::Connect, error)));
+            }
+            Poll::Pending => return Poll::Pending,
+        };
+
+        if let Some(no_delay) = this.options.no_delay
+            && let Err(error) = registration
+                .source()
+                .map_err(registration_closed)
+                .and_then(|source| source.set_nodelay(no_delay))
+        {
+            this.state = MioConnectState::Done;
+            return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::SocketOption, error)));
+        }
+
+        let MioConnectState::Connecting(registration) = std::mem::replace(&mut this.state, MioConnectState::Done) else {
+            return Poll::Ready(Err(completed_dial_error(this.address)));
+        };
+        Poll::Ready(Ok(MioStream::new(registration, info)))
+    }
+}
+
+fn completed_dial_error(address: SocketAddr) -> AttemptFailure {
+    AttemptFailure::new(
+        address,
+        AttemptPhase::Connect,
+        io::Error::other("the completed dial future was polled again"),
+    )
 }
 
 fn apply_buffer_options(stream: &TcpStream, options: SocketOptions) -> io::Result<()> {
@@ -302,12 +352,19 @@ fn apply_buffer_options(stream: &TcpStream, options: SocketOptions) -> io::Resul
     Ok(())
 }
 
-async fn complete_connect(registration: &ExclusiveRegistered<TcpStream>) -> io::Result<MioConnectionInfo> {
+fn poll_complete_connect(registration: &ExclusiveRegistered<TcpStream>, context: &mut Context<'_>) -> Poll<io::Result<MioConnectionInfo>> {
     loop {
-        registration.readiness(Interest::WRITABLE).await.map_err(registration_closed)?;
+        match registration.poll_write_ready(context) {
+            Poll::Ready(Ok(_readiness)) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(registration_closed(error))),
+            Poll::Pending => return Poll::Pending,
+        }
 
         loop {
-            let source = registration.source().map_err(registration_closed)?;
+            let source = match registration.source() {
+                Ok(source) => source,
+                Err(error) => return Poll::Ready(Err(registration_closed(error))),
+            };
             let connect_error = match source.take_error() {
                 Ok(None) => None,
                 Ok(Some(error)) | Err(error) => Some(error),
@@ -316,19 +373,22 @@ async fn complete_connect(registration: &ExclusiveRegistered<TcpStream>) -> io::
                 match connect_error_action(&error) {
                     ConnectErrorAction::Retry => continue,
                     ConnectErrorAction::Wait => break,
-                    ConnectErrorAction::Fail => return Err(error),
+                    ConnectErrorAction::Fail => return Poll::Ready(Err(error)),
                 }
             }
 
             match source.peer_addr() {
                 Ok(peer_addr) => {
-                    let local_addr = source.local_addr()?;
-                    return Ok(MioConnectionInfo::new(local_addr, peer_addr));
+                    let local_addr = match source.local_addr() {
+                        Ok(local_addr) => local_addr,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
+                    return Poll::Ready(Ok(MioConnectionInfo::new(local_addr, peer_addr)));
                 }
                 Err(error) => match connect_error_action(&error) {
                     ConnectErrorAction::Retry => {}
                     ConnectErrorAction::Wait => break,
-                    ConnectErrorAction::Fail => return Err(error),
+                    ConnectErrorAction::Fail => return Poll::Ready(Err(error)),
                 },
             }
         }
@@ -380,22 +440,25 @@ fn finish_failures(failures: Vec<Option<AttemptFailure>>) -> HttpError {
     connect_failures(failures.into_iter().flatten().collect())
 }
 
-type BoxAttempt<T> = Pin<Box<dyn Future<Output = std::result::Result<T, AttemptFailure>> + Send + 'static>>;
-
-struct Attempts<T> {
-    slots: Vec<Option<BoxAttempt<T>>>,
+struct Attempts<T, F> {
+    slots: Vec<Option<F>>,
     active: usize,
+    _stream: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T> Attempts<T> {
+impl<T, F> Attempts<T, F>
+where
+    F: Future<Output = std::result::Result<T, AttemptFailure>> + Unpin,
+{
     fn new(capacity: usize) -> Self {
         Self {
             slots: std::iter::repeat_with(|| None).take(capacity).collect(),
             active: 0,
+            _stream: std::marker::PhantomData,
         }
     }
 
-    fn insert(&mut self, index: usize, future: BoxAttempt<T>) {
+    fn insert(&mut self, index: usize, future: F) {
         self.slots[index] = Some(future);
         self.active += 1;
     }
@@ -413,7 +476,7 @@ impl<T> Attempts<T> {
             let Some(future) = slot else {
                 continue;
             };
-            if let Poll::Ready(result) = future.as_mut().poll(cx) {
+            if let Poll::Ready(result) = Pin::new(future).poll(cx) {
                 *slot = None;
                 self.active -= 1;
                 return Poll::Ready(Some((index, result)));
@@ -612,18 +675,15 @@ pub mod benchmark {
 
     impl Dialer for ScriptedDialer {
         type Stream = usize;
+        type Future = ScriptedAttempt;
 
-        fn connect(
-            &self,
-            address: SocketAddr,
-        ) -> Pin<Box<dyn Future<Output = std::result::Result<Self::Stream, AttemptFailure>> + Send + 'static>> {
+        fn connect(&self, address: SocketAddr) -> Self::Future {
             let index = self.launches.fetch_add(1, Ordering::Relaxed);
-            let future = ScriptedAttempt {
+            ScriptedAttempt {
                 address,
                 index,
                 script: self.scripts[index],
-            };
-            Box::pin(future)
+            }
         }
     }
 
@@ -845,19 +905,33 @@ mod tests {
 
     impl Dialer for ScriptedDialer {
         type Stream = &'static str;
+        type Future = ScriptedAttemptFuture;
 
-        fn connect(
-            &self,
-            address: SocketAddr,
-        ) -> Pin<Box<dyn Future<Output = std::result::Result<Self::Stream, AttemptFailure>> + Send + 'static>> {
+        fn connect(&self, address: SocketAddr) -> Self::Future {
             self.launches.lock().unwrap().push(address);
             let script = self.scripts.lock().unwrap().pop_front().unwrap();
             match script {
-                AttemptScript::Pending(future) => Box::pin(future),
-                AttemptScript::Success(value) => Box::pin(std::future::ready(Ok(value))),
+                AttemptScript::Pending(future) => ScriptedAttemptFuture::Pending(future),
+                AttemptScript::Success(value) => ScriptedAttemptFuture::Ready(Some(Ok(value))),
                 AttemptScript::Failure(phase, kind) => {
-                    Box::pin(std::future::ready(Err(AttemptFailure::new(address, phase, io::Error::from(kind)))))
+                    ScriptedAttemptFuture::Ready(Some(Err(AttemptFailure::new(address, phase, io::Error::from(kind)))))
                 }
+            }
+        }
+    }
+
+    enum ScriptedAttemptFuture {
+        Pending(ManualAttemptFuture),
+        Ready(Option<std::result::Result<&'static str, AttemptFailure>>),
+    }
+
+    impl Future for ScriptedAttemptFuture {
+        type Output = std::result::Result<&'static str, AttemptFailure>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match &mut *self {
+                Self::Pending(future) => Pin::new(future).poll(cx),
+                Self::Ready(result) => Poll::Ready(result.take().unwrap()),
             }
         }
     }
