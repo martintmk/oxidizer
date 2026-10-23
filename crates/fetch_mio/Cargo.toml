@@ -89,3 +89,7 @@ harness = false
 [[bench]]
 name = "fetch_mio_readiness"
 harness = false
+
+[[bench]]
+name = "fetch_mio_flush"
+harness = false

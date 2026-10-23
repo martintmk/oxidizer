@@ -333,10 +333,6 @@ impl StreamIo for ScriptedIo {
         self.write(buffers.first().map_or(&[], |buffer| &**buffer))
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
     fn shutdown(&self) -> io::Result<()> {
         Ok(())
     }

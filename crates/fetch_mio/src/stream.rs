@@ -19,7 +19,6 @@ pub(crate) trait StreamIo: Send + Unpin + 'static {
     fn read(&mut self, buffer: &mut [MaybeUninit<u8>]) -> io::Result<usize>;
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize>;
     fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> io::Result<usize>;
-    fn flush(&mut self) -> io::Result<()>;
     fn shutdown(&self) -> io::Result<()>;
     fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>>;
     fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>>;
@@ -138,22 +137,9 @@ impl<I: StreamIo> StreamCore<I> {
         }
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            let result = self.io.flush();
-
-            match result {
-                Ok(()) => return Poll::Ready(Ok(())),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Poll::Ready(Err(error)),
-            }
-
-            match self.io.poll_write_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+    pub(crate) const fn poll_flush() -> Poll<io::Result<()>> {
+        // Raw TCP writes go directly to the socket. There is no user-space buffer to flush.
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(&self) -> Poll<io::Result<()>> {
@@ -196,10 +182,6 @@ impl StreamIo for RegisteredIo {
         self.registration.source_mut().map_err(registration_closed)?.write_vectored(buffers)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.registration.source_mut().map_err(registration_closed)?.flush()
-    }
-
     fn shutdown(&self) -> io::Result<()> {
         self.registration.source().map_err(registration_closed)?.shutdown(Shutdown::Write)
     }
@@ -228,8 +210,8 @@ impl Write for MioStream {
         self.core.poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.core.poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        StreamCore::<RegisteredIo>::poll_flush()
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -354,6 +336,11 @@ mod tests {
     }
 
     #[test]
+    fn raw_tcp_flush_is_an_immediate_noop() {
+        assert!(matches!(StreamCore::<ScriptedIo>::poll_flush(), Poll::Ready(Ok(()))));
+    }
+
+    #[test]
     fn dropping_pending_stream_cleans_up_io_and_waiter() {
         let io = ScriptedIo::new(vec![], vec![]);
         let drops = Arc::clone(&io.drops);
@@ -438,10 +425,6 @@ mod tests {
 
         fn write_vectored(&mut self, _buffers: &[IoSlice<'_>]) -> io::Result<usize> {
             self.next_write()
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
         }
 
         fn shutdown(&self) -> io::Result<()> {
