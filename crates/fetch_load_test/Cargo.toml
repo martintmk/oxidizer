@@ -1,0 +1,45 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "fetch_load_test"
+description = "Local load comparison for the Fetch Tokio and Arty runtime integrations."
+version = "0.0.0"
+publish = false
+
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository = "https://github.com/microsoft/oxidizer"
+
+[dependencies]
+argh.workspace = true
+arty = { workspace = true, features = ["rt"] }
+bytesbuf = { workspace = true, features = ["std"] }
+fetch = { workspace = true, features = ["arty", "rustls", "tokio"] }
+fastrand.workspace = true
+futures = { workspace = true, features = ["async-await", "executor", "std"] }
+hdrhistogram.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2.workspace = true
+thread_aware = { workspace = true, features = ["std"] }
+tick = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+# >>> anvil-managed: anvil-lints
+[lints]
+workspace = true
+# <<< anvil-managed: anvil-lints

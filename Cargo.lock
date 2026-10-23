@@ -2063,6 +2063,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fetch_load_test"
+version = "0.0.0"
+dependencies = [
+ "argh",
+ "arty",
+ "bytesbuf",
+ "fastrand",
+ "fetch",
+ "futures",
+ "hdrhistogram",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thread_aware",
+ "tick",
+ "tokio",
+ "windows",
+]
+
+[[package]]
 name = "fetch_mio"
 version = "0.1.0"
 dependencies = [
@@ -2645,6 +2665,16 @@ dependencies = [
  "allocator-api2 0.2.21",
  "equivalent",
  "foldhash 0.2.0",
+]
+
+[[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
 ]
 
 [[package]]
@@ -5576,6 +5606,17 @@ name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
