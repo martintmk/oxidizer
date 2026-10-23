@@ -41,5 +41,8 @@ mod connector;
 mod error;
 mod stream;
 
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+pub use connector::benchmark;
 pub use connector::{MioConnector, MioConnectorOptions};
 pub use stream::{MioConnectionInfo, MioStream};

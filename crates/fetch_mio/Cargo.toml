@@ -36,6 +36,7 @@ ignored = ["ctor"]
 
 [features]
 default = []
+benchmark = ["tick/test-util"]
 
 [dependencies]
 # internal
@@ -93,3 +94,8 @@ harness = false
 [[bench]]
 name = "fetch_mio_flush"
 harness = false
+
+[[bench]]
+name = "connector_path"
+harness = false
+required-features = ["benchmark"]

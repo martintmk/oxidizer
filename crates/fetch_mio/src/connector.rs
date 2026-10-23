@@ -11,7 +11,6 @@ use std::time::Duration;
 use arty::task::Scheduler;
 use arty_mio::{ExclusiveRegistered, MioContext, RegistrationClosed};
 use fetch_options::SocketOptions;
-use futures::future::{Either, select};
 use http::uri::Scheme;
 use http_extensions::{HttpError, Result};
 use layered::Service;
@@ -30,10 +29,9 @@ use crate::{MioConnectionInfo, MioStream};
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
 
 type AttemptFuture = Pin<Box<dyn Future<Output = std::result::Result<MioStream, AttemptFailure>> + Send + 'static>>;
-type ResolveFuture = Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>>> + Send + 'static>>;
 
 trait Resolver {
-    fn resolve(&self, host: String, port: u16) -> ResolveFuture;
+    fn resolve(&self, host: String, port: u16) -> impl Future<Output = Result<Vec<SocketAddr>>> + Send + 'static;
 }
 
 trait Dialer {
@@ -93,14 +91,13 @@ impl Service<BaseUri> for MioConnector {
     async fn execute(&self, input: BaseUri) -> Self::Out {
         validate_scheme(&input)?;
         let port = input.try_effective_port()?;
-        let addresses = SystemResolver {
-            scheduler: self.scheduler.clone(),
-        }
-        .resolve(input.host().to_owned(), port)
-        .await?;
-        race_connections(
+        connect_with(
             &self.clock,
-            addresses,
+            input.host().to_owned(),
+            port,
+            &SystemResolver {
+                scheduler: self.scheduler.clone(),
+            },
             &MioDialer {
                 context: self.context.clone(),
                 options: self.options.socket,
@@ -123,15 +120,25 @@ fn validate_scheme(input: &BaseUri) -> Result<()> {
     ))
 }
 
+async fn connect_with<R, D>(clock: &Clock, host: String, port: u16, resolver: &R, dialer: &D) -> Result<D::Stream>
+where
+    R: Resolver + Sync,
+    D: Dialer + Sync,
+    D::Stream: Send,
+{
+    let addresses = resolver.resolve(host, port).await?;
+    race_connections(clock, addresses, dialer).await
+}
+
 #[derive(Clone)]
 struct SystemResolver {
     scheduler: Scheduler,
 }
 
 impl Resolver for SystemResolver {
-    fn resolve(&self, host: String, port: u16) -> ResolveFuture {
+    fn resolve(&self, host: String, port: u16) -> impl Future<Output = Result<Vec<SocketAddr>>> + Send + 'static {
         let scheduler = self.scheduler.clone();
-        Box::pin(async move {
+        async move {
             let result = scheduler
                 .spawn_blocking(move || {
                     let addresses = (host.as_str(), port).to_socket_addrs()?.collect::<Vec<_>>();
@@ -147,7 +154,7 @@ impl Resolver for SystemResolver {
                 .map_err(|error| unavailable(error, LABEL_RUNTIME))?;
 
             result.map_err(|error| io_error(error, LABEL_DNS))
-        })
+        }
     }
 }
 
@@ -197,7 +204,7 @@ where
 
     launch(&mut attempts, next, addresses[next], dialer);
     next += 1;
-    let mut delay = Box::pin(clock.delay(HAPPY_EYEBALLS_DELAY));
+    let mut delay = clock.delay(HAPPY_EYEBALLS_DELAY);
 
     loop {
         if next == addresses.len() {
@@ -211,31 +218,31 @@ where
             continue;
         }
 
-        let (attempt, remaining_delay) = {
-            match select(Box::pin(attempts.next()), delay).await {
-                Either::Left((attempt, remaining_delay)) => (Some(attempt), Some(remaining_delay)),
-                Either::Right(((), pending_attempt)) => {
-                    drop(pending_attempt);
-                    (None, None)
-                }
+        let attempt = poll_fn(|cx| {
+            if let Poll::Ready(attempt) = attempts.poll_next(cx) {
+                return Poll::Ready(attempt);
             }
-        };
+            if Pin::new(&mut delay).poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            Poll::Pending
+        })
+        .await;
 
-        if let Some(Some((index, result))) = attempt {
+        if let Some((index, result)) = attempt {
             match result {
                 Ok(stream) => return Ok(stream),
                 Err(error) => {
                     failures[index] = Some(error);
                     launch(&mut attempts, next, addresses[next], dialer);
                     next += 1;
-                    drop(remaining_delay);
-                    delay = Box::pin(clock.delay(HAPPY_EYEBALLS_DELAY));
+                    delay = clock.delay(HAPPY_EYEBALLS_DELAY);
                 }
             }
         } else {
             launch(&mut attempts, next, addresses[next], dialer);
             next += 1;
-            delay = Box::pin(clock.delay(HAPPY_EYEBALLS_DELAY));
+            delay = clock.delay(HAPPY_EYEBALLS_DELAY);
         }
     }
 }
@@ -417,6 +424,232 @@ impl<T> Attempts<T> {
     }
 }
 
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+pub mod benchmark {
+    use std::net::SocketAddr;
+    use std::pin::{Pin, pin};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+    use std::{fmt, io};
+
+    use http_extensions::Result;
+    use tick::{Clock, ClockControl};
+
+    use super::{AttemptFailure, AttemptPhase, Dialer, Resolver, connect_with, order_addresses};
+
+    /// A deterministic connector path for benchmarks.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Scenario {
+        /// One address succeeds.
+        OneAddress,
+        /// The first of two addresses succeeds.
+        TwoAddressesFirstSuccess,
+        /// The second address starts after the 300 ms delay.
+        DelayedSecondLaunch,
+        /// The first address fails and the second address succeeds.
+        FastFailureThenSuccess,
+        /// Both addresses fail.
+        AllFailures,
+    }
+
+    impl Scenario {
+        const fn scripts(self) -> &'static [AttemptScript] {
+            match self {
+                Self::OneAddress | Self::TwoAddressesFirstSuccess => &[AttemptScript::Success],
+                Self::DelayedSecondLaunch => &[AttemptScript::Pending, AttemptScript::Success],
+                Self::FastFailureThenSuccess => &[AttemptScript::Failure, AttemptScript::Success],
+                Self::AllFailures => &[AttemptScript::Failure, AttemptScript::Failure],
+            }
+        }
+
+        fn addresses(self) -> Vec<SocketAddr> {
+            let mut addresses = vec![SocketAddr::from(([192, 0, 2, 1], 443))];
+            if !matches!(self, Self::OneAddress) {
+                addresses.push(SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443)));
+            }
+            addresses
+        }
+
+        const fn needs_delay_advance(self) -> bool {
+            matches!(self, Self::DelayedSecondLaunch)
+        }
+    }
+
+    /// Prepared state for one connector benchmark operation.
+    pub struct Harness {
+        scenario: Scenario,
+        control: ClockControl,
+        clock: Clock,
+        resolver: ScriptedResolver,
+        dialer: ScriptedDialer,
+    }
+
+    impl fmt::Debug for Harness {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Harness").field("scenario", &self.scenario).finish_non_exhaustive()
+        }
+    }
+
+    impl Harness {
+        /// Prepares one benchmark operation.
+        #[must_use]
+        pub fn new(scenario: Scenario) -> Self {
+            let control = ClockControl::new();
+            Self {
+                scenario,
+                clock: control.to_clock(),
+                control,
+                resolver: ScriptedResolver { scenario },
+                dialer: ScriptedDialer {
+                    scripts: scenario.scripts(),
+                    launches: AtomicUsize::new(0),
+                },
+            }
+        }
+    }
+
+    /// The retained output from one connector benchmark operation.
+    pub struct Output {
+        harness: Harness,
+        result: Result<usize>,
+        launches: usize,
+    }
+
+    impl fmt::Debug for Output {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Output")
+                .field("harness", &self.harness)
+                .field("result", &self.result)
+                .field("launches", &self.launches)
+                .finish()
+        }
+    }
+
+    impl Output {
+        /// Returns the number of address attempts that started.
+        #[must_use]
+        pub const fn launches(&self) -> usize {
+            self.launches
+        }
+
+        /// Returns true when the connector succeeded.
+        #[must_use]
+        pub const fn succeeded(&self) -> bool {
+            self.result.is_ok()
+        }
+
+        /// Keeps the prepared state alive until after measurement.
+        pub fn retain(self) {
+            std::hint::black_box(self.harness);
+            let _ = std::hint::black_box(self.result);
+        }
+    }
+
+    /// Runs one deterministic connector benchmark operation.
+    #[must_use]
+    #[expect(clippy::panic, reason = "benchmark scripts fail fast when production behavior changes")]
+    pub fn run(harness: Harness) -> Output {
+        let result = {
+            let future = connect_with(
+                &harness.clock,
+                "benchmark.invalid".to_owned(),
+                443,
+                &harness.resolver,
+                &harness.dialer,
+            );
+            // Stack-pin to keep benchmark allocations limited to the connector.
+            let mut future = pin!(future);
+            match poll(future.as_mut()) {
+                Poll::Ready(output) => output,
+                Poll::Pending if harness.scenario.needs_delay_advance() => {
+                    harness.control.advance(Duration::from_millis(300));
+                    expect_ready(poll(future.as_mut()))
+                }
+                Poll::Pending => panic!("the scripted connector did not complete"),
+            }
+        };
+
+        let launches = harness.dialer.launches.load(Ordering::Relaxed);
+        Output { harness, result, launches }
+    }
+
+    fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[expect(clippy::panic, reason = "benchmark scripts fail fast when production behavior changes")]
+    fn expect_ready<T>(poll: Poll<T>) -> T {
+        match poll {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("the scripted connector did not complete after the timer advanced"),
+        }
+    }
+
+    struct ScriptedResolver {
+        scenario: Scenario,
+    }
+
+    impl Resolver for ScriptedResolver {
+        fn resolve(&self, _host: String, _port: u16) -> impl Future<Output = Result<Vec<SocketAddr>>> + Send + 'static {
+            let scenario = self.scenario;
+            async move { Ok(order_addresses(scenario.addresses())) }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum AttemptScript {
+        Pending,
+        Success,
+        Failure,
+    }
+
+    struct ScriptedDialer {
+        scripts: &'static [AttemptScript],
+        launches: AtomicUsize,
+    }
+
+    impl Dialer for ScriptedDialer {
+        type Stream = usize;
+
+        fn connect(
+            &self,
+            address: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<Self::Stream, AttemptFailure>> + Send + 'static>> {
+            let index = self.launches.fetch_add(1, Ordering::Relaxed);
+            let future = ScriptedAttempt {
+                address,
+                index,
+                script: self.scripts[index],
+            };
+            Box::pin(future)
+        }
+    }
+
+    struct ScriptedAttempt {
+        address: SocketAddr,
+        index: usize,
+        script: AttemptScript,
+    }
+
+    impl Future for ScriptedAttempt {
+        type Output = std::result::Result<usize, AttemptFailure>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match self.script {
+                AttemptScript::Pending => Poll::Pending,
+                AttemptScript::Success => Poll::Ready(Ok(self.index)),
+                AttemptScript::Failure => Poll::Ready(Err(AttemptFailure::new(
+                    self.address,
+                    AttemptPhase::Connect,
+                    io::Error::from(io::ErrorKind::ConnectionRefused),
+                ))),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -578,10 +811,10 @@ mod tests {
     }
 
     impl Resolver for ScriptedResolver {
-        fn resolve(&self, host: String, port: u16) -> ResolveFuture {
+        fn resolve(&self, host: String, port: u16) -> impl Future<Output = Result<Vec<SocketAddr>>> + Send + 'static {
             self.calls.lock().unwrap().push((host, port));
             let result = self.result.lock().unwrap().take().unwrap();
-            Box::pin(std::future::ready(result))
+            std::future::ready(result)
         }
     }
 
