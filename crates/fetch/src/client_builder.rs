@@ -38,7 +38,7 @@ use crate::{BaseUri, RequestHandler};
 /// # Construction
 ///
 /// Create the builder with `HttpClient::builder_tokio`,
-/// `HttpClient::builder_arty`, `HttpClient::builder_arty_with_options`, or
+/// `HttpClient::builder_arty`, or
 /// [`custom::create_builder`](crate::custom::create_builder) for a custom transport.
 #[derive(Debug, Clone)]
 #[must_use]

@@ -23,9 +23,9 @@ allowed_external_types = [
     "bytesbuf::mem::has_memory::HasMemory",
     "bytesbuf::mem::memory::Memory",
     "data_privacy::redaction_engine::RedactionEngine",
+    "arty::io::handle::Io",
     "arty::task::builtins::Builtins",
-    "arty_mio::options::MioOptions",
-    "fetch_mio::connector::MioConnectorOptions",
+    "arty::task::scheduler::Scheduler",
     "fetch_options::*",
     "fetch_tls::*",
     "http::*",
@@ -82,7 +82,7 @@ seismograph = [
     "performables/seismograph",
     "tick/seismograph",
 ]
-test-util = ["tick/test-util", "http_extensions/test-util", "fetch_hyper?/test-util"]
+test-util = ["tick/test-util", "http_extensions/test-util"]
 compression-gzip = ["dep:compressors", "dep:http_compression", "http_compression/gzip"]
 # HTTP `deflate` is zlib-wrapped DEFLATE, which is `compressors/zlib`.
 compression-deflate = ["dep:compressors", "dep:http_compression", "http_compression/deflate"]
@@ -324,11 +324,11 @@ required-features = ["tokio", "rustls", "test-util"]
 
 [[test]]
 name = "arty"
-required-features = ["arty", "rustls", "test-util"]
+required-features = ["arty", "rustls"]
 
 [[test]]
 name = "arty_native_tls"
-required-features = ["arty", "native-tls", "test-util"]
+required-features = ["arty", "native-tls"]
 
 [[test]]
 name = "telemetry_scope"

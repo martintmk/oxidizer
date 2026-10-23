@@ -852,9 +852,8 @@
 //!   Tokio-based application.
 //!
 //! - **`arty`**: Enables integration with the Arty runtime and Mio I/O. This
-//!   feature provides [`HttpClient::builder_arty`] and
-//!   [`HttpClient::builder_arty_with_options`], and
-//!   [`HttpClient::new_arty`]. Enable `rustls` or `native-tls` with it.
+//!   feature provides [`HttpClient::builder_arty`] and [`HttpClient::new_arty`].
+//!   Enable `rustls` or `native-tls` with it.
 //!
 //! - **`json`**: Adds support for JSON serialization and deserialization, enabling methods like
 //!   `HttpRequestBuilder::json` for sending JSON data and `HttpRequestBuilder::fetch_json` for receiving JSON responses.
