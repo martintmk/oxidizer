@@ -152,16 +152,21 @@ impl WorkerState {
         }
     }
 
-    pub(crate) fn dispatch(&self, event: &Event) {
-        let registration = self
+    pub(crate) fn dispatch_batch(&self, events: &[Event], resolved: &mut Vec<Option<Arc<RegistrationEntry>>>) {
+        resolved.clear();
+        if events.is_empty() {
+            return;
+        }
+        let registrations = self
             .registrations
             .lock()
-            .expect("event dispatch does not call user code while the registration lock is held")
-            .values
-            .get(&event.token())
-            .cloned();
-        if let Some(registration) = registration {
-            registration.notify(event);
+            .expect("event batch resolution does not call user code while the registration lock is held");
+        resolved.extend(events.iter().map(|event| registrations.values.get(&event.token()).cloned()));
+        drop(registrations);
+        for (event, registration) in events.iter().zip(resolved.iter()) {
+            if let Some(registration) = registration {
+                registration.notify(event);
+            }
         }
     }
 

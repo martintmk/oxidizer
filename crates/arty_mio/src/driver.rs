@@ -12,6 +12,7 @@ use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole};
 use mio::event::Event;
 use mio::{Events, Poll, Registry};
 
+use crate::registration::RegistrationEntry;
 use crate::worker::{ContextState, DRIVER_WAKE_TOKEN, WorkerState};
 
 const COMPLETION_BUDGET: usize = 256;
@@ -178,6 +179,8 @@ struct PrimaryDriver {
     poll: Poll,
     events: Events,
     pending: VecDeque<Event>,
+    batch: Vec<Event>,
+    resolved: Vec<Option<Arc<RegistrationEntry>>>,
 }
 
 impl PrimaryDriver {
@@ -186,6 +189,8 @@ impl PrimaryDriver {
             poll,
             events: Events::with_capacity(EVENT_CAPACITY),
             pending: VecDeque::new(),
+            batch: Vec::with_capacity(COMPLETION_BUDGET),
+            resolved: Vec::with_capacity(COMPLETION_BUDGET),
         }
     }
 
@@ -224,8 +229,10 @@ impl PrimaryDriver {
 
     fn dispatch_pending(&mut self, worker: &WorkerState, budget: usize) -> usize {
         let count = budget.min(self.pending.len());
-        for event in self.pending.drain(..count) {
-            worker.dispatch(&event);
+        if count != 0 {
+            self.batch.clear();
+            self.batch.extend(self.pending.drain(..count));
+            worker.dispatch_batch(&self.batch, &mut self.resolved);
         }
         count
     }
@@ -235,6 +242,8 @@ struct SecondaryDriver {
     shared: Arc<SecondaryShared>,
     finished: std::sync::mpsc::Receiver<()>,
     thread: JoinHandle<()>,
+    events: Vec<Event>,
+    resolved: Vec<Option<Arc<RegistrationEntry>>>,
 }
 
 impl SecondaryDriver {
@@ -292,25 +301,25 @@ impl SecondaryDriver {
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(io::Error::other("the secondary Arty Mio poll thread stopped during creation")),
         };
-        Ok((Self { shared, finished, thread }, poll_waker, registry))
+        Ok((
+            Self {
+                shared,
+                finished,
+                thread,
+                events: Vec::with_capacity(COMPLETION_BUDGET),
+                resolved: Vec::with_capacity(COMPLETION_BUDGET),
+            },
+            poll_waker,
+            registry,
+        ))
     }
 
     fn attach(&self, worker: Arc<WorkerState>) {
         self.shared.set_worker(worker);
     }
 
-    fn execute_cycle(&self, worker: &WorkerState) -> Result<(), DriverError> {
-        let (events, failure, resume) = {
-            let mut state = self.shared.state();
-            let count = COMPLETION_BUDGET.min(state.events.len());
-            let events: Vec<_> = state.events.drain(..count).collect();
-            let failure = state.failure.take();
-            let resume = state.events.is_empty();
-            if resume {
-                state.paused = false;
-            }
-            (events, failure, resume)
-        };
+    fn execute_cycle(&mut self, worker: &WorkerState) -> Result<(), DriverError> {
+        let (failure, resume, has_events) = drain_secondary_events(&self.shared, &mut self.events);
         if resume {
             self.shared.ready.notify_one();
         }
@@ -320,10 +329,8 @@ impl SecondaryDriver {
         if let Some(error) = worker.take_failure() {
             return Err(DriverError::from_source(error));
         }
-        for event in &events {
-            worker.dispatch(event);
-        }
-        if self.shared.has_events() {
+        worker.dispatch_batch(&self.events, &mut self.resolved);
+        if has_events {
             worker.wake_owner();
         }
         Ok(())
@@ -350,6 +357,20 @@ impl SecondaryDriver {
             None => Ok(()),
         }
     }
+}
+
+fn drain_secondary_events(shared: &SecondaryShared, events: &mut Vec<Event>) -> (Option<io::Error>, bool, bool) {
+    events.clear();
+    let mut state = shared.state();
+    let count = COMPLETION_BUDGET.min(state.events.len());
+    events.extend(state.events.drain(..count));
+    let failure = state.failure.take();
+    let has_events = !state.events.is_empty();
+    let resume = !has_events;
+    if resume {
+        state.paused = false;
+    }
+    (failure, resume, has_events)
 }
 
 #[derive(Default)]
@@ -387,10 +408,6 @@ impl SecondaryShared {
 
     fn try_worker(&self) -> Option<Arc<WorkerState>> {
         self.state().worker.clone()
-    }
-
-    fn has_events(&self) -> bool {
-        !self.state().events.is_empty()
     }
 
     fn wait_until_resumed(&self) {
@@ -478,14 +495,18 @@ impl Wake for PollWake {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::sync::Arc;
-    use std::task::Waker;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+    use std::time::Duration;
 
-    use super::SecondaryDriver;
+    use mio::{Events, Poll, Token};
+
+    use super::{COMPLETION_BUDGET, EVENT_CAPACITY, PrimaryDriver, SecondaryDriver, SecondaryShared, drain_secondary_events};
     use crate::worker::WorkerState;
 
     #[test]
     fn secondary_background_failure_becomes_driver_error() {
-        let (driver, poll_waker, registry) = SecondaryDriver::new().unwrap();
+        let (mut driver, poll_waker, registry) = SecondaryDriver::new().unwrap();
         let worker = Arc::new(WorkerState::new(std::thread::current().id(), registry, Waker::noop().clone()));
         driver.attach(Arc::clone(&worker));
         driver.shared.fail(std::io::Error::other("scripted poll failure"));
@@ -496,5 +517,78 @@ mod tests {
         worker.close_registrations();
         driver.shutdown(&poll_waker, &worker).unwrap();
         poll_waker.deactivate();
+    }
+
+    #[test]
+    fn primary_full_capacity_batch_yields_after_each_budget() {
+        let poll = Poll::new().unwrap();
+        let owner = Arc::new(WakeCounter::default());
+        let worker = Arc::new(WorkerState::new(
+            std::thread::current().id(),
+            poll.registry().try_clone().unwrap(),
+            Waker::from(Arc::clone(&owner)),
+        ));
+        let mut driver = PrimaryDriver::new(poll);
+        driver.pending.extend(std::iter::repeat_n(wake_event(), EVENT_CAPACITY));
+
+        for remaining in [768, 512, 256, 0] {
+            driver.execute_cycle(&worker, Duration::ZERO).unwrap();
+            assert_eq!(driver.pending.len(), remaining);
+        }
+
+        assert_eq!(owner.count(), 3);
+    }
+
+    #[test]
+    fn secondary_full_capacity_batch_resumes_after_the_last_budget() {
+        let shared = SecondaryShared::default();
+        {
+            let mut state = shared.state();
+            state.events.extend(std::iter::repeat_n(wake_event(), EVENT_CAPACITY));
+            state.paused = true;
+        }
+        let mut events = Vec::with_capacity(COMPLETION_BUDGET);
+
+        for remaining in [768, 512, 256] {
+            let (_failure, resume, has_events) = drain_secondary_events(&shared, &mut events);
+            assert_eq!(events.len(), COMPLETION_BUDGET);
+            assert!(has_events);
+            assert!(!resume);
+            assert_eq!(shared.state().events.len(), remaining);
+        }
+
+        let (_failure, resume, has_events) = drain_secondary_events(&shared, &mut events);
+        assert_eq!(events.len(), COMPLETION_BUDGET);
+        assert!(!has_events);
+        assert!(resume);
+        assert!(!shared.state().paused);
+    }
+
+    fn wake_event() -> mio::event::Event {
+        let mut poll = Poll::new().unwrap();
+        let waker = mio::Waker::new(poll.registry(), Token(0)).unwrap();
+        let mut events = Events::with_capacity(1);
+        waker.wake().unwrap();
+        poll.poll(&mut events, Some(Duration::ZERO)).unwrap();
+        events.iter().next().unwrap().clone()
+    }
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl WakeCounter {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

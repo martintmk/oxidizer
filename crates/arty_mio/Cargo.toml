@@ -58,5 +58,9 @@ name = "registration"
 harness = false
 
 [[bench]]
+name = "event_dispatch"
+harness = false
+
+[[bench]]
 name = "source_access"
 harness = false
