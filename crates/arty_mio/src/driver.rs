@@ -14,7 +14,6 @@ use mio::{Events, Poll, Registry};
 
 use crate::worker::{ContextState, DRIVER_WAKE_TOKEN, WorkerState};
 
-const COMMAND_BUDGET: usize = 256;
 const COMPLETION_BUDGET: usize = 256;
 const EVENT_CAPACITY: usize = 1_024;
 const SHUTDOWN_LIMIT: Duration = Duration::from_secs(1);
@@ -40,28 +39,24 @@ impl MioDriver {
             ));
         }
 
-        let (mode, poll_waker) = match options.role() {
+        let (mode, poll_waker, registry) = match options.role() {
             DriverRole::Primary => {
                 let poll = Poll::new().map_err(DriverError::from_source)?;
                 let poll_waker = Arc::new(PollWake::new(poll.registry()).map_err(DriverError::from_source)?);
-                (DriverMode::Primary(PrimaryDriver::new(poll)), poll_waker)
+                let registry = poll.registry().try_clone().map_err(DriverError::from_source)?;
+                (DriverMode::Primary(PrimaryDriver::new(poll)), poll_waker, registry)
             }
             DriverRole::Secondary => {
-                let (driver, poll_waker) = SecondaryDriver::new().map_err(DriverError::from_source)?;
-                (DriverMode::Secondary(driver), poll_waker)
+                let (driver, poll_waker, registry) = SecondaryDriver::new().map_err(DriverError::from_source)?;
+                (DriverMode::Secondary(driver), poll_waker, registry)
             }
         };
 
-        let worker = Arc::new(WorkerState::new(
-            options.thread().id(),
-            Arc::clone(&poll_waker),
-            options.owner_waker().clone(),
-        ));
+        let worker = Arc::new(WorkerState::new(options.thread().id(), registry, options.owner_waker().clone()));
         if let DriverMode::Secondary(driver) = &mode {
             driver.attach(Arc::clone(&worker));
         }
         if let Err(error) = state.install(Arc::clone(&worker)) {
-            worker.begin_close();
             worker.close_registrations();
             let cleanup = match mode {
                 DriverMode::Primary(_) => Ok(()),
@@ -138,12 +133,10 @@ impl DriverInner {
 
     fn shutdown(self) -> Result<(), DriverError> {
         self.context.remove(&self.worker);
-        self.worker.begin_close();
         self.worker.close_registrations();
+        let cleanup_error = self.deregister_all();
         match self.mode {
             DriverMode::Primary(driver) => {
-                driver.execute_controls(&self.worker, true);
-                let cleanup_error = driver.deregister_all(&self.worker);
                 let control_error = self.worker.take_failure().map(DriverError::from_source);
                 self.poll_waker.deactivate();
                 drop(driver);
@@ -155,9 +148,24 @@ impl DriverInner {
             DriverMode::Secondary(driver) => {
                 let result = driver.shutdown(&self.poll_waker, &self.worker);
                 self.poll_waker.deactivate();
-                result
+                match (result, cleanup_error) {
+                    (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+                    (Ok(()), Ok(())) => Ok(()),
+                }
             }
         }
+    }
+
+    fn deregister_all(&self) -> Result<(), DriverError> {
+        let mut first_error = None;
+        for registration in self.worker.drain_registrations() {
+            if let Err(error) = registration.try_deregister(self.worker.registry())
+                && first_error.is_none()
+            {
+                first_error = Some(DriverError::from_source(error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -182,17 +190,8 @@ impl PrimaryDriver {
     }
 
     fn execute_cycle(&mut self, worker: &Arc<WorkerState>, max_wait: Duration) -> Result<(), DriverError> {
-        self.execute_controls(worker, false);
         if let Some(error) = worker.take_failure() {
             return Err(DriverError::from_source(error));
-        }
-        let commands = worker.take_commands(COMMAND_BUDGET);
-        let processed_commands = !commands.is_empty();
-        for command in commands {
-            command.execute(self.poll.registry(), worker);
-        }
-        if worker.has_commands() {
-            worker.wake_owner();
         }
 
         let processed_pending = self.dispatch_pending(worker, COMPLETION_BUDGET);
@@ -201,7 +200,7 @@ impl PrimaryDriver {
             return Ok(());
         }
 
-        let timeout = if processed_commands || processed_pending != 0 {
+        let timeout = if processed_pending != 0 {
             Some(Duration::ZERO)
         } else if max_wait == Duration::MAX {
             None
@@ -223,25 +222,6 @@ impl PrimaryDriver {
         Ok(())
     }
 
-    fn execute_controls(&self, worker: &Arc<WorkerState>, seal: bool) {
-        let commands = if seal { worker.seal_controls() } else { worker.take_controls() };
-        for command in commands {
-            command.execute(self.poll.registry(), worker);
-        }
-    }
-
-    fn deregister_all(&self, worker: &WorkerState) -> Result<(), DriverError> {
-        let mut first_error = None;
-        for registration in worker.drain_registrations() {
-            if let Err(error) = registration.try_deregister(self.poll.registry())
-                && first_error.is_none()
-            {
-                first_error = Some(DriverError::from_source(error));
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-
     fn dispatch_pending(&mut self, worker: &WorkerState, budget: usize) -> usize {
         let count = budget.min(self.pending.len());
         for event in self.pending.drain(..count) {
@@ -258,7 +238,7 @@ struct SecondaryDriver {
 }
 
 impl SecondaryDriver {
-    fn new() -> io::Result<(Self, Arc<PollWake>)> {
+    fn new() -> io::Result<(Self, Arc<PollWake>, Registry)> {
         let shared = Arc::new(SecondaryShared::default());
         let thread_shared = Arc::clone(&shared);
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -267,32 +247,15 @@ impl SecondaryDriver {
             let result = (|| -> io::Result<()> {
                 let mut poll = Poll::new()?;
                 let poll_waker = Arc::new(PollWake::new(poll.registry())?);
+                let registry = poll.registry().try_clone()?;
                 started_tx
-                    .send(Ok(Arc::clone(&poll_waker)))
+                    .send(Ok((Arc::clone(&poll_waker), registry)))
                     .map_err(|_send_error| io::Error::other("the Arty worker stopped secondary driver creation"))?;
                 let mut events = Events::with_capacity(EVENT_CAPACITY);
                 loop {
-                    let worker = thread_shared.worker()?;
-                    for command in worker.take_controls() {
-                        command.execute(poll.registry(), &worker);
-                    }
+                    thread_shared.worker()?;
                     if thread_shared.shutdown_requested() {
-                        for command in worker.seal_controls() {
-                            command.execute(poll.registry(), &worker);
-                        }
-                        for registration in worker.drain_registrations() {
-                            if let Err(error) = registration.try_deregister(poll.registry()) {
-                                thread_shared.fail(error);
-                            }
-                        }
                         break;
-                    }
-                    let commands = thread_shared.take_commands();
-                    for command in commands {
-                        command.execute(poll.registry(), &worker);
-                    }
-                    if worker.has_commands() {
-                        poll_waker.wake_poll();
                     }
 
                     match poll.poll(&mut events, None) {
@@ -324,12 +287,12 @@ impl SecondaryDriver {
             let _ = finished_tx.send(());
         })?;
 
-        let poll_waker = match started_rx.recv() {
+        let (poll_waker, registry) = match started_rx.recv() {
             Ok(Ok(started)) => started,
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(io::Error::other("the secondary Arty Mio poll thread stopped during creation")),
         };
-        Ok((Self { shared, finished, thread }, poll_waker))
+        Ok((Self { shared, finished, thread }, poll_waker, registry))
     }
 
     fn attach(&self, worker: Arc<WorkerState>) {
@@ -424,10 +387,6 @@ impl SecondaryShared {
 
     fn try_worker(&self) -> Option<Arc<WorkerState>> {
         self.state().worker.clone()
-    }
-
-    fn take_commands(&self) -> Vec<Box<dyn crate::worker::DriverCommand>> {
-        self.worker().map(|worker| worker.take_commands(COMMAND_BUDGET)).unwrap_or_default()
     }
 
     fn has_events(&self) -> bool {
@@ -526,19 +485,14 @@ mod tests {
 
     #[test]
     fn secondary_background_failure_becomes_driver_error() {
-        let (driver, poll_waker) = SecondaryDriver::new().unwrap();
-        let worker = Arc::new(WorkerState::new(
-            std::thread::current().id(),
-            Arc::clone(&poll_waker),
-            Waker::noop().clone(),
-        ));
+        let (driver, poll_waker, registry) = SecondaryDriver::new().unwrap();
+        let worker = Arc::new(WorkerState::new(std::thread::current().id(), registry, Waker::noop().clone()));
         driver.attach(Arc::clone(&worker));
         driver.shared.fail(std::io::Error::other("scripted poll failure"));
 
         let error = driver.execute_cycle(&worker).unwrap_err();
         assert_eq!(error.to_string(), "scripted poll failure");
 
-        worker.begin_close();
         worker.close_registrations();
         driver.shutdown(&poll_waker, &worker).unwrap();
         poll_waker.deactivate();

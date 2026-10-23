@@ -12,66 +12,13 @@ use mio::{Interest, Registry, Token};
 use parking_lot::{Mutex as SourceMutex, MutexGuard as SourceMutexGuard};
 
 use crate::readiness::{Readiness, RegistrationClosed};
-use crate::worker::{ControlCommand, DriverCommand, WorkerState};
+use crate::worker::WorkerState;
 
-pub(crate) struct Response<T> {
-    inner: Mutex<ResponseState<T>>,
-}
+struct RegistryOperation<'a>(&'a WorkerState);
 
-enum ResponseState<T> {
-    Pending(Option<Waker>),
-    Ready(T),
-}
-
-impl<T> Default for Response<T> {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(ResponseState::Pending(None)),
-        }
-    }
-}
-
-impl<T> Response<T> {
-    pub(crate) fn complete(&self, value: T) {
-        let waiter = {
-            let mut state = self
-                .inner
-                .lock()
-                .expect("response completion does not call code that can panic while the response lock is held");
-            match std::mem::replace(&mut *state, ResponseState::Ready(value)) {
-                ResponseState::Pending(waiter) => waiter,
-                ResponseState::Ready(_) => {
-                    unreachable!("a driver command completes its response exactly once")
-                }
-            }
-        };
-        if let Some(waiter) = waiter {
-            waiter.wake();
-        }
-    }
-
-    pub(crate) async fn wait(&self) -> T {
-        poll_fn(|context| {
-            let mut state = self
-                .inner
-                .lock()
-                .expect("response polling does not call code that can panic while the response lock is held");
-            match &mut *state {
-                ResponseState::Ready(_) => {
-                    let ResponseState::Ready(value) = std::mem::replace(&mut *state, ResponseState::Pending(None)) else {
-                        unreachable!("the response state was matched as ready")
-                    };
-                    Poll::Ready(value)
-                }
-                ResponseState::Pending(waiter) => {
-                    if waiter.as_ref().is_none_or(|waiter| !waiter.will_wake(context.waker())) {
-                        *waiter = Some(context.waker().clone());
-                    }
-                    Poll::Pending
-                }
-            }
-        })
-        .await
+impl Drop for RegistryOperation<'_> {
+    fn drop(&mut self) {
+        self.0.finish_registry_operation();
     }
 }
 
@@ -250,10 +197,10 @@ impl RegistrationState {
 
 /// An owned Mio source registered with one Arty Mio driver.
 ///
-/// Dropping this value sends deregistration to the native poll owner. The
-/// source drops on that thread after the deregistration attempt. Mio binds a
-/// source to one `Poll` for its registered lifetime, so this type does not
-/// expose an operation that moves the source to another registry.
+/// Dropping this value removes the source registration through a thread-safe
+/// clone of the native registry. The source then drops on the caller thread.
+/// Mio binds a source to one `Poll` for its registered lifetime, so this type
+/// does not expose an operation that moves the source to another registry.
 pub struct Registered<S>
 where
     S: Source + Send + 'static,
@@ -342,10 +289,14 @@ where
     S: Source + Send + 'static,
 {
     fn drop(&mut self) {
-        self.worker.enqueue_control(Box::new(DeregisterCommand {
-            token: self.token,
-            entry: Arc::clone(&self.entry),
-        }));
+        if !self.worker.begin_deregistration(self.token, &self.entry) {
+            self.entry.close();
+            return;
+        }
+        let _operation = RegistryOperation(&self.worker);
+        if let Err(error) = self.entry.deregister(self.worker.registry()) {
+            self.worker.record_failure(error);
+        }
     }
 }
 
@@ -425,102 +376,43 @@ impl<S> DerefMut for SourceMut<'_, S> {
     }
 }
 
-pub(crate) struct RegisterCommand<S>
+pub(crate) fn register<S>(source: S, interest: Interest, worker: Arc<WorkerState>) -> io::Result<Registered<S>>
 where
     S: Source + Send + 'static,
 {
-    source: S,
-    interest: Interest,
-    response: Arc<Response<io::Result<Registered<S>>>>,
-}
-
-impl<S> RegisterCommand<S>
-where
-    S: Source + Send + 'static,
-{
-    pub(crate) fn new(source: S, interest: Interest, response: Arc<Response<io::Result<Registered<S>>>>) -> Self {
-        Self {
-            source,
+    let token = worker.allocate_token()?;
+    let state = Arc::new(RegistrationState::default());
+    let source = Arc::new(SourceCell::new(source));
+    let entry = Arc::new(RegistrationEntry::new(
+        Arc::clone(&state),
+        Arc::clone(&source) as Arc<dyn NativeRegistration>,
+    ));
+    worker.begin_registration(token, Arc::clone(&entry))?;
+    let operation = RegistryOperation(&worker);
+    let registration = {
+        let mut source = source.source.lock();
+        worker.registry().register(
+            source.as_mut().expect("the source is present before native registration"),
+            token,
             interest,
-            response,
-        }
+        )
+    };
+    if let Err(error) = registration {
+        worker.finish_registration(token, &entry, false);
+        entry.close();
+        return Err(error);
     }
-}
-
-impl<S> DriverCommand for RegisterCommand<S>
-where
-    S: Source + Send + 'static,
-{
-    fn execute(self: Box<Self>, registry: &Registry, worker: &Arc<WorkerState>) {
-        let token = match worker.allocate_token() {
-            Ok(token) => token,
-            Err(error) => {
-                self.response.complete(Err(error));
-                return;
-            }
-        };
-        let state = Arc::new(RegistrationState::default());
-        let source = Arc::new(SourceCell::new(self.source));
-        let entry = Arc::new(RegistrationEntry::new(
-            Arc::clone(&state),
-            Arc::clone(&source) as Arc<dyn NativeRegistration>,
-        ));
-        if let Err(error) = worker.add_registration(token, Arc::clone(&entry)) {
-            self.response.complete(Err(error));
-            return;
-        }
-        let registration = {
-            let mut source = source.source.lock();
-            registry.register(
-                source.as_mut().expect("the source is present before native registration"),
-                token,
-                self.interest,
-            )
-        };
-        if let Err(error) = registration {
-            worker.remove_registration(token);
-            entry.close();
-            self.response.complete(Err(error));
-            return;
-        }
-        if !worker.registration_is_active(token, &entry) {
-            if let Err(error) = entry.deregister(registry) {
-                worker.record_failure(error);
-            }
-            self.response.complete(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the Arty Mio driver closed while it registered the source",
-            )));
-            return;
-        }
-        self.response
-            .complete(Ok(Registered::new(source, Arc::clone(worker), token, entry)));
-    }
-
-    fn cancel(self: Box<Self>) {
-        self.response.complete(Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "the Arty Mio driver closed before it registered the source",
-        )));
-    }
-}
-
-struct DeregisterCommand {
-    token: Token,
-    entry: Arc<RegistrationEntry>,
-}
-
-impl ControlCommand for DeregisterCommand {
-    fn execute(self: Box<Self>, registry: &Registry, worker: &Arc<WorkerState>) {
-        worker.remove_registration(self.token);
-        if let Err(error) = self.entry.deregister(registry) {
+    if !worker.finish_registration(token, &entry, true) {
+        if let Err(error) = entry.deregister(worker.registry()) {
             worker.record_failure(error);
         }
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the Arty Mio driver closed while it registered the source",
+        ));
     }
-
-    fn cancel(self: Box<Self>) {
-        self.entry.close();
-    }
+    drop(operation);
+    Ok(Registered::new(source, worker, token, entry))
 }
 
 #[cfg(test)]
@@ -532,47 +424,48 @@ mod tests {
     use mio::event::Source;
     use mio::{Interest, Poll, Registry, Token};
 
-    use super::{RegisterCommand, Response};
-    use crate::driver::PollWake;
-    use crate::worker::{DriverCommand, WorkerState};
+    use super::register;
+    use crate::worker::WorkerState;
 
     #[test]
     fn shutdown_wins_against_an_in_flight_registration() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (deregister_tx, deregister_rx) = mpsc::channel();
-        let response = Arc::new(Response::default());
-        let command = RegisterCommand::new(
-            BlockingSource {
-                entered_tx,
-                release_rx,
-                deregister_tx,
-            },
-            Interest::READABLE,
-            Arc::clone(&response),
-        );
-        let (worker_tx, worker_rx) = mpsc::channel();
-
-        let poll_thread = std::thread::spawn(move || {
-            let poll = Poll::new().unwrap();
-            let poll_waker = Arc::new(PollWake::new(poll.registry()).unwrap());
-            let worker = Arc::new(WorkerState::new(std::thread::current().id(), poll_waker, Waker::noop().clone()));
-            worker_tx.send(Arc::clone(&worker)).unwrap();
-            Box::new(command).execute(poll.registry(), &worker);
+        let poll = Poll::new().unwrap();
+        let worker = Arc::new(WorkerState::new(
+            std::thread::current().id(),
+            poll.registry().try_clone().unwrap(),
+            Waker::noop().clone(),
+        ));
+        let registration_worker = Arc::clone(&worker);
+        let registration_thread = std::thread::spawn(move || {
+            register(
+                BlockingSource {
+                    entered_tx,
+                    release_rx,
+                    deregister_tx,
+                },
+                Interest::READABLE,
+                registration_worker,
+            )
         });
+        let registration_thread_id = registration_thread.thread().id();
 
-        let worker = worker_rx.recv().unwrap();
         entered_rx.recv().unwrap();
-        worker.begin_close();
-        worker.close_registrations();
+        let shutdown_worker = Arc::clone(&worker);
+        let shutdown_thread = std::thread::spawn(move || shutdown_worker.close_registrations());
+        while !worker.registrations_are_closed() {
+            std::thread::yield_now();
+        }
         release_tx.send(()).unwrap();
-        poll_thread.join().unwrap();
 
         assert_eq!(
-            futures::executor::block_on(response.wait()).err().unwrap().kind(),
+            registration_thread.join().unwrap().err().unwrap().kind(),
             std::io::ErrorKind::BrokenPipe
         );
-        assert_eq!(deregister_rx.recv().unwrap(), worker.thread_id);
+        shutdown_thread.join().unwrap();
+        assert_eq!(deregister_rx.recv().unwrap(), registration_thread_id);
     }
 
     struct BlockingSource {

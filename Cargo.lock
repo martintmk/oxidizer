@@ -360,8 +360,10 @@ version = "0.1.0"
 dependencies = [
  "arty",
  "arty_io_core",
+ "criterion",
  "ctor",
  "futures",
+ "metabench",
  "mio",
  "parking_lot",
  "static_assertions",

@@ -1,31 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::Waker;
 use std::thread::ThreadId;
 
 use mio::event::Event;
 use mio::{Registry, Token};
 
-use crate::driver::PollWake;
 use crate::registration::RegistrationEntry;
 
 pub(crate) const DRIVER_WAKE_TOKEN: Token = Token(usize::MAX);
-const MAX_COMMAND_QUEUE: usize = 1_024;
-
-pub(crate) trait DriverCommand: Send {
-    fn execute(self: Box<Self>, registry: &Registry, worker: &Arc<WorkerState>);
-    fn cancel(self: Box<Self>);
-}
-
-pub(crate) trait ControlCommand: Send {
-    fn execute(self: Box<Self>, registry: &Registry, worker: &Arc<WorkerState>);
-    fn cancel(self: Box<Self>);
-}
 
 #[derive(Default)]
 pub(crate) struct ContextState {
@@ -73,114 +61,36 @@ impl ContextState {
 
 pub(crate) struct WorkerState {
     pub(crate) thread_id: ThreadId,
-    poll_waker: Arc<PollWake>,
     owner_waker: Waker,
     next_token: AtomicUsize,
-    commands: Mutex<CommandQueue>,
+    registry: Registry,
     registrations: Mutex<Registrations>,
+    registrations_idle: Condvar,
     failure: Mutex<Option<io::Error>>,
-}
-
-#[derive(Default)]
-struct CommandQueue {
-    closed: bool,
-    values: VecDeque<Box<dyn DriverCommand>>,
-    controls_closed: bool,
-    controls: VecDeque<Box<dyn ControlCommand>>,
 }
 
 #[derive(Default)]
 struct Registrations {
     closed: bool,
+    active_operations: usize,
     values: HashMap<Token, Arc<RegistrationEntry>>,
 }
 
 impl WorkerState {
-    pub(crate) fn new(thread_id: ThreadId, poll_waker: Arc<PollWake>, owner_waker: Waker) -> Self {
+    pub(crate) fn new(thread_id: ThreadId, registry: Registry, owner_waker: Waker) -> Self {
         Self {
             thread_id,
-            poll_waker,
             owner_waker,
             next_token: AtomicUsize::new(0),
-            commands: Mutex::new(CommandQueue::default()),
+            registry,
             registrations: Mutex::new(Registrations::default()),
+            registrations_idle: Condvar::new(),
             failure: Mutex::new(None),
         }
     }
 
-    pub(crate) fn enqueue(&self, command: Box<dyn DriverCommand>) -> io::Result<()> {
-        {
-            let mut commands = self
-                .commands
-                .lock()
-                .expect("command submission does not call user code while the command queue lock is held");
-            if commands.closed {
-                return Err(closed_error());
-            }
-            if commands.values.len() == MAX_COMMAND_QUEUE {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "the Arty Mio registration queue is full"));
-            }
-            commands.values.push_back(command);
-        }
-        self.poll_waker.wake_poll();
-        self.owner_waker.wake_by_ref();
-        Ok(())
-    }
-
-    pub(crate) fn enqueue_control(&self, command: Box<dyn ControlCommand>) {
-        let command = {
-            let mut commands = self
-                .commands
-                .lock()
-                .expect("control submission does not call user code while the command queue lock is held");
-            if commands.controls_closed {
-                Some(command)
-            } else {
-                commands.controls.push_back(command);
-                None
-            }
-        };
-        if let Some(command) = command {
-            command.cancel();
-        } else {
-            self.poll_waker.wake_poll();
-        }
-    }
-
-    pub(crate) fn take_controls(&self) -> Vec<Box<dyn ControlCommand>> {
-        self.commands
-            .lock()
-            .expect("control draining does not call user code while the command queue lock is held")
-            .controls
-            .drain(..)
-            .collect()
-    }
-
-    pub(crate) fn seal_controls(&self) -> Vec<Box<dyn ControlCommand>> {
-        let mut commands = self
-            .commands
-            .lock()
-            .expect("control sealing does not call user code while the command queue lock is held");
-        commands.controls_closed = true;
-        commands.controls.drain(..).collect()
-    }
-
-    pub(crate) fn take_commands(&self, limit: usize) -> Vec<Box<dyn DriverCommand>> {
-        let mut commands = self
-            .commands
-            .lock()
-            .expect("command draining does not call user code while the command queue lock is held");
-        let count = limit.min(commands.values.len());
-        commands.values.drain(..count).collect()
-    }
-
-    pub(crate) fn has_commands(&self) -> bool {
-        !self
-            .commands
-            .lock()
-            .expect("command inspection does not call user code while the command queue lock is held")
-            .values
-            .is_empty()
+    pub(crate) const fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     pub(crate) fn allocate_token(&self) -> io::Result<Token> {
@@ -192,7 +102,7 @@ impl WorkerState {
             .map_err(|_exhausted| io::Error::other("the Arty Mio token space is exhausted"))
     }
 
-    pub(crate) fn add_registration(&self, token: Token, entry: Arc<RegistrationEntry>) -> io::Result<()> {
+    pub(crate) fn begin_registration(&self, token: Token, entry: Arc<RegistrationEntry>) -> io::Result<()> {
         let mut registrations = self
             .registrations
             .lock()
@@ -200,24 +110,46 @@ impl WorkerState {
         if registrations.closed {
             return Err(closed_error());
         }
+        registrations.active_operations += 1;
         registrations.values.insert(token, entry);
         Ok(())
     }
 
-    pub(crate) fn registration_is_active(&self, token: Token, entry: &Arc<RegistrationEntry>) -> bool {
-        let registrations = self
+    pub(crate) fn finish_registration(&self, token: Token, entry: &Arc<RegistrationEntry>, registered: bool) -> bool {
+        let mut registrations = self
             .registrations
             .lock()
-            .expect("registration inspection does not call user code while the registration lock is held");
-        !registrations.closed && registrations.values.get(&token).is_some_and(|current| Arc::ptr_eq(current, entry))
+            .expect("registration completion does not call user code while the registration lock is held");
+        let active =
+            registered && !registrations.closed && registrations.values.get(&token).is_some_and(|current| Arc::ptr_eq(current, entry));
+        if !active {
+            registrations.values.remove(&token);
+        }
+        active
     }
 
-    pub(crate) fn remove_registration(&self, token: Token) {
-        self.registrations
+    pub(crate) fn begin_deregistration(&self, token: Token, entry: &Arc<RegistrationEntry>) -> bool {
+        let mut registrations = self
+            .registrations
             .lock()
-            .expect("registration removal does not call user code while the registration lock is held")
-            .values
-            .remove(&token);
+            .expect("deregistration removal does not call user code while the registration lock is held");
+        if registrations.closed || !registrations.values.get(&token).is_some_and(|current| Arc::ptr_eq(current, entry)) {
+            return false;
+        }
+        registrations.active_operations += 1;
+        registrations.values.remove(&token);
+        true
+    }
+
+    pub(crate) fn finish_registry_operation(&self) {
+        let mut registrations = self
+            .registrations
+            .lock()
+            .expect("deregistration completion does not call user code while the registration lock is held");
+        registrations.active_operations -= 1;
+        if registrations.active_operations == 0 {
+            self.registrations_idle.notify_all();
+        }
     }
 
     pub(crate) fn dispatch(&self, event: &Event) {
@@ -233,20 +165,6 @@ impl WorkerState {
         }
     }
 
-    pub(crate) fn begin_close(&self) {
-        let commands = {
-            let mut commands = self
-                .commands
-                .lock()
-                .expect("driver shutdown does not call user code while the command queue lock is held");
-            commands.closed = true;
-            std::mem::take(&mut commands.values)
-        };
-        for command in commands {
-            command.cancel();
-        }
-    }
-
     pub(crate) fn close_registrations(&self) {
         let registrations: Vec<_> = {
             let mut registrations = self
@@ -254,6 +172,12 @@ impl WorkerState {
                 .lock()
                 .expect("driver shutdown does not call user code while the registration lock is held");
             registrations.closed = true;
+            while registrations.active_operations != 0 {
+                registrations = self
+                    .registrations_idle
+                    .wait(registrations)
+                    .expect("only driver shutdown waits for active registry operations");
+            }
             registrations.values.values().cloned().collect()
         };
         for registration in registrations {
@@ -264,11 +188,19 @@ impl WorkerState {
     pub(crate) fn drain_registrations(&self) -> Vec<Arc<RegistrationEntry>> {
         self.registrations
             .lock()
-            .expect("native registration draining does not call user code while the registration lock is held")
+            .expect("registration draining does not call user code while the registration lock is held")
             .values
             .drain()
             .map(|(_, registration)| registration)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registrations_are_closed(&self) -> bool {
+        self.registrations
+            .lock()
+            .expect("test inspection does not call user code while the registration lock is held")
+            .closed
     }
 
     pub(crate) fn wake_owner(&self) {
@@ -302,20 +234,21 @@ fn closed_error() -> io::Error {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::task::Waker;
 
     use mio::{Poll, Token};
 
     use super::WorkerState;
-    use crate::driver::PollWake;
 
     #[test]
     fn token_allocation_stops_before_the_reserved_waker_token() {
         let poll = Poll::new().unwrap();
-        let poll_waker = Arc::new(PollWake::new(poll.registry()).unwrap());
-        let worker = WorkerState::new(std::thread::current().id(), poll_waker, Waker::noop().clone());
+        let worker = WorkerState::new(
+            std::thread::current().id(),
+            poll.registry().try_clone().unwrap(),
+            Waker::noop().clone(),
+        );
         worker.next_token.store(usize::MAX - 2, Ordering::Relaxed);
 
         assert_eq!(worker.allocate_token().unwrap(), Token(usize::MAX - 2));
