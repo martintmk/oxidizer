@@ -362,7 +362,6 @@ dependencies = [
  "arty_io_core",
  "criterion",
  "ctor",
- "futures",
  "metabench",
  "mio",
  "parking_lot",

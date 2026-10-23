@@ -21,7 +21,7 @@ async fn builtins_context_drives_a_mio_source(builtins: Builtins) {
     let receiver = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let sender = StdUdpSocket::bind("127.0.0.1:0").unwrap();
     sender.connect(receiver.local_addr().unwrap()).unwrap();
-    let registration = io.register(receiver, Interest::READABLE).await.unwrap();
+    let registration = io.register(receiver, Interest::READABLE).unwrap();
 
     sender.send(&[1]).unwrap();
     assert!(registration.readiness(Interest::READABLE).await.unwrap().is_readable());

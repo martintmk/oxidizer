@@ -4,18 +4,12 @@
 //! Measures registration on the primary driver owner thread.
 
 #![allow(missing_docs, reason = "benchmark code")]
-#![expect(
-    clippy::panic,
-    clippy::unwrap_used,
-    reason = "benchmark fixture failures provide sufficient context"
-)]
+#![expect(clippy::unwrap_used, reason = "benchmark fixture failures provide sufficient context")]
 
 use std::hint::black_box;
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::task::Waker;
 
-use arty_io_core::{Cycle, Driver, DriverOptions, DriverRole, IoContext};
+use arty_io_core::{DriverOptions, DriverRole, IoContext};
 use arty_mio::{MioContext, MioDriver, MioOptions, Registered};
 use criterion::{BatchSize, Criterion};
 use mio::Interest;
@@ -27,7 +21,7 @@ const GROUP: &str = "arty_mio/registration";
 
 struct RegistrationState {
     io: MioContext,
-    driver: MioDriver,
+    _driver: MioDriver,
     source: Option<UdpSocket>,
 }
 
@@ -41,7 +35,7 @@ fn registration_state() -> RegistrationState {
     let source = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     RegistrationState {
         io,
-        driver,
+        _driver: driver,
         source: Some(source),
     }
 }
@@ -50,17 +44,7 @@ fn registration_state() -> RegistrationState {
 #[bench::primary_owner(&mut registration_state())]
 fn register(state: &mut RegistrationState) -> Registered<UdpSocket> {
     let source = state.source.take().unwrap();
-    let mut future = pin!(state.io.register(source, Interest::READABLE));
-    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(result) => result.unwrap(),
-        Poll::Pending => {
-            state.driver.execute_cycle(&mut Cycle::new(Duration::ZERO)).unwrap();
-            match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-                Poll::Ready(result) => result.unwrap(),
-                Poll::Pending => panic!("the primary driver must complete registration in one cycle"),
-            }
-        }
-    }
+    state.io.register(source, Interest::READABLE).unwrap()
 }
 
 fn criterion_benchmarks(criterion: &mut Criterion) {

@@ -30,7 +30,7 @@
 //!     let io = builtins.io().context::<MioContext>(&MioOptions::default());
 //!     let address = "127.0.0.1:0".parse().expect("the example address is valid");
 //!     let socket = mio::net::UdpSocket::bind(address)?;
-//!     let socket = io.register(socket, Interest::READABLE).await?;
+//!     let socket = io.register(socket, Interest::READABLE)?;
 //!
 //!     loop {
 //!         socket

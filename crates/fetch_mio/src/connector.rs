@@ -265,7 +265,6 @@ impl Dialer for MioDialer {
 
             let registration = context
                 .register(stream, Interest::READABLE | Interest::WRITABLE)
-                .await
                 .map_err(|error| AttemptFailure::new(address, AttemptPhase::Registration, error))?;
 
             let info = complete_connect(&registration)

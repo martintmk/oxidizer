@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 use std::sync::Arc;
-use std::task::Poll;
 use std::{fmt, io};
 
 use arty_io_core::{DriverError, DriverOptions, IoContext};
@@ -38,38 +37,32 @@ impl fmt::Debug for MioContext {
 impl MioContext {
     /// Registers an owned Mio source with this context's driver.
     ///
-    /// The future registers the source through a thread-safe Mio registry
-    /// handle.
+    /// Registration uses the worker route that is available on the calling
+    /// thread.
     ///
     /// # Errors
     ///
     /// Returns an error if this context is not attached to a driver, the
     /// driver is closed, or Mio rejects the source.
-    pub fn register<S>(&self, source: S, interest: Interest) -> impl Future<Output = io::Result<Registered<S>>> + Send + '_
+    pub fn register<S>(&self, source: S, interest: Interest) -> io::Result<Registered<S>>
     where
         S: Source + Send + 'static,
     {
-        let mut source = Some(source);
-        std::future::poll_fn(move |_context| {
-            let source = source
-                .take()
-                .ok_or_else(|| io::Error::other("a completed MioContext::register future was polled again"))?;
-            let current = std::thread::current().id();
-            let worker = self
-                .worker
-                .as_ref()
-                .filter(|worker| worker.thread_id == current)
-                .cloned()
-                .or_else(|| self.state.worker(current))
-                .or_else(|| self.worker.clone())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "the Arty Mio context is not attached to a worker driver",
-                    )
-                })?;
-            Poll::Ready(register(source, interest, worker))
-        })
+        let current = std::thread::current().id();
+        let worker = self
+            .worker
+            .as_ref()
+            .filter(|worker| worker.thread_id == current)
+            .cloned()
+            .or_else(|| self.state.worker(current))
+            .or_else(|| self.worker.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the Arty Mio context is not attached to a worker driver",
+                )
+            })?;
+        register(source, interest, worker)
     }
 }
 

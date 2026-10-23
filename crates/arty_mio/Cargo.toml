@@ -42,7 +42,6 @@ thread_aware_core = { workspace = true, features = ["std"] }
 arty = { path = "../arty" }
 ctor = { workspace = true, features = ["proc_macro"] }
 criterion = { workspace = true }
-futures = { workspace = true, features = ["executor"] }
 metabench = { path = "../metabench", default-features = false }
 mio = { workspace = true, features = ["net", "os-poll"] }
 static_assertions = { workspace = true }

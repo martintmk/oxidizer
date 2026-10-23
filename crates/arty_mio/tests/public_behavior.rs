@@ -104,7 +104,7 @@ fn readiness_before_first_poll_and_waiter_replacement_are_lossless() {
 fn readable_and_writable_waiters_are_independent() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (stream, mut peer) = tcp_pair();
-    let registration = futures::executor::block_on(io.register(stream, Interest::READABLE | Interest::WRITABLE)).unwrap();
+    let registration = io.register(stream, Interest::READABLE | Interest::WRITABLE).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::ZERO)).unwrap();
     let read_wake = Arc::new(WakeCounter::default());
     let write_wake = Arc::new(WakeCounter::default());
@@ -138,7 +138,7 @@ fn secondary_driver_registers_on_its_poller_and_wakes_the_owner() {
     let owner_waker = Waker::from(Arc::new(ChannelWake(owner_tx)));
     let (io, mut driver) = driver(DriverRole::Secondary, owner_waker);
     let (receiver, sender) = udp_pair();
-    let registration = futures::executor::block_on(io.register(receiver, Interest::READABLE)).unwrap();
+    let registration = io.register(receiver, Interest::READABLE).unwrap();
     assert!(owner_rx.try_recv().is_err());
 
     driver.execute_cycle(&mut Cycle::new(Duration::ZERO)).unwrap();
@@ -161,15 +161,17 @@ fn cloned_registries_run_source_registration_on_the_caller_thread() {
     let (primary_io, primary_driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let primary_source = recording_source();
     let (primary_tx, primary_rx) = mpsc::channel();
-    let primary_registration =
-        futures::executor::block_on(primary_io.register(primary_source.with_reporter(primary_tx), Interest::READABLE)).unwrap();
+    let primary_registration = primary_io
+        .register(primary_source.with_reporter(primary_tx), Interest::READABLE)
+        .unwrap();
     assert_eq!(primary_rx.recv().unwrap(), current);
 
     let (secondary_io, secondary_driver) = driver(DriverRole::Secondary, Waker::noop().clone());
     let secondary_source = recording_source();
     let (secondary_tx, secondary_rx) = mpsc::channel();
-    let secondary_registration =
-        futures::executor::block_on(secondary_io.register(secondary_source.with_reporter(secondary_tx), Interest::READABLE)).unwrap();
+    let secondary_registration = secondary_io
+        .register(secondary_source.with_reporter(secondary_tx), Interest::READABLE)
+        .unwrap();
     assert_eq!(secondary_rx.recv().unwrap(), current);
 
     drop(primary_registration);
@@ -184,8 +186,9 @@ fn drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
     let (primary_io, primary_driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let primary_source = recording_source();
     let (primary_tx, primary_rx) = mpsc::channel();
-    let primary_registration =
-        futures::executor::block_on(primary_io.register(primary_source.with_deregister_reporter(primary_tx), Interest::READABLE)).unwrap();
+    let primary_registration = primary_io
+        .register(primary_source.with_deregister_reporter(primary_tx), Interest::READABLE)
+        .unwrap();
 
     drop(primary_registration);
     assert_eq!(primary_rx.recv().unwrap(), current);
@@ -193,9 +196,9 @@ fn drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
     let (secondary_io, secondary_driver) = driver(DriverRole::Secondary, Waker::noop().clone());
     let secondary_source = recording_source();
     let (secondary_tx, secondary_rx) = mpsc::channel();
-    let secondary_registration =
-        futures::executor::block_on(secondary_io.register(secondary_source.with_deregister_reporter(secondary_tx), Interest::READABLE))
-            .unwrap();
+    let secondary_registration = secondary_io
+        .register(secondary_source.with_deregister_reporter(secondary_tx), Interest::READABLE)
+        .unwrap();
 
     drop(secondary_registration);
     assert_eq!(secondary_rx.recv().unwrap(), current);
@@ -205,14 +208,14 @@ fn drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
 }
 
 #[test]
-fn context_clone_submits_from_another_thread_and_relocation_selects_destination_worker() {
+fn context_clone_registers_on_the_calling_thread_and_relocation_selects_destination_worker() {
     let (mut io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let external = io.clone();
     let (thread_tx, thread_rx) = mpsc::channel();
     let source = recording_source().with_reporter(thread_tx);
 
     let registration = std::thread::scope(|scope| {
-        let task = scope.spawn(move || futures::executor::block_on(external.register(source, Interest::READABLE)));
+        let task = scope.spawn(move || external.register(source, Interest::READABLE));
         task.join().unwrap().unwrap()
     });
     assert_ne!(thread_rx.recv().unwrap(), std::thread::current().id());
@@ -229,8 +232,7 @@ fn context_clone_submits_from_another_thread_and_relocation_selects_destination_
                     .unwrap();
                 let source = recording_source();
                 let (thread_tx, thread_rx) = mpsc::channel();
-                let registration =
-                    futures::executor::block_on(relocated.register(source.with_reporter(thread_tx), Interest::READABLE)).unwrap();
+                let registration = relocated.register(source.with_reporter(thread_tx), Interest::READABLE).unwrap();
                 assert_eq!(thread_rx.recv().unwrap(), std::thread::current().id());
                 drop(registration);
                 destination_driver.shutdown().unwrap();
@@ -241,6 +243,21 @@ fn context_clone_submits_from_another_thread_and_relocation_selects_destination_
 
     io.relocate(None, &ThreadBuilder::default().build(std::thread::current().id()));
     driver.shutdown().unwrap();
+}
+
+#[test]
+fn unattached_context_rejects_registration_and_releases_the_source() {
+    let io = MioContext::context(MioOptions::default());
+    let (token_tx, _token_rx) = mpsc::channel();
+    let (drop_tx, drop_rx) = mpsc::channel();
+
+    let error = io
+        .register(FailingRegisterSource { token_tx, drop_tx }, Interest::READABLE)
+        .err()
+        .unwrap();
+
+    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    assert_eq!(drop_rx.recv().unwrap(), std::thread::current().id());
 }
 
 #[test]
@@ -262,8 +279,7 @@ fn relocation_keeps_existing_sources_on_their_original_poller() {
                 .unwrap();
             let source = recording_source();
             let (thread_tx, thread_rx) = mpsc::channel();
-            let registration =
-                futures::executor::block_on(relocated.register(source.with_reporter(thread_tx), Interest::READABLE)).unwrap();
+            let registration = relocated.register(source.with_reporter(thread_tx), Interest::READABLE).unwrap();
             assert_eq!(thread_rx.recv().unwrap(), std::thread::current().id());
             destination_ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -292,8 +308,9 @@ fn secondary_shutdown_deregisters_live_sources_before_stopping_the_poller() {
     let current = std::thread::current().id();
     let (io, driver) = driver(DriverRole::Secondary, Waker::noop().clone());
     let (deregister_tx, deregister_rx) = mpsc::channel();
-    let registration =
-        futures::executor::block_on(io.register(recording_source().with_deregister_reporter(deregister_tx), Interest::READABLE)).unwrap();
+    let registration = io
+        .register(recording_source().with_deregister_reporter(deregister_tx), Interest::READABLE)
+        .unwrap();
 
     driver.shutdown().unwrap();
 
@@ -330,7 +347,7 @@ fn drop_deregistration_failure_is_reported_by_each_driver_role() {
 
     let (owner_tx, owner_rx) = mpsc::channel();
     let (secondary_io, mut secondary_driver) = driver(DriverRole::Secondary, Waker::from(Arc::new(ChannelWake(owner_tx))));
-    let secondary = futures::executor::block_on(secondary_io.register(FailingDeregisterSource, Interest::READABLE)).unwrap();
+    let secondary = secondary_io.register(FailingDeregisterSource, Interest::READABLE).unwrap();
     while owner_rx.try_recv().is_ok() {}
     drop(secondary);
     owner_rx.recv().unwrap();
@@ -345,7 +362,7 @@ fn successful_registry_operations_do_not_wake_the_driver_owner() {
     for role in [DriverRole::Primary, DriverRole::Secondary] {
         let owner = Arc::new(WakeCounter::default());
         let (io, driver) = driver(role, Waker::from(Arc::clone(&owner)));
-        let registration = futures::executor::block_on(io.register(recording_source(), Interest::READABLE)).unwrap();
+        let registration = io.register(recording_source(), Interest::READABLE).unwrap();
         assert_eq!(owner.count(), 0);
         drop(registration);
         assert_eq!(owner.count(), 0);
@@ -359,21 +376,22 @@ fn failed_registration_releases_the_source_and_does_not_reuse_its_token() {
         let (io, driver) = driver(role, Waker::noop().clone());
         let (failed_token_tx, failed_token_rx) = mpsc::channel();
         let (drop_tx, drop_rx) = mpsc::channel();
-        let error = futures::executor::block_on(io.register(
-            FailingRegisterSource {
-                token_tx: failed_token_tx,
-                drop_tx,
-            },
-            Interest::READABLE,
-        ))
-        .err()
-        .unwrap();
+        let error = io
+            .register(
+                FailingRegisterSource {
+                    token_tx: failed_token_tx,
+                    drop_tx,
+                },
+                Interest::READABLE,
+            )
+            .err()
+            .unwrap();
         assert_eq!(error.to_string(), "scripted registration failure");
         let failed_token = failed_token_rx.recv().unwrap();
         assert_eq!(drop_rx.recv().unwrap(), std::thread::current().id());
 
         let (next_token_tx, next_token_rx) = mpsc::channel();
-        let registration = futures::executor::block_on(io.register(TokenReportingSource(next_token_tx), Interest::READABLE)).unwrap();
+        let registration = io.register(TokenReportingSource(next_token_tx), Interest::READABLE).unwrap();
         assert_eq!(next_token_rx.recv().unwrap().0, failed_token.0 + 1);
 
         drop(registration);
@@ -415,9 +433,7 @@ fn shutdown_closes_live_registration_and_rejects_later_registration() {
         Err(RegistrationClosed)
     );
     let later_source = recording_source();
-    let error = futures::executor::block_on(io.register(later_source, Interest::READABLE))
-        .err()
-        .unwrap();
+    let error = io.register(later_source, Interest::READABLE).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
 
@@ -433,7 +449,7 @@ fn register_primary<S>(io: &MioContext, _driver: &mut MioDriver, source: S) -> R
 where
     S: Source + Send + 'static,
 {
-    futures::executor::block_on(io.register(source, Interest::READABLE)).unwrap()
+    io.register(source, Interest::READABLE).unwrap()
 }
 
 fn udp_pair() -> (UdpSocket, StdUdpSocket) {
