@@ -355,6 +355,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arty_mio"
+version = "0.1.0"
+dependencies = [
+ "arty",
+ "arty_io_core",
+ "ctor",
+ "futures",
+ "mio",
+ "parking_lot",
+ "static_assertions",
+ "testing_aids",
+ "thread_aware",
+ "thread_aware_core",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1936,6 +1952,8 @@ dependencies = [
  "alloc_tracker",
  "anyspawn",
  "argh",
+ "arty",
+ "arty_mio",
  "benchmarking",
  "bytes",
  "bytesbuf",
@@ -1945,6 +1963,7 @@ dependencies = [
  "data_privacy",
  "fastrand",
  "fetch_hyper",
+ "fetch_mio",
  "fetch_options",
  "fetch_tls",
  "fundle",
@@ -2041,6 +2060,39 @@ dependencies = [
  "tower",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "fetch_mio"
+version = "0.1.0"
+dependencies = [
+ "anyspawn",
+ "arty",
+ "arty_mio",
+ "ctor",
+ "fetch_hyper",
+ "fetch_options",
+ "fetch_tls",
+ "future_assert",
+ "futures",
+ "http",
+ "http_extensions",
+ "hyper",
+ "hyper-util",
+ "layered",
+ "libc",
+ "mio",
+ "native-tls",
+ "ohno",
+ "rcgen",
+ "rustls",
+ "seatbelt",
+ "socket2",
+ "static_assertions",
+ "templated_uri",
+ "testing_aids",
+ "thread_aware",
+ "tick",
 ]
 
 [[package]]

@@ -89,8 +89,8 @@
 //!
 //! # Getting Started
 //!
-//! This client runs on the Tokio runtime by default. (Other runtimes can be plugged in via a
-//! custom transport — see the [`custom`] module.)
+//! This client has bundled integrations for Tokio and Arty. Other runtimes can
+//! use a custom transport through the [`custom`] module.
 //!
 //! ```rust,no_run
 //! # #[cfg(all(feature = "tokio", any(feature = "rustls", feature = "native-tls")))]
@@ -116,6 +116,24 @@
 //! > **Customization**: If you need to customize the HTTP client (e.g., add custom handlers, modify timeouts,
 //! > or configure other options), use [`HttpClient::builder_tokio`] instead of `new_tokio` to access
 //! > the full builder API.
+//!
+//! Arty applications can create a client from the task's built-in services:
+//!
+//! ```rust,no_run
+//! # #[cfg(all(feature = "arty", any(feature = "rustls", feature = "native-tls")))]
+//! # {
+//! use arty::task::Builtins;
+//! use fetch::{HttpClient, HttpError};
+//!
+//! #[arty::main]
+//! async fn main(cx: Builtins) -> Result<(), HttpError> {
+//!     let client = HttpClient::new_arty(&cx);
+//!     let response = client.get("https://example.com").fetch().await?;
+//!     println!("status: {}", response.status());
+//!     Ok(())
+//! }
+//! # }
+//! ```
 //!
 //! # Making Requests
 //!
@@ -833,6 +851,11 @@
 //!   transport-specific `TokioTransportOptions`) and related APIs for using the HTTP client in a
 //!   Tokio-based application.
 //!
+//! - **`arty`**: Enables integration with the Arty runtime and Mio I/O. This
+//!   feature provides [`HttpClient::builder_arty`] and
+//!   [`HttpClient::builder_arty_with_options`], and
+//!   [`HttpClient::new_arty`]. Enable `rustls` or `native-tls` with it.
+//!
 //! - **`json`**: Adds support for JSON serialization and deserialization, enabling methods like
 //!   `HttpRequestBuilder::json` for sending JSON data and `HttpRequestBuilder::fetch_json` for receiving JSON responses.
 //!
@@ -915,6 +938,10 @@ pub mod fake;
 
 /// Custom runtime and transport integration.
 pub mod custom;
+
+#[cfg(all(feature = "arty", any(feature = "rustls", feature = "native-tls")))]
+/// Arty runtime and Mio transport integration.
+pub mod arty;
 
 #[cfg(all(feature = "tokio", any(feature = "rustls", feature = "native-tls")))]
 /// Tokio transport integration.

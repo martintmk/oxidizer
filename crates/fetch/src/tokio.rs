@@ -11,8 +11,7 @@
 
 use anyspawn::Spawner;
 use fetch_hyper::HyperTransportBuilder;
-use fetch_options::{SocketOptions, TransportOptions};
-use fetch_tls::{TlsBackend, TlsBackendBuilder};
+use fetch_options::SocketOptions;
 use http::uri::Scheme;
 use http_extensions::{HttpError, Result};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -26,7 +25,6 @@ use tower_service::Service as _;
 use crate::custom::{CustomContext, CustomDeps, Isolation};
 use crate::error_labels::LABEL_SCHEME_NOT_ALLOWED;
 use crate::handlers::TransportHandler;
-use crate::tls::TlsOptions;
 use crate::{HttpClient, HttpClientBuilder};
 
 /// Configuration dependencies for Tokio runtime HTTP operations.
@@ -288,7 +286,7 @@ fn io_error_kind(mut error: &(dyn std::error::Error + 'static)) -> std::io::Erro
 }
 
 fn build_tokio_handler(cx: CustomContext<TokioDeps>, options: &TokioTransportOptions) -> fetch_hyper::HyperTransport {
-    let tls_backend = build_tls_backend(&cx.options, cx.tls);
+    let tls_backend = crate::tls::build_tls_backend(&cx.options, cx.tls);
     let connector = TokioConnector::new(options.socket);
 
     HyperTransportBuilder::new(connector, Spawner::new_tokio(), cx.clock, cx.options)
@@ -296,44 +294,6 @@ fn build_tokio_handler(cx: CustomContext<TokioDeps>, options: &TokioTransportOpt
         .pool_index(cx.pool_index)
         .meter(cx.meter)
         .build(tls_backend)
-}
-
-/// Materializes the client's [`TlsOptions`] into a concrete [`TlsBackend`].
-///
-/// When the `rustls` feature is enabled, rustls is wired up with the aws-lc-rs
-/// crypto provider and the platform certificate verifier (the OS trust store),
-/// and rustls becomes the default backend. When only `native-tls` is enabled it
-/// becomes the default backend instead.
-fn build_tls_backend(options: &TransportOptions, tls: TlsOptions) -> TlsBackend {
-    let mut builder = TlsBackendBuilder::new();
-    if !options.supported_http_versions.is_empty() {
-        builder = builder.supported_http_versions(&options.supported_http_versions);
-    }
-
-    #[cfg(any(feature = "rustls", test))]
-    {
-        // aws-lc-rs is the default crypto provider when rustls is enabled.
-        let provider = std::sync::Arc::new(::rustls::crypto::aws_lc_rs::default_provider());
-        let verifier = std::sync::Arc::new(
-            rustls_platform_verifier::Verifier::new(std::sync::Arc::clone(&provider))
-                .expect("the platform certificate verifier must initialize with the aws-lc-rs crypto provider"),
-        );
-        // `configure_rustls` auto-promotes rustls to the default backend.
-        builder = builder.configure_rustls(provider, verifier);
-    }
-
-    #[cfg(all(feature = "native-tls", not(any(feature = "rustls", test))))]
-    {
-        builder = builder.defaults_to_native_tls();
-    }
-
-    // `build_backend` is fallible (invalid client identity material, missing
-    // backend configuration), but `build()` on the transport is infallible. Any
-    // failure here reflects a misconfigured `TlsOptions` supplied by the caller,
-    // which is a programming error surfaced eagerly at client construction.
-    builder
-        .build_backend(tls)
-        .expect("TLS backend construction must succeed for the configured TlsOptions")
 }
 
 #[cfg(test)]
@@ -440,8 +400,6 @@ mod tests {
     fn build_tls_backend_skips_empty_supported_http_versions() {
         use fetch_options::TransportOptions;
 
-        use crate::tls::TlsOptions;
-
         // An empty `supported_http_versions` means "no preference", so
         // `build_tls_backend` must leave the builder's own default versions in place.
         // It must NOT forward the empty list to `TlsBackendBuilder::supported_http_versions`,
@@ -451,7 +409,7 @@ mod tests {
         options.supported_http_versions = Vec::new();
 
         // Must not panic: the empty list has to be skipped, not forwarded.
-        let _backend = super::build_tls_backend(&options, TlsOptions::default());
+        let _backend = crate::tls::build_tls_backend(&options, crate::tls::TlsOptions::default());
     }
 
     /// Dials `127.0.0.1:port` over `http` through a [`TokioConnector`] configured with `options`.

@@ -17,14 +17,13 @@
 //!
 //! | Scope attribute | Description | Sample value |
 //! |-----------------|-------------|--------------|
-//! | `fetch.runtime` | Identifies the async runtime the client is built for | `"tokio"` |
+//! | `fetch.runtime` | Identifies the async runtime the client is built for | `"arty"` |
 //! | `fetch.transport` | Identifies the transport handler the client dispatches through | `"hyper"` |
 //! | `http.client.name` | Name of the client, set via [`HttpClientBuilder::name`](crate::HttpClientBuilder::name) (defaults to `"http_client"`); lets callers correlate all of a client's metrics with a specific named client | `"crates_api_client"` |
 //!
-//! The bundled transports report fixed values — `"tokio"` runtime and
-//! `"hyper"` transport for the default Tokio + hyper transport, and `"fake"`
-//! for both the runtime and transport of fake HTTP clients. A custom transport
-//! reports the `runtime` and `transport` names passed to
+//! The bundled Hyper transports report `"arty"` or `"tokio"` as the runtime
+//! and `"hyper"` as the transport. Fake clients report `"fake"` for both
+//! values. A custom transport reports the names passed to
 //! [`custom::create_builder`](crate::custom::create_builder).
 //!
 //! # Metrics
@@ -112,7 +111,7 @@
 //! failure.
 //!
 //! This metric is only available when the Hyper-based transport is in use
-//! (the default for the Tokio runtime).
+//! (the default for the bundled Arty and Tokio integrations).
 //!
 //! **Histogram boundaries (seconds):** `0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 25.0, 50.0`
 //!

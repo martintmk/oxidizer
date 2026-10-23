@@ -90,8 +90,8 @@ any transport — including `reqwest` itself — and keep all of `fetch`’s sur
 
 ## Getting Started
 
-This client runs on the Tokio runtime by default. (Other runtimes can be plugged in via a
-custom transport — see the [`custom`][__link7] module.)
+This client has bundled integrations for Tokio and Arty. Other runtimes can
+use a custom transport through the [`custom`][__link7] module.
 
 ```rust
 use fetch::{HttpClient, HttpError};
@@ -115,6 +115,21 @@ async fn main() -> Result<(), HttpError> {
  > **Customization**: If you need to customize the HTTP client (e.g., add custom handlers, modify timeouts,
  > or configure other options), use [`HttpClient::builder_tokio`][__link8] instead of `new_tokio` to access
  > the full builder API.
+
+Arty applications can create a client from the task’s built-in services:
+
+```rust
+use arty::task::Builtins;
+use fetch::{HttpClient, HttpError};
+
+#[arty::main]
+async fn main(cx: Builtins) -> Result<(), HttpError> {
+    let client = HttpClient::new_arty(&cx);
+    let response = client.get("https://example.com").fetch().await?;
+    println!("status: {}", response.status());
+    Ok(())
+}
+```
 
 ## Making Requests
 
@@ -729,6 +744,11 @@ fetch = { version = "*", features = ["json", "tokio", "tls", "compression-gzip"]
   transport-specific `TokioTransportOptions`) and related APIs for using the HTTP client in a
   Tokio-based application.
 
+* **`arty`**: Enables integration with the Arty runtime and Mio I/O. This
+  feature provides [`HttpClient::builder_arty`][__link88] and
+  [`HttpClient::builder_arty_with_options`][__link89], and
+  [`HttpClient::new_arty`][__link90]. Enable `rustls` or `native-tls` with it.
+
 * **`json`**: Adds support for JSON serialization and deserialization, enabling methods like
   `HttpRequestBuilder::json` for sending JSON data and `HttpRequestBuilder::fetch_json` for receiving JSON responses.
 
@@ -750,27 +770,27 @@ The `compression-*` features below select formats for
 [automatic response decompression](#automatic-response-decompression). None is on by default,
 and a build with none of them links no compression implementation. Enabling one makes a format
 *available*; the client decompresses nothing until
-[`DecompressionOptions::formats`][__link88]
+[`DecompressionOptions::formats`][__link91]
 names it and those options are applied with
-[`decompression`][__link89].
+[`decompression`][__link92].
 
 * **`compression-gzip`**: Links `gzip` compression (RFC 1952) for
   [automatic response decompression](#automatic-response-decompression) and adds
-  [`DecompressionFormat::Gzip`][__link90]. The legacy `x-gzip` token selects
+  [`DecompressionFormat::Gzip`][__link93]. The legacy `x-gzip` token selects
   it too.
 
 * **`compression-deflate`**: Links `deflate` compression and adds
-  [`DecompressionFormat::Deflate`][__link91]. Despite the token, the HTTP
+  [`DecompressionFormat::Deflate`][__link94]. Despite the token, the HTTP
   `deflate` format is zlib-wrapped DEFLATE (RFC 1950), *not* raw DEFLATE (RFC 1951).
 
 * **`compression-brotli`**: Links Brotli compression (`br`, RFC 7932) and adds
-  [`DecompressionFormat::Brotli`][__link92].
+  [`DecompressionFormat::Brotli`][__link95].
 
 * **`compression-zstd`**: Links Zstandard compression (`zstd`, RFC 8878) and adds
-  [`DecompressionFormat::Zstd`][__link93].
+  [`DecompressionFormat::Zstd`][__link96].
 
 * **`compression-all`**: Enables all four compression features above. Use
-  [`DecompressionFormat::ALL`][__link94] to request decompression with all of them.
+  [`DecompressionFormat::ALL`][__link97] to request decompression with all of them.
 
  > 
  > **Note**: Most users should enable the `tokio` feature along with the `tls` feature for HTTPS
@@ -782,7 +802,7 @@ names it and those options are applied with
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/fetch">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbYX2biHSnzdYbPpDjAsdXBAEbzj3vtt_FroEbFPXRzVAThDlhZIeCZWJ5dGVzZjEuMTIuMYJoYnl0ZXNidWZmMC4xMi4wgmVmZXRjaGYwLjE5LjCCb2h0dHBfZXh0ZW5zaW9uc2YwLjEzLjCCZ2xheWVyZWRlMC4zLjiCaHNlYXRiZWx0ZjAuMTEuMIJtdGVtcGxhdGVkX3VyaWUwLjcuMA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbMmJYripcHqUbOgSxkQZBtiYbwY6NbEkXSrAbhoEE6RONf1JhZIeCZWJ5dGVzZjEuMTIuMYJoYnl0ZXNidWZmMC4xMi4wgmVmZXRjaGYwLjE5LjCCb2h0dHBfZXh0ZW5zaW9uc2YwLjEzLjCCZ2xheWVyZWRlMC4zLjiCaHNlYXRiZWx0ZjAuMTEuMIJtdGVtcGxhdGVkX3VyaWUwLjcuMA
  [__link0]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClient
  [__link1]: https://docs.rs/http_extensions/0.13.0/http_extensions/?search=RequestHandler
  [__link10]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClient::post
@@ -870,11 +890,14 @@ This crate was developed as part of <a href="https://github.com/microsoft/oxidiz
  [__link85]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionOptions::max_output_len
  [__link86]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClientBuilder::response_body_options
  [__link87]: https://docs.rs/http_compression
- [__link88]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionOptions::formats
- [__link89]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClientBuilder::decompression
+ [__link88]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClient::builder_arty
+ [__link89]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClient::builder_arty_with_options
  [__link9]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClient::get
- [__link90]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
- [__link91]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
- [__link92]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
+ [__link90]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClient::new_arty
+ [__link91]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionOptions::formats
+ [__link92]: https://docs.rs/fetch/0.19.0/fetch/?search=HttpClientBuilder::decompression
  [__link93]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
- [__link94]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat::ALL
+ [__link94]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
+ [__link95]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
+ [__link96]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat
+ [__link97]: https://docs.rs/fetch/0.19.0/fetch/?search=options::DecompressionFormat::ALL

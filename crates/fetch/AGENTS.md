@@ -3,17 +3,18 @@
 ## Conditional Compilation
 
 **A TLS backend is mandatory to create an `HttpClient` for real network use.**
-The `tokio` runtime alone is not enough — the hyper transport layer is built on top of
-TLS, so both must be enabled together. There are currently two TLS backends, `rustls`
-and `native-tls`, and more may be added. This produces the recurring cfg-guard pattern:
+The `arty` and `tokio` features do not enable TLS. Enable one runtime feature and
+one TLS feature. There are two TLS backends, `rustls` and `native-tls`.
 
 ```rust
-// "compile when the tokio runtime is selected AND a TLS backend is enabled"
+// Compile the Tokio integration when a TLS backend is enabled.
 #[cfg(all(feature = "tokio", any(feature = "rustls", feature = "native-tls")))]
+
+// Compile the Arty integration when a TLS backend is enabled.
+#[cfg(all(feature = "arty", any(feature = "rustls", feature = "native-tls")))]
 ```
 
-When adding a new TLS backend, extend the inner `any(...)` accordingly (e.g. add the new
-feature alongside `rustls` and `native-tls`).
+If you add a TLS backend, add its feature to each applicable `any(...)` expression.
 
 Some items are guarded by a single TLS backend plus `test`, for example the TLS error
 label resolution:

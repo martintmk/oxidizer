@@ -37,9 +37,9 @@ use crate::{BaseUri, RequestHandler};
 ///
 /// # Construction
 ///
-/// The builder instance is created using the `HttpClient::builder_tokio` method, or
-/// the free-standing [`custom::create_builder`][crate::custom::create_builder] function
-/// for a custom transport.
+/// Create the builder with `HttpClient::builder_tokio`,
+/// `HttpClient::builder_arty`, `HttpClient::builder_arty_with_options`, or
+/// [`custom::create_builder`](crate::custom::create_builder) for a custom transport.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct HttpClientBuilder {

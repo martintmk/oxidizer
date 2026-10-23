@@ -1,0 +1,560 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+use std::fmt;
+use std::io::{self, IoSlice, Read as _, Write as _};
+use std::net::{Shutdown, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use arty_mio::{Readiness, Registered, RegistrationClosed};
+use hyper::rt::{Read, ReadBufCursor, Write};
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use mio::Interest;
+use mio::net::TcpStream;
+
+const READ_BUFFER_SIZE: usize = 16 * 1_024;
+
+type ReadinessFuture = Pin<Box<dyn Future<Output = Result<Readiness, RegistrationClosed>> + Send + 'static>>;
+
+trait StreamIo: Send + Unpin + 'static {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize>;
+    fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> io::Result<usize>;
+    fn flush(&mut self) -> io::Result<()>;
+    fn shutdown(&self) -> io::Result<()>;
+    fn readiness(&self, interest: Interest) -> ReadinessFuture;
+}
+
+/// Socket addresses for one established Mio connection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MioConnectionInfo {
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+}
+
+impl MioConnectionInfo {
+    pub(crate) const fn new(local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self { local_addr, peer_addr }
+    }
+
+    /// Returns the local socket address.
+    #[must_use]
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Returns the remote socket address.
+    #[must_use]
+    pub const fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+}
+
+/// A registered Mio TCP stream that implements the Hyper I/O contract.
+pub struct MioStream {
+    core: StreamCore<RegisteredIo>,
+    info: MioConnectionInfo,
+}
+
+struct RegisteredIo {
+    registration: Registered<TcpStream>,
+}
+
+struct StreamCore<I> {
+    io: I,
+    read_buffer: Box<[u8]>,
+    read_wait: Option<ReadinessFuture>,
+    write_wait: Option<ReadinessFuture>,
+}
+
+impl MioStream {
+    pub(crate) fn new(registration: Registered<TcpStream>, info: MioConnectionInfo) -> Self {
+        Self {
+            core: StreamCore::new(RegisteredIo { registration }),
+            info,
+        }
+    }
+}
+
+impl<I> StreamCore<I> {
+    fn new(io: I) -> Self {
+        Self {
+            io,
+            read_buffer: vec![0; READ_BUFFER_SIZE].into_boxed_slice(),
+            read_wait: None,
+            write_wait: None,
+        }
+    }
+}
+
+impl fmt::Debug for MioStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MioStream")
+            .field("token", &self.core.io.registration.token())
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I: StreamIo> StreamCore<I> {
+    fn poll_read(&mut self, cx: &mut Context<'_>, mut buf: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let available = buf.remaining().min(self.read_buffer.len());
+            if available == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let result = self.io.read(&mut self.read_buffer[..available]);
+
+            match result {
+                Ok(length) => {
+                    self.read_wait = None;
+                    buf.put_slice(&self.read_buffer[..length]);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    self.read_wait = None;
+                    return Poll::Ready(Err(error));
+                }
+            }
+
+            match poll_readiness(&self.io, &mut self.read_wait, Interest::READABLE, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        loop {
+            let result = self.io.write(buf);
+
+            match result {
+                Ok(length) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Ok(length));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Err(error));
+                }
+            }
+
+            match poll_readiness(&self.io, &mut self.write_wait, Interest::WRITABLE, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let result = self.io.flush();
+
+            match result {
+                Ok(()) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Err(error));
+                }
+            }
+
+            match poll_readiness(&self.io, &mut self.write_wait, Interest::WRITABLE, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_shutdown(&self) -> Poll<io::Result<()>> {
+        Poll::Ready(self.io.shutdown())
+    }
+
+    fn poll_write_vectored(&mut self, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        loop {
+            let result = self.io.write_vectored(bufs);
+
+            match result {
+                Ok(length) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Ok(length));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    self.write_wait = None;
+                    return Poll::Ready(Err(error));
+                }
+            }
+
+            match poll_readiness(&self.io, &mut self.write_wait, Interest::WRITABLE, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl StreamIo for RegisteredIo {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.registration.source_mut().map_err(registration_closed)?.read(buffer)
+    }
+
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.registration.source_mut().map_err(registration_closed)?.write(buffer)
+    }
+
+    fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.registration.source_mut().map_err(registration_closed)?.write_vectored(buffers)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.registration.source_mut().map_err(registration_closed)?.flush()
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        self.registration.source().map_err(registration_closed)?.shutdown(Shutdown::Write)
+    }
+
+    fn readiness(&self, interest: Interest) -> ReadinessFuture {
+        Box::pin(self.registration.readiness(interest))
+    }
+}
+
+impl Read for MioStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
+        self.core.poll_read(cx, buf)
+    }
+}
+
+impl Write for MioStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.core.poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.core.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.core.poll_shutdown()
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        self.core.poll_write_vectored(cx, bufs)
+    }
+}
+
+impl Connection for MioStream {
+    fn connected(&self) -> Connected {
+        Connected::new().extra(self.info.clone())
+    }
+}
+
+fn poll_readiness<I: StreamIo>(
+    io: &I,
+    wait: &mut Option<ReadinessFuture>,
+    interest: Interest,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    let future = wait.get_or_insert_with(|| io.readiness(interest));
+    match future.as_mut().poll(cx) {
+        Poll::Ready(Ok(_readiness)) => {
+            *wait = None;
+            Poll::Ready(Ok(()))
+        }
+        Poll::Ready(Err(error)) => {
+            *wait = None;
+            Poll::Ready(Err(registration_closed(error)))
+        }
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+fn registration_closed(error: RegistrationClosed) -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, error)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Wake, Waker};
+
+    use super::*;
+
+    #[test]
+    fn spurious_readiness_retries_io_before_waiting_again() {
+        let io = ScriptedIo::new(
+            vec![ReadStep::WouldBlock, ReadStep::WouldBlock, ReadStep::Data(b"ok".to_vec())],
+            vec![],
+        );
+        io.readable.signal();
+        let mut core = StreamCore::new(io.clone());
+        let mut bytes = [0; 2];
+        let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
+
+        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_pending());
+        io.readable.signal();
+        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_ready());
+        assert_eq!(buffer.filled(), b"ok");
+        assert_eq!(io.read_calls(), 3);
+    }
+
+    #[test]
+    fn read_and_write_waiters_replace_only_their_latest_waker() {
+        let io = ScriptedIo::new(vec![], vec![]);
+        let mut core = StreamCore::new(io.clone());
+        let first_read = Arc::new(WakeCounter::default());
+        let second_read = Arc::new(WakeCounter::default());
+        let first_write = Arc::new(WakeCounter::default());
+        let second_write = Arc::new(WakeCounter::default());
+        let mut bytes = [0; 1];
+        let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
+
+        assert!(poll_read(&mut core, &Waker::from(Arc::clone(&first_read)), buffer.unfilled()).is_pending());
+        assert!(poll_read(&mut core, &Waker::from(Arc::clone(&second_read)), buffer.unfilled()).is_pending());
+        assert!(poll_write(&mut core, &Waker::from(Arc::clone(&first_write)), b"x").is_pending());
+        assert!(poll_write(&mut core, &Waker::from(Arc::clone(&second_write)), b"x").is_pending());
+
+        io.readable.signal();
+        assert_eq!((first_read.count(), second_read.count()), (0, 1));
+        assert_eq!((first_write.count(), second_write.count()), (0, 0));
+
+        io.writable.signal();
+        assert_eq!((first_write.count(), second_write.count()), (0, 1));
+    }
+
+    #[test]
+    fn eof_does_not_advance_the_hyper_buffer() {
+        let mut core = StreamCore::new(ScriptedIo::new(vec![ReadStep::Eof], vec![]));
+        let mut bytes = [0; 4];
+        let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
+
+        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_ready());
+        assert!(buffer.filled().is_empty());
+    }
+
+    #[test]
+    fn partial_and_zero_writes_are_returned_verbatim() {
+        let mut core = StreamCore::new(ScriptedIo::new(vec![], vec![WriteStep::Count(2), WriteStep::Count(0)]));
+
+        assert!(matches!(poll_write(&mut core, Waker::noop(), b"four"), Poll::Ready(Ok(2))));
+        assert!(matches!(
+            poll_write_vectored(&mut core, Waker::noop(), &[IoSlice::new(b"one"), IoSlice::new(b"two")]),
+            Poll::Ready(Ok(0))
+        ));
+    }
+
+    #[test]
+    fn dropping_pending_stream_cleans_up_io_and_readiness_future() {
+        let io = ScriptedIo::new(vec![], vec![]);
+        let drops = Arc::clone(&io.drops);
+        let readiness_drops = io.readable.future_drops();
+        let mut core = StreamCore::new(io);
+        let mut bytes = [0; 1];
+        let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
+
+        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_pending());
+        drop(core);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(readiness_drops.load(Ordering::SeqCst), 1);
+    }
+
+    fn poll_read<I: StreamIo>(core: &mut StreamCore<I>, waker: &Waker, buffer: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
+        core.poll_read(&mut Context::from_waker(waker), buffer)
+    }
+
+    fn poll_write<I: StreamIo>(core: &mut StreamCore<I>, waker: &Waker, buffer: &[u8]) -> Poll<io::Result<usize>> {
+        core.poll_write(&mut Context::from_waker(waker), buffer)
+    }
+
+    fn poll_write_vectored<I: StreamIo>(core: &mut StreamCore<I>, waker: &Waker, buffers: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        core.poll_write_vectored(&mut Context::from_waker(waker), buffers)
+    }
+
+    #[derive(Clone)]
+    struct ScriptedIo {
+        reads: Arc<Mutex<VecDeque<ReadStep>>>,
+        writes: Arc<Mutex<VecDeque<WriteStep>>>,
+        read_calls: Arc<AtomicUsize>,
+        readable: Signal,
+        writable: Signal,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedIo {
+        fn new(reads: Vec<ReadStep>, writes: Vec<WriteStep>) -> Self {
+            Self {
+                reads: Arc::new(Mutex::new(reads.into())),
+                writes: Arc::new(Mutex::new(writes.into())),
+                read_calls: Arc::new(AtomicUsize::new(0)),
+                readable: Signal::default(),
+                writable: Signal::default(),
+                drops: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn read_calls(&self) -> usize {
+            self.read_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ScriptedIo {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl StreamIo for ScriptedIo {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            let step = self.reads.lock().unwrap().pop_front().unwrap_or(ReadStep::WouldBlock);
+            match step {
+                ReadStep::Data(data) => {
+                    let length = data.len().min(buffer.len());
+                    buffer[..length].copy_from_slice(&data[..length]);
+                    Ok(length)
+                }
+                ReadStep::Eof => Ok(0),
+                ReadStep::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            self.next_write()
+        }
+
+        fn write_vectored(&mut self, _buffers: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.next_write()
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn readiness(&self, interest: Interest) -> ReadinessFuture {
+            if interest.is_readable() {
+                self.readable.future()
+            } else {
+                self.writable.future()
+            }
+        }
+    }
+
+    impl ScriptedIo {
+        fn next_write(&self) -> io::Result<usize> {
+            let step = self.writes.lock().unwrap().pop_front().unwrap_or(WriteStep::WouldBlock);
+            match step {
+                WriteStep::Count(length) => Ok(length),
+                WriteStep::WouldBlock => Err(io::ErrorKind::WouldBlock.into()),
+            }
+        }
+    }
+
+    enum ReadStep {
+        Data(Vec<u8>),
+        Eof,
+        WouldBlock,
+    }
+
+    enum WriteStep {
+        Count(usize),
+        WouldBlock,
+    }
+
+    #[derive(Clone, Default)]
+    struct Signal {
+        state: Arc<Mutex<SignalState>>,
+        future_drops: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct SignalState {
+        ready: bool,
+        waker: Option<Waker>,
+    }
+
+    impl Signal {
+        fn signal(&self) {
+            let waker = {
+                let mut state = self.state.lock().unwrap();
+                state.ready = true;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn future(&self) -> ReadinessFuture {
+            Box::pin(SignalFuture { signal: self.clone() })
+        }
+
+        fn future_drops(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.future_drops)
+        }
+    }
+
+    struct SignalFuture {
+        signal: Signal,
+    }
+
+    impl Future for SignalFuture {
+        type Output = Result<Readiness, RegistrationClosed>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut state = self.signal.state.lock().unwrap();
+            if std::mem::take(&mut state.ready) {
+                return Poll::Ready(Ok(Readiness::default()));
+            }
+            if state.waker.as_ref().is_none_or(|waker| !waker.will_wake(cx.waker())) {
+                state.waker = Some(cx.waker().clone());
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for SignalFuture {
+        fn drop(&mut self) {
+            self.signal.future_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCounter {
+        count: AtomicUsize,
+    }
+
+    impl WakeCounter {
+        fn count(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
