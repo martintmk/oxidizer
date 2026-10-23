@@ -8,15 +8,12 @@ use std::net::{Shutdown, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arty_mio::{Readiness, Registered, RegistrationClosed};
+use arty_mio::{Registered, RegistrationClosed};
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
-use mio::Interest;
 use mio::net::TcpStream;
 
-type ReadinessFuture = Pin<Box<dyn Future<Output = Result<Readiness, RegistrationClosed>> + Send + 'static>>;
-
-trait StreamIo: Send + Unpin + 'static {
+pub(crate) trait StreamIo: Send + Unpin + 'static {
     /// On success, returns at most `buffer.len()`, initializes that many leading
     /// entries, and does not inspect the buffer's previous contents.
     fn read(&mut self, buffer: &mut [MaybeUninit<u8>]) -> io::Result<usize>;
@@ -24,7 +21,8 @@ trait StreamIo: Send + Unpin + 'static {
     fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> io::Result<usize>;
     fn flush(&mut self) -> io::Result<()>;
     fn shutdown(&self) -> io::Result<()>;
-    fn readiness(&self, interest: Interest) -> ReadinessFuture;
+    fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
 /// Socket addresses for one established Mio connection.
@@ -62,10 +60,8 @@ struct RegisteredIo {
     registration: Registered<TcpStream>,
 }
 
-struct StreamCore<I> {
+pub(crate) struct StreamCore<I> {
     io: I,
-    read_wait: Option<ReadinessFuture>,
-    write_wait: Option<ReadinessFuture>,
 }
 
 impl MioStream {
@@ -78,12 +74,8 @@ impl MioStream {
 }
 
 impl<I> StreamCore<I> {
-    fn new(io: I) -> Self {
-        Self {
-            io,
-            read_wait: None,
-            write_wait: None,
-        }
+    pub(crate) fn new(io: I) -> Self {
+        Self { io }
     }
 }
 
@@ -97,7 +89,7 @@ impl fmt::Debug for MioStream {
 }
 
 impl<I: StreamIo> StreamCore<I> {
-    fn poll_read(&mut self, cx: &mut Context<'_>, mut buf: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_read(&mut self, cx: &mut Context<'_>, mut buf: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
         loop {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
@@ -109,7 +101,6 @@ impl<I: StreamIo> StreamCore<I> {
 
             match result {
                 Ok(length) => {
-                    self.read_wait = None;
                     // SAFETY: `StreamIo::read` initialized the first `length`
                     // entries in the cursor's unfilled region.
                     unsafe {
@@ -118,36 +109,28 @@ impl<I: StreamIo> StreamCore<I> {
                     return Poll::Ready(Ok(()));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    self.read_wait = None;
-                    return Poll::Ready(Err(error));
-                }
+                Err(error) => return Poll::Ready(Err(error)),
             }
 
-            match poll_readiness(&self.io, &mut self.read_wait, Interest::READABLE, cx) {
+            match self.io.poll_read_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             }
         }
     }
-    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+
+    pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         loop {
             let result = self.io.write(buf);
 
             match result {
-                Ok(length) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Ok(length));
-                }
+                Ok(length) => return Poll::Ready(Ok(length)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Err(error));
-                }
+                Err(error) => return Poll::Ready(Err(error)),
             }
 
-            match poll_readiness(&self.io, &mut self.write_wait, Interest::WRITABLE, cx) {
+            match self.io.poll_write_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
@@ -160,18 +143,12 @@ impl<I: StreamIo> StreamCore<I> {
             let result = self.io.flush();
 
             match result {
-                Ok(()) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Ok(()));
-                }
+                Ok(()) => return Poll::Ready(Ok(())),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Err(error));
-                }
+                Err(error) => return Poll::Ready(Err(error)),
             }
 
-            match poll_readiness(&self.io, &mut self.write_wait, Interest::WRITABLE, cx) {
+            match self.io.poll_write_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
@@ -183,23 +160,17 @@ impl<I: StreamIo> StreamCore<I> {
         Poll::Ready(self.io.shutdown())
     }
 
-    fn poll_write_vectored(&mut self, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+    pub(crate) fn poll_write_vectored(&mut self, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
         loop {
             let result = self.io.write_vectored(bufs);
 
             match result {
-                Ok(length) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Ok(length));
-                }
+                Ok(length) => return Poll::Ready(Ok(length)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    self.write_wait = None;
-                    return Poll::Ready(Err(error));
-                }
+                Err(error) => return Poll::Ready(Err(error)),
             }
 
-            match poll_readiness(&self.io, &mut self.write_wait, Interest::WRITABLE, cx) {
+            match self.io.poll_write_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
@@ -233,8 +204,16 @@ impl StreamIo for RegisteredIo {
         self.registration.source().map_err(registration_closed)?.shutdown(Shutdown::Write)
     }
 
-    fn readiness(&self, interest: Interest) -> ReadinessFuture {
-        Box::pin(self.registration.readiness(interest))
+    fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.registration
+            .poll_read_ready(context)
+            .map(|result| result.map(|_readiness| ()).map_err(registration_closed))
+    }
+
+    fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.registration
+            .poll_write_ready(context)
+            .map(|result| result.map(|_readiness| ()).map_err(registration_closed))
     }
 }
 
@@ -269,26 +248,6 @@ impl Write for MioStream {
 impl Connection for MioStream {
     fn connected(&self) -> Connected {
         Connected::new().extra(self.info.clone())
-    }
-}
-
-fn poll_readiness<I: StreamIo>(
-    io: &I,
-    wait: &mut Option<ReadinessFuture>,
-    interest: Interest,
-    cx: &mut Context<'_>,
-) -> Poll<io::Result<()>> {
-    let future = wait.get_or_insert_with(|| io.readiness(interest));
-    match future.as_mut().poll(cx) {
-        Poll::Ready(Ok(_readiness)) => {
-            *wait = None;
-            Poll::Ready(Ok(()))
-        }
-        Poll::Ready(Err(error)) => {
-            *wait = None;
-            Poll::Ready(Err(registration_closed(error)))
-        }
-        Poll::Pending => Poll::Pending,
     }
 }
 
@@ -395,19 +354,20 @@ mod tests {
     }
 
     #[test]
-    fn dropping_pending_stream_cleans_up_io_and_readiness_future() {
+    fn dropping_pending_stream_cleans_up_io_and_waiter() {
         let io = ScriptedIo::new(vec![], vec![]);
         let drops = Arc::clone(&io.drops);
-        let readiness_drops = io.readable.future_drops();
+        let waiter = Arc::new(WakeCounter::default());
         let mut core = StreamCore::new(io);
         let mut bytes = [0; 1];
         let mut buffer = hyper::rt::ReadBuf::new(&mut bytes);
 
-        assert!(poll_read(&mut core, Waker::noop(), buffer.unfilled()).is_pending());
+        assert!(poll_read(&mut core, &Waker::from(Arc::clone(&waiter)), buffer.unfilled()).is_pending());
+        assert_eq!(Arc::strong_count(&waiter), 2);
         drop(core);
 
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert_eq!(readiness_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&waiter), 1);
     }
 
     fn poll_read<I: StreamIo>(core: &mut StreamCore<I>, waker: &Waker, buffer: ReadBufCursor<'_>) -> Poll<io::Result<()>> {
@@ -488,12 +448,12 @@ mod tests {
             Ok(())
         }
 
-        fn readiness(&self, interest: Interest) -> ReadinessFuture {
-            if interest.is_readable() {
-                self.readable.future()
-            } else {
-                self.writable.future()
-            }
+        fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.readable.poll_ready(context)
+        }
+
+        fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.writable.poll_ready(context)
         }
     }
 
@@ -521,7 +481,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct Signal {
         state: Arc<Mutex<SignalState>>,
-        future_drops: Arc<AtomicUsize>,
     }
 
     #[derive(Default)]
@@ -542,37 +501,15 @@ mod tests {
             }
         }
 
-        fn future(&self) -> ReadinessFuture {
-            Box::pin(SignalFuture { signal: self.clone() })
-        }
-
-        fn future_drops(&self) -> Arc<AtomicUsize> {
-            Arc::clone(&self.future_drops)
-        }
-    }
-
-    struct SignalFuture {
-        signal: Signal,
-    }
-
-    impl Future for SignalFuture {
-        type Output = Result<Readiness, RegistrationClosed>;
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let mut state = self.signal.state.lock().unwrap();
+        fn poll_ready(&self, context: &Context<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.state.lock().unwrap();
             if std::mem::take(&mut state.ready) {
-                return Poll::Ready(Ok(Readiness::default()));
+                return Poll::Ready(Ok(()));
             }
-            if state.waker.as_ref().is_none_or(|waker| !waker.will_wake(cx.waker())) {
-                state.waker = Some(cx.waker().clone());
+            if state.waker.as_ref().is_none_or(|waker| !waker.will_wake(context.waker())) {
+                state.waker = Some(context.waker().clone());
             }
             Poll::Pending
-        }
-    }
-
-    impl Drop for SignalFuture {
-        fn drop(&mut self) {
-            self.signal.future_drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 

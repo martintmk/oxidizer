@@ -4,7 +4,7 @@
 use std::future::poll_fn;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 use std::{fmt, io};
 
 use mio::event::Source;
@@ -193,6 +193,42 @@ impl RegistrationState {
         }
         Poll::Pending
     }
+
+    fn poll_read(&self, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("read readiness polling does not call code that can panic while the readiness lock is held");
+        let readiness = std::mem::take(&mut inner.readable);
+        if !readiness.is_empty() {
+            return Poll::Ready(Ok(readiness));
+        }
+        if inner.closed {
+            return Poll::Ready(Err(RegistrationClosed));
+        }
+        if inner.read_waiter.as_ref().is_none_or(|waiter| !waiter.will_wake(waker)) {
+            inner.read_waiter = Some(waker.clone());
+        }
+        Poll::Pending
+    }
+
+    fn poll_write(&self, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("write readiness polling does not call code that can panic while the readiness lock is held");
+        let readiness = std::mem::take(&mut inner.writable);
+        if !readiness.is_empty() {
+            return Poll::Ready(Ok(readiness));
+        }
+        if inner.closed {
+            return Poll::Ready(Err(RegistrationClosed));
+        }
+        if inner.write_waiter.as_ref().is_none_or(|waiter| !waiter.will_wake(waker)) {
+            inner.write_waiter = Some(waker.clone());
+        }
+        Poll::Pending
+    }
 }
 
 /// An owned Mio source registered with one Arty Mio driver.
@@ -265,6 +301,50 @@ where
     /// source.
     pub fn source_mut(&self) -> Result<SourceMut<'_, S>, RegistrationClosed> {
         SourceMut::new(self.source.source.lock())
+    }
+
+    /// Polls for read readiness or driver shutdown.
+    ///
+    /// Call this method only after a read operation returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
+    /// be spurious. This method consumes the accumulated read readiness. It
+    /// does not consume write readiness.
+    ///
+    /// The registration stores only the latest read waker. A later poll can
+    /// replace the waker from an earlier poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver closes before it reports
+    /// more read readiness.
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the poll API follows Future::poll and accepts the caller's task context"
+    )]
+    pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
+        self.entry.state.poll_read(context.waker())
+    }
+
+    /// Polls for write readiness or driver shutdown.
+    ///
+    /// Call this method only after a write operation returns
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
+    /// be spurious. This method consumes the accumulated write readiness. It
+    /// does not consume read readiness.
+    ///
+    /// The registration stores only the latest write waker. A later poll can
+    /// replace the waker from an earlier poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistrationClosed`] if the driver closes before it reports
+    /// more write readiness.
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the poll API follows Future::poll and accepts the caller's task context"
+    )]
+    pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
+        self.entry.state.poll_write(context.waker())
     }
 
     /// Waits for the requested readiness or driver shutdown.

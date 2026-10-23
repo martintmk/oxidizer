@@ -33,10 +33,6 @@
 //!     let socket = io.register(socket, Interest::READABLE)?;
 //!
 //!     loop {
-//!         socket
-//!             .readiness(Interest::READABLE)
-//!             .await
-//!             .map_err(io::Error::other)?;
 //!         let mut buffer = [0; 1_024];
 //!         match socket
 //!             .source_mut()
@@ -47,7 +43,11 @@
 //!                 println!("received {length} bytes");
 //!                 return Ok(());
 //!             }
-//!             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+//!             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+//!                 std::future::poll_fn(|context| socket.poll_read_ready(context))
+//!                     .await
+//!                     .map_err(io::Error::other)?;
+//!             }
 //!             Err(error) => return Err(error),
 //!         }
 //!     }

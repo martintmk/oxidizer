@@ -41,11 +41,7 @@ fn primary_driver_registers_and_reports_repeat_readiness() {
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-    assert!(
-        expect_ready(poll_once(registration.readiness(Interest::READABLE), Waker::noop(),))
-            .unwrap()
-            .is_readable()
-    );
+    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
 
     let mut buffer = [0; 8];
     assert_eq!(registration.source_mut().unwrap().recv(&mut buffer).unwrap(), 1);
@@ -53,15 +49,11 @@ fn primary_driver_registers_and_reports_repeat_readiness() {
         registration.source_mut().unwrap().recv(&mut buffer).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
-    assert!(poll_once(registration.readiness(Interest::READABLE), Waker::noop(),).is_pending());
+    assert!(poll_read_ready(&registration, Waker::noop()).is_pending());
 
     sender.send(&[2]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-    assert!(
-        expect_ready(poll_once(registration.readiness(Interest::READABLE), Waker::noop(),))
-            .unwrap()
-            .is_readable()
-    );
+    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
 
     drop(registration);
     driver.shutdown().unwrap();
@@ -75,11 +67,7 @@ fn readiness_before_first_poll_and_waiter_replacement_are_lossless() {
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-    assert!(
-        expect_ready(poll_once(registration.readiness(Interest::READABLE), Waker::noop(),))
-            .unwrap()
-            .is_readable()
-    );
+    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
     let mut buffer = [0; 8];
     assert_eq!(registration.source_mut().unwrap().recv(&mut buffer).unwrap(), 1);
     assert_eq!(
@@ -89,8 +77,8 @@ fn readiness_before_first_poll_and_waiter_replacement_are_lossless() {
 
     let first = Arc::new(WakeCounter::default());
     let second = Arc::new(WakeCounter::default());
-    assert!(poll_once(registration.readiness(Interest::READABLE), &Waker::from(Arc::clone(&first)),).is_pending());
-    assert!(poll_once(registration.readiness(Interest::READABLE), &Waker::from(Arc::clone(&second)),).is_pending());
+    assert!(poll_read_ready(&registration, &Waker::from(Arc::clone(&first))).is_pending());
+    assert!(poll_read_ready(&registration, &Waker::from(Arc::clone(&second))).is_pending());
 
     sender.send(&[2]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
@@ -109,24 +97,16 @@ fn readable_and_writable_waiters_are_independent() {
     let read_wake = Arc::new(WakeCounter::default());
     let write_wake = Arc::new(WakeCounter::default());
 
-    assert!(poll_once(registration.readiness(Interest::READABLE), &Waker::from(Arc::clone(&read_wake)),).is_pending());
-    assert!(
-        expect_ready(poll_once(registration.readiness(Interest::WRITABLE), Waker::noop(),))
-            .unwrap()
-            .is_writable()
-    );
-    assert!(poll_once(registration.readiness(Interest::WRITABLE), &Waker::from(Arc::clone(&write_wake)),).is_pending());
+    assert!(poll_read_ready(&registration, &Waker::from(Arc::clone(&read_wake))).is_pending());
+    assert!(expect_ready(poll_write_ready(&registration, Waker::noop())).unwrap().is_writable());
+    assert!(poll_write_ready(&registration, &Waker::from(Arc::clone(&write_wake))).is_pending());
 
     peer.write_all(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
 
     assert_eq!((read_wake.count(), write_wake.count()), (1, 0));
-    assert!(
-        expect_ready(poll_once(registration.readiness(Interest::READABLE), Waker::noop(),))
-            .unwrap()
-            .is_readable()
-    );
-    assert!(poll_once(registration.readiness(Interest::WRITABLE), Waker::noop(),).is_pending());
+    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
+    assert!(poll_write_ready(&registration, Waker::noop()).is_pending());
 
     drop(registration);
     driver.shutdown().unwrap();
@@ -421,17 +401,14 @@ fn shutdown_closes_live_registration_and_rejects_later_registration() {
     let live_source = recording_source().with_deregister_reporter(deregister_tx);
     let live = register_primary(&io, &mut driver, live_source);
     let live_wake = Arc::new(WakeCounter::default());
-    assert!(poll_once(live.readiness(Interest::READABLE), &Waker::from(Arc::clone(&live_wake)),).is_pending());
+    assert!(poll_read_ready(&live, &Waker::from(Arc::clone(&live_wake))).is_pending());
 
     driver.shutdown().unwrap();
 
     assert_eq!(deregister_rx.recv().unwrap(), std::thread::current().id());
     assert_eq!(live.source_mut().err().unwrap(), RegistrationClosed);
     assert_eq!(live_wake.count(), 1);
-    assert_eq!(
-        expect_ready(poll_once(live.readiness(Interest::READABLE), Waker::noop(),)),
-        Err(RegistrationClosed)
-    );
+    assert_eq!(expect_ready(poll_read_ready(&live, Waker::noop())), Err(RegistrationClosed));
     let later_source = recording_source();
     let error = io.register(later_source, Interest::READABLE).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -480,6 +457,20 @@ where
 {
     let mut future = pin!(future);
     poll_pinned(future.as_mut(), waker)
+}
+
+fn poll_read_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>>
+where
+    S: Source + Send + 'static,
+{
+    registration.poll_read_ready(&mut Context::from_waker(waker))
+}
+
+fn poll_write_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>>
+where
+    S: Source + Send + 'static,
+{
+    registration.poll_write_ready(&mut Context::from_waker(waker))
 }
 
 fn poll_pinned<F>(future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output>

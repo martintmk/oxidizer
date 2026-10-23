@@ -85,3 +85,7 @@ workspace = true
 [[bench]]
 name = "read_path"
 harness = false
+
+[[bench]]
+name = "fetch_mio_readiness"
+harness = false

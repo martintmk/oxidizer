@@ -39,10 +39,6 @@ async fn receive(builtins: &Builtins) -> io::Result<()> {
     let socket = io.register(socket, Interest::READABLE)?;
 
     loop {
-        socket
-            .readiness(Interest::READABLE)
-            .await
-            .map_err(io::Error::other)?;
         let mut buffer = [0; 1_024];
         match socket
             .source_mut()
@@ -53,7 +49,11 @@ async fn receive(builtins: &Builtins) -> io::Result<()> {
                 println!("received {length} bytes");
                 return Ok(());
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::future::poll_fn(|context| socket.poll_read_ready(context))
+                    .await
+                    .map_err(io::Error::other)?;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -66,5 +66,5 @@ async fn receive(builtins: &Builtins) -> io::Result<()> {
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty_mio">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbZrnjxuowXW4bCj2Y-5pzChob8MdMLuiqlVwbwTHtdy7cy79hZIGCaGFydHlfbWlvZTAuMS4w
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbEcNJEnjZt3Ebli-Z7Zb_zYcbpOmJjS20ZuAbYg-3-wsKzY9hZIGCaGFydHlfbWlvZTAuMS4w
  [__link0]: https://docs.rs/arty_mio/0.1.0/arty_mio/?search=MioContext
