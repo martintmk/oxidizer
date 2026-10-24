@@ -53,7 +53,7 @@ Each PR must keep the public API stable, preserve behavior, and avoid performanc
 
 The loop posts each PR in `Please Review (AI)`. The PR then follows the same AI and human phases.
 
-The loop does not make product decisions or change user contracts. If a change needs such a decision, the loop stops and asks a human.
+The loop does not make product decisions or change user contracts. If a PR needs a human decision, that PR waits in the human phase while the loop continues.
 
 ## Summary
 
