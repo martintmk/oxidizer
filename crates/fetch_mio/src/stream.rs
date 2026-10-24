@@ -120,10 +120,12 @@ impl<I: StreamIo> StreamCore<I> {
     }
 
     pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        loop {
-            let result = self.io.write(buf);
+        self.poll_write_with(cx, |io| io.write(buf))
+    }
 
-            match result {
+    fn poll_write_with(&mut self, cx: &mut Context<'_>, mut write: impl FnMut(&mut I) -> io::Result<usize>) -> Poll<io::Result<usize>> {
+        loop {
+            match write(&mut self.io) {
                 Ok(length) => return Poll::Ready(Ok(length)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Poll::Ready(Err(error)),
@@ -147,21 +149,7 @@ impl<I: StreamIo> StreamCore<I> {
     }
 
     pub(crate) fn poll_write_vectored(&mut self, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        loop {
-            let result = self.io.write_vectored(bufs);
-
-            match result {
-                Ok(length) => return Poll::Ready(Ok(length)),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Poll::Ready(Err(error)),
-            }
-
-            match self.io.poll_write_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        self.poll_write_with(cx, |io| io.write_vectored(bufs))
     }
 }
 

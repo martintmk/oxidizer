@@ -151,6 +151,23 @@ fn write_direct(mut input: WriteInput<StreamCore<ScriptedIo>>) -> WriteOutput<St
     }
 }
 
+#[metabench::benchmark(WRITE_VECTORED_DIRECT, WRITE_GROUP, "direct_poll_vectored")]
+#[bench::would_block_ready_retry(direct_write_input())]
+fn write_vectored_direct(mut input: WriteInput<StreamCore<ScriptedIo>>) -> WriteOutput<StreamCore<ScriptedIo>> {
+    let mut context = Context::from_waker(Waker::noop());
+    let buffers = [IoSlice::new(&[42])];
+    assert!(input.core.poll_write_vectored(&mut context, &buffers).is_pending());
+    input.signal.signal();
+    let Poll::Ready(Ok(bytes_written)) = input.core.poll_write_vectored(&mut context, &buffers) else {
+        panic!("the scripted vectored write must complete after readiness");
+    };
+    WriteOutput {
+        input,
+        pending_polls: 1,
+        bytes_written,
+    }
+}
+
 fn criterion_benchmarks(criterion: &mut Criterion) {
     let mut read = criterion.benchmark_group(READ_GROUP);
     read.bench_function(READ_BOXED.benchmark_name(), |bencher| {
@@ -194,6 +211,17 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
             direct_write_input,
             |input| {
                 let output = write_direct(input);
+                black_box((output.pending_polls, output.bytes_written));
+                output.input
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    write.bench_function(WRITE_VECTORED_DIRECT.benchmark_name(), |bencher| {
+        bencher.iter_batched(
+            direct_write_input,
+            |input| {
+                let output = write_vectored_direct(input);
                 black_box((output.pending_polls, output.bytes_written));
                 output.input
             },
@@ -401,6 +429,6 @@ enum Direction {
 
 metabench::main!(
     criterion = criterion_benchmarks,
-    benchmarks = [READ_BOXED, READ_DIRECT, WRITE_BOXED, WRITE_DIRECT],
+    benchmarks = [READ_BOXED, READ_DIRECT, WRITE_BOXED, WRITE_DIRECT, WRITE_VECTORED_DIRECT],
     allocator = std::alloc::System,
 );
