@@ -9,7 +9,6 @@
 use std::io;
 use std::io::Write as _;
 use std::net::{TcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket};
-use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
@@ -127,11 +126,7 @@ fn secondary_driver_registers_on_its_poller_and_wakes_the_owner() {
     owner_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::ZERO)).unwrap();
 
-    assert!(
-        expect_ready(poll_once(registration.readiness(Interest::READABLE), Waker::noop(),))
-            .unwrap()
-            .is_readable()
-    );
+    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
     drop(registration);
     driver.shutdown().unwrap();
 }
@@ -261,7 +256,7 @@ fn relocation_keeps_existing_sources_on_their_original_poller() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (old_source, old_sender) = udp_pair();
     let old_registration = register_primary(&io, &mut driver, old_source);
-    assert!(poll_once(old_registration.readiness(Interest::READABLE), Waker::noop(),).is_pending());
+    assert!(poll_read_ready(&old_registration, Waker::noop()).is_pending());
     let (destination_ready_tx, destination_ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
@@ -287,7 +282,7 @@ fn relocation_keeps_existing_sources_on_their_original_poller() {
         old_sender.send(&[1]).unwrap();
         driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
         assert!(
-            expect_ready(poll_once(old_registration.readiness(Interest::READABLE), Waker::noop(),))
+            expect_ready(poll_read_ready(&old_registration, Waker::noop()))
                 .unwrap()
                 .is_readable()
         );
@@ -498,14 +493,6 @@ fn recording_source() -> RecordingSource {
     }
 }
 
-fn poll_once<F>(future: F, waker: &Waker) -> Poll<F::Output>
-where
-    F: Future,
-{
-    let mut future = pin!(future);
-    poll_pinned(future.as_mut(), waker)
-}
-
 fn poll_read_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>>
 where
     S: Source + Send + 'static,
@@ -518,13 +505,6 @@ where
     S: Source + Send + 'static,
 {
     registration.poll_write_ready(&mut Context::from_waker(waker))
-}
-
-fn poll_pinned<F>(future: Pin<&mut F>, waker: &Waker) -> Poll<F::Output>
-where
-    F: Future + ?Sized,
-{
-    future.poll(&mut Context::from_waker(waker))
 }
 
 fn expect_ready<T>(poll: Poll<T>) -> T {

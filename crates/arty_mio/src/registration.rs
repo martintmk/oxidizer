@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::future::poll_fn;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -194,33 +193,6 @@ impl RegistrationState {
         self.closed.load(Ordering::Acquire)
     }
 
-    fn poll(&self, interest: Interest, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("readiness polling does not call code that can panic while the readiness lock is held");
-        let mut readiness = Readiness::default();
-        if interest.is_readable() {
-            readiness.combine(std::mem::take(&mut inner.readable));
-        }
-        if interest.is_writable() {
-            readiness.combine(std::mem::take(&mut inner.writable));
-        }
-        if !readiness.is_empty() {
-            return Poll::Ready(Ok(readiness));
-        }
-        if inner.closed {
-            return Poll::Ready(Err(RegistrationClosed));
-        }
-        if interest.is_readable() && inner.read_waiter.as_ref().is_none_or(|waiter| !waiter.will_wake(waker)) {
-            inner.read_waiter = Some(waker.clone());
-        }
-        if interest.is_writable() && inner.write_waiter.as_ref().is_none_or(|waiter| !waiter.will_wake(waker)) {
-            inner.write_waiter = Some(waker.clone());
-        }
-        Poll::Pending
-    }
-
     fn poll_read(&self, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
         let mut inner = self
             .inner
@@ -399,22 +371,6 @@ where
     pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
         self.entry.state.poll_write(context.waker())
     }
-
-    /// Waits for the requested readiness or driver shutdown.
-    ///
-    /// Readiness is a hint and can be spurious. Multiple events accumulate
-    /// until this future returns them. Reading readiness and writing readiness
-    /// have separate latest-waker slots. Taking one direction does not clear
-    /// the other direction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationClosed`] if the driver closes before it reports
-    /// the requested readiness.
-    pub fn readiness(&self, interest: Interest) -> impl Future<Output = Result<Readiness, RegistrationClosed>> + Send + 'static {
-        let state = Arc::clone(&self.entry.state);
-        async move { poll_fn(|context| state.poll(interest, context.waker())).await }
-    }
 }
 
 impl<S> Drop for ExclusiveRegistered<S>
@@ -532,22 +488,6 @@ where
     )]
     pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
         self.entry.state.poll_write(context.waker())
-    }
-
-    /// Waits for the requested readiness or driver shutdown.
-    ///
-    /// Readiness is a hint and can be spurious. Multiple events accumulate
-    /// until this future returns them. Reading readiness and writing readiness
-    /// have separate latest-waker slots. Taking one direction does not clear
-    /// the other direction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationClosed`] if the driver closes before it reports
-    /// the requested readiness.
-    pub fn readiness(&self, interest: Interest) -> impl Future<Output = Result<Readiness, RegistrationClosed>> + Send + 'static {
-        let state = Arc::clone(&self.entry.state);
-        async move { poll_fn(|context| state.poll(interest, context.waker())).await }
     }
 }
 

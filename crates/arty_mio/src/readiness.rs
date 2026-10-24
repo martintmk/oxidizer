@@ -87,17 +87,6 @@ impl Readiness {
         self.lio |= event.is_lio();
     }
 
-    pub(crate) fn combine(&mut self, other: Self) {
-        self.readable |= other.readable;
-        self.writable |= other.writable;
-        self.error |= other.error;
-        self.read_closed |= other.read_closed;
-        self.write_closed |= other.write_closed;
-        self.priority |= other.priority;
-        self.aio |= other.aio;
-        self.lio |= other.lio;
-    }
-
     pub(crate) const fn is_empty(self) -> bool {
         !(self.readable || self.writable || self.error || self.read_closed || self.write_closed || self.priority || self.aio || self.lio)
     }
