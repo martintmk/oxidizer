@@ -1,15 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::{fmt, io};
 
 use mio::event::Source;
-use mio::{Interest, Registry, Token};
-use parking_lot::{Mutex as SourceMutex, MutexGuard as SourceMutexGuard};
+use mio::{Interest, Token};
 
 use crate::readiness::{Readiness, RegistrationClosed};
 use crate::worker::WorkerState;
@@ -38,12 +36,11 @@ impl Default for RegistrationState {
 
 pub(crate) struct RegistrationEntry {
     state: Arc<RegistrationState>,
-    source: Arc<dyn NativeRegistration>,
 }
 
 impl RegistrationEntry {
-    fn new(state: Arc<RegistrationState>, source: Arc<dyn NativeRegistration>) -> Self {
-        Self { state, source }
+    fn new(state: Arc<RegistrationState>) -> Self {
+        Self { state }
     }
 
     pub(crate) fn notify(&self, event: &mio::event::Event) {
@@ -52,71 +49,6 @@ impl RegistrationEntry {
 
     pub(crate) fn close(&self) {
         self.state.close();
-    }
-
-    pub(crate) fn deregister(&self, registry: &Registry) -> io::Result<()> {
-        let result = self.source.deregister(registry);
-        self.state.close();
-        result
-    }
-
-    pub(crate) fn try_deregister(&self, registry: &Registry) -> io::Result<()> {
-        self.source.try_deregister(registry)?;
-        self.state.close();
-        Ok(())
-    }
-}
-
-trait NativeRegistration: Send + Sync {
-    fn deregister(&self, registry: &Registry) -> io::Result<()>;
-    fn try_deregister(&self, registry: &Registry) -> io::Result<()>;
-}
-
-struct OwnerRegistration;
-
-impl NativeRegistration for OwnerRegistration {
-    fn deregister(&self, _registry: &Registry) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn try_deregister(&self, _registry: &Registry) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct SourceCell<S> {
-    source: SourceMutex<Option<S>>,
-}
-
-impl<S> SourceCell<S> {
-    fn new(source: S) -> Self {
-        Self {
-            source: SourceMutex::new(Some(source)),
-        }
-    }
-}
-
-impl<S> NativeRegistration for SourceCell<S>
-where
-    S: Source + Send + 'static,
-{
-    fn deregister(&self, registry: &Registry) -> io::Result<()> {
-        let source = self.source.lock().take();
-        if let Some(mut source) = source {
-            registry.deregister(&mut source)?;
-        }
-        Ok(())
-    }
-
-    fn try_deregister(&self, registry: &Registry) -> io::Result<()> {
-        let mut source = self
-            .source
-            .try_lock()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "the registered source is in use during driver shutdown"))?;
-        if let Some(mut source) = source.take() {
-            registry.deregister(&mut source)?;
-        }
-        Ok(())
     }
 }
 
@@ -232,31 +164,16 @@ impl RegistrationState {
 
 /// An owned Mio source registered with one Arty Mio driver.
 ///
-/// Dropping this value removes the source registration through a thread-safe
-/// clone of the native registry. The source then drops on the caller thread.
-/// Mio binds a source to one `Poll` for its registered lifetime, so this type
-/// does not expose an operation that moves the source to another registry.
+/// This type gives its owner direct source access without a lock. Driver
+/// shutdown closes readiness and the native poller. The owner keeps the source
+/// until this value drops.
+///
+/// While the driver is active, dropping this value removes the source
+/// registration through a thread-safe clone of the native registry. The source
+/// then drops on the caller thread. Mio binds a source to one `Poll` for its
+/// registered lifetime, so this type does not expose an operation that moves
+/// the source to another registry.
 pub struct Registered<S>
-where
-    S: Source + Send + 'static,
-{
-    source: Arc<SourceCell<S>>,
-    worker: Arc<WorkerState>,
-    token: Token,
-    entry: Arc<RegistrationEntry>,
-}
-
-/// A registered Mio source with exclusive source ownership.
-///
-/// This type gives the owner direct source access without a lock. Driver
-/// shutdown closes readiness and removes the native poller. The owner keeps
-/// the source until this value drops.
-///
-/// Dropping this value while the driver is active removes the source
-/// registration through a thread-safe clone of the native registry. Mio binds
-/// a source to one `Poll` for its registered lifetime, so this type does not
-/// expose an operation that moves the source to another registry.
-pub struct ExclusiveRegistered<S>
 where
     S: Source + Send + 'static,
 {
@@ -266,18 +183,16 @@ where
     entry: Arc<RegistrationEntry>,
 }
 
-impl<S> fmt::Debug for ExclusiveRegistered<S>
+impl<S> fmt::Debug for Registered<S>
 where
     S: Source + Send + fmt::Debug + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExclusiveRegistered")
-            .field("token", &self.token)
-            .finish_non_exhaustive()
+        f.debug_struct("Registered").field("token", &self.token).finish_non_exhaustive()
     }
 }
 
-impl<S> ExclusiveRegistered<S>
+impl<S> Registered<S>
 where
     S: Source + Send + 'static,
 {
@@ -373,7 +288,7 @@ where
     }
 }
 
-impl<S> Drop for ExclusiveRegistered<S>
+impl<S> Drop for Registered<S>
 where
     S: Source + Send + 'static,
 {
@@ -390,245 +305,13 @@ where
     }
 }
 
-impl<S> fmt::Debug for Registered<S>
-where
-    S: Source + Send + fmt::Debug + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Registered").field("token", &self.token).finish_non_exhaustive()
-    }
-}
-
-impl<S> Registered<S>
-where
-    S: Source + Send + 'static,
-{
-    fn new(source: Arc<SourceCell<S>>, worker: Arc<WorkerState>, token: Token, entry: Arc<RegistrationEntry>) -> Self {
-        Self {
-            source,
-            worker,
-            token,
-            entry,
-        }
-    }
-
-    /// Returns the Mio token assigned to this source.
-    #[must_use]
-    pub const fn token(&self) -> Token {
-        self.token
-    }
-
-    /// Returns a shared reference to the registered source.
-    ///
-    /// Drop the returned guard before an await point. The guard prevents
-    /// driver shutdown from releasing the source.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationClosed`] if driver shutdown already released the
-    /// source.
-    pub fn source(&self) -> Result<SourceRef<'_, S>, RegistrationClosed> {
-        SourceRef::new(self.source.source.lock())
-    }
-
-    /// Returns a mutable reference to the registered source.
-    ///
-    /// Read or write until the operation returns
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Then wait for new readiness.
-    /// Drop the returned guard before an await point. The guard prevents
-    /// driver shutdown from releasing the source.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationClosed`] if driver shutdown already released the
-    /// source.
-    pub fn source_mut(&self) -> Result<SourceMut<'_, S>, RegistrationClosed> {
-        SourceMut::new(self.source.source.lock())
-    }
-
-    /// Polls for read readiness or driver shutdown.
-    ///
-    /// Call this method only after a read operation returns
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
-    /// be spurious. This method consumes the accumulated read readiness. It
-    /// does not consume write readiness.
-    ///
-    /// The registration stores only the latest read waker. A later poll can
-    /// replace the waker from an earlier poll.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationClosed`] if the driver closes before it reports
-    /// more read readiness.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "the poll API follows Future::poll and accepts the caller's task context"
-    )]
-    pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
-        self.entry.state.poll_read(context.waker())
-    }
-
-    /// Polls for write readiness or driver shutdown.
-    ///
-    /// Call this method only after a write operation returns
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
-    /// be spurious. This method consumes the accumulated write readiness. It
-    /// does not consume read readiness.
-    ///
-    /// The registration stores only the latest write waker. A later poll can
-    /// replace the waker from an earlier poll.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationClosed`] if the driver closes before it reports
-    /// more write readiness.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "the poll API follows Future::poll and accepts the caller's task context"
-    )]
-    pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
-        self.entry.state.poll_write(context.waker())
-    }
-}
-
-impl<S> Drop for Registered<S>
-where
-    S: Source + Send + 'static,
-{
-    fn drop(&mut self) {
-        if !self.worker.begin_deregistration(self.token, &self.entry) {
-            self.entry.close();
-            return;
-        }
-        let _operation = RegistryOperation(&self.worker);
-        if let Err(error) = self.entry.deregister(self.worker.registry()) {
-            self.worker.record_failure(error);
-        }
-    }
-}
-
-/// Shared access to a registered Mio source.
-pub struct SourceRef<'a, S> {
-    guard: SourceMutexGuard<'a, Option<S>>,
-}
-
-impl<S> fmt::Debug for SourceRef<'_, S>
-where
-    S: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<'a, S> SourceRef<'a, S> {
-    fn new(guard: SourceMutexGuard<'a, Option<S>>) -> Result<Self, RegistrationClosed> {
-        if guard.is_some() {
-            Ok(Self { guard })
-        } else {
-            Err(RegistrationClosed)
-        }
-    }
-}
-
-impl<S> Deref for SourceRef<'_, S> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        self.guard
-            .as_ref()
-            .expect("SourceRef is constructed only while the source is present")
-    }
-}
-
-/// Exclusive access to a registered Mio source.
-pub struct SourceMut<'a, S> {
-    guard: SourceMutexGuard<'a, Option<S>>,
-}
-
-impl<S> fmt::Debug for SourceMut<'_, S>
-where
-    S: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<'a, S> SourceMut<'a, S> {
-    fn new(guard: SourceMutexGuard<'a, Option<S>>) -> Result<Self, RegistrationClosed> {
-        if guard.is_some() {
-            Ok(Self { guard })
-        } else {
-            Err(RegistrationClosed)
-        }
-    }
-}
-
-impl<S> Deref for SourceMut<'_, S> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        self.guard
-            .as_ref()
-            .expect("SourceMut is constructed only while the source is present")
-    }
-}
-
-impl<S> DerefMut for SourceMut<'_, S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard
-            .as_mut()
-            .expect("SourceMut is constructed only while the source is present")
-    }
-}
-
-pub(crate) fn register<S>(source: S, interest: Interest, worker: Arc<WorkerState>) -> io::Result<Registered<S>>
+pub(crate) fn register<S>(mut source: S, interest: Interest, worker: Arc<WorkerState>) -> io::Result<Registered<S>>
 where
     S: Source + Send + 'static,
 {
     let token = worker.allocate_token()?;
     let state = Arc::new(RegistrationState::default());
-    let source = Arc::new(SourceCell::new(source));
-    let entry = Arc::new(RegistrationEntry::new(
-        Arc::clone(&state),
-        Arc::clone(&source) as Arc<dyn NativeRegistration>,
-    ));
-    worker.begin_registration(token, Arc::clone(&entry))?;
-    let operation = RegistryOperation(&worker);
-    let registration = {
-        let mut source = source.source.lock();
-        worker.registry().register(
-            source.as_mut().expect("the source is present before native registration"),
-            token,
-            interest,
-        )
-    };
-    if let Err(error) = registration {
-        worker.finish_registration(token, &entry, false);
-        entry.close();
-        return Err(error);
-    }
-    if !worker.finish_registration(token, &entry, true) {
-        if let Err(error) = entry.deregister(worker.registry()) {
-            worker.record_failure(error);
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "the Arty Mio driver closed while it registered the source",
-        ));
-    }
-    drop(operation);
-    Ok(Registered::new(source, worker, token, entry))
-}
-
-pub(crate) fn register_exclusive<S>(mut source: S, interest: Interest, worker: Arc<WorkerState>) -> io::Result<ExclusiveRegistered<S>>
-where
-    S: Source + Send + 'static,
-{
-    let token = worker.allocate_token()?;
-    let state = Arc::new(RegistrationState::default());
-    let entry = Arc::new(RegistrationEntry::new(state, Arc::new(OwnerRegistration)));
+    let entry = Arc::new(RegistrationEntry::new(state));
     worker.begin_registration(token, Arc::clone(&entry))?;
     let operation = RegistryOperation(&worker);
     if let Err(error) = worker.registry().register(&mut source, token, interest) {
@@ -646,7 +329,7 @@ where
         ));
     }
     drop(operation);
-    Ok(ExclusiveRegistered::new(source, worker, token, entry))
+    Ok(Registered::new(source, worker, token, entry))
 }
 
 #[cfg(test)]

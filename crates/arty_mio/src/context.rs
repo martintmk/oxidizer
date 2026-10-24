@@ -11,7 +11,7 @@ use thread_aware_core::{Thread, ThreadAware};
 
 use crate::driver::MioDriver;
 use crate::options::MioOptions;
-use crate::registration::{ExclusiveRegistered, Registered, register, register_exclusive};
+use crate::registration::{Registered, register};
 use crate::worker::{ContextState, WorkerState};
 
 /// A thread-aware handle that submits sources to a worker-local Mio driver.
@@ -37,6 +37,10 @@ impl fmt::Debug for MioContext {
 impl MioContext {
     /// Registers an owned Mio source with this context's driver.
     ///
+    /// The returned registration gives its owner direct access to the source.
+    /// Driver shutdown closes readiness and the native poller. The registration
+    /// keeps the source until its owner drops it.
+    ///
     /// Registration uses the worker route that is available on the calling
     /// thread.
     ///
@@ -49,26 +53,6 @@ impl MioContext {
         S: Source + Send + 'static,
     {
         register(source, interest, self.registration_worker()?)
-    }
-
-    /// Registers a Mio source with exclusive source ownership.
-    ///
-    /// This method gives the returned owner direct source access without a
-    /// lock. Driver shutdown closes readiness and the native poller. The
-    /// source remains with the owner until the returned value drops.
-    ///
-    /// Registration uses the worker route that is available on the calling
-    /// thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if this context is not attached to a driver, the
-    /// driver is closed, or Mio rejects the source.
-    pub fn register_exclusive<S>(&self, source: S, interest: Interest) -> io::Result<ExclusiveRegistered<S>>
-    where
-        S: Source + Send + 'static,
-    {
-        register_exclusive(source, interest, self.registration_worker()?)
     }
 
     fn registration_worker(&self) -> io::Result<Arc<WorkerState>> {

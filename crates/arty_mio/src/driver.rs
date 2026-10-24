@@ -135,38 +135,22 @@ impl DriverInner {
     fn shutdown(self) -> Result<(), DriverError> {
         self.context.remove(&self.worker);
         self.worker.close_registrations();
-        let cleanup_error = self.deregister_all();
         match self.mode {
             DriverMode::Primary(driver) => {
                 let control_error = self.worker.take_failure().map(DriverError::from_source);
                 self.poll_waker.deactivate();
                 drop(driver);
-                match (control_error, cleanup_error) {
-                    (Some(error), _) | (None, Err(error)) => Err(error),
-                    (None, Ok(())) => Ok(()),
+                match control_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
                 }
             }
             DriverMode::Secondary(driver) => {
                 let result = driver.shutdown(&self.poll_waker, &self.worker);
                 self.poll_waker.deactivate();
-                match (result, cleanup_error) {
-                    (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-                    (Ok(()), Ok(())) => Ok(()),
-                }
+                result
             }
         }
-    }
-
-    fn deregister_all(&self) -> Result<(), DriverError> {
-        let mut first_error = None;
-        for registration in self.worker.drain_registrations() {
-            if let Err(error) = registration.try_deregister(self.worker.registry())
-                && first_error.is_none()
-            {
-                first_error = Some(DriverError::from_source(error));
-            }
-        }
-        first_error.map_or(Ok(()), Err)
     }
 }
 

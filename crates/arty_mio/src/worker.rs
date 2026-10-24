@@ -183,21 +183,11 @@ impl WorkerState {
                     .wait(registrations)
                     .expect("only driver shutdown waits for active registry operations");
             }
-            registrations.values.values().cloned().collect()
+            registrations.values.drain().map(|(_, registration)| registration).collect()
         };
         for registration in registrations {
             registration.close();
         }
-    }
-
-    pub(crate) fn drain_registrations(&self) -> Vec<Arc<RegistrationEntry>> {
-        self.registrations
-            .lock()
-            .expect("registration draining does not call user code while the registration lock is held")
-            .values
-            .drain()
-            .map(|(_, registration)| registration)
-            .collect()
     }
 
     #[cfg(test)]

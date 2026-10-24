@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arty::task::Scheduler;
-use arty_mio::{ExclusiveRegistered, MioContext, RegistrationClosed};
+use arty_mio::{MioContext, Registered, RegistrationClosed};
 use fetch_options::SocketOptions;
 use http::uri::Scheme;
 use http_extensions::{HttpError, Result};
@@ -277,7 +277,7 @@ struct MioConnectFuture {
 
 enum MioConnectState {
     Start(MioContext),
-    Connecting(ExclusiveRegistered<TcpStream>),
+    Connecting(Registered<TcpStream>),
     Done,
 }
 
@@ -297,7 +297,7 @@ impl Future for MioConnectFuture {
             if let Err(error) = apply_buffer_options(&stream, this.options) {
                 return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::SocketOption, error)));
             }
-            let registration = match context.register_exclusive(stream, Interest::READABLE | Interest::WRITABLE) {
+            let registration = match context.register(stream, Interest::READABLE | Interest::WRITABLE) {
                 Ok(registration) => registration,
                 Err(error) => return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::Registration, error))),
             };
@@ -352,7 +352,7 @@ fn apply_buffer_options(stream: &TcpStream, options: SocketOptions) -> io::Resul
     Ok(())
 }
 
-fn poll_complete_connect(registration: &ExclusiveRegistered<TcpStream>, context: &mut Context<'_>) -> Poll<io::Result<MioConnectionInfo>> {
+fn poll_complete_connect(registration: &Registered<TcpStream>, context: &mut Context<'_>) -> Poll<io::Result<MioConnectionInfo>> {
     loop {
         match registration.poll_write_ready(context) {
             Poll::Ready(Ok(_readiness)) => {}

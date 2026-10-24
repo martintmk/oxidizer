@@ -364,7 +364,6 @@ dependencies = [
  "ctor",
  "metabench",
  "mio",
- "parking_lot",
  "static_assertions",
  "testing_aids",
  "thread_aware",

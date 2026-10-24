@@ -16,7 +16,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use arty_io_core::{Cycle, Driver, DriverOptions, DriverRole, IoContext};
-use arty_mio::{ExclusiveRegistered, MioContext, MioDriver, MioOptions, Readiness, Registered, RegistrationClosed};
+use arty_mio::{MioContext, MioDriver, MioOptions, Readiness, Registered, RegistrationClosed};
 use mio::event::Source;
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Interest, Registry, Token};
@@ -31,13 +31,12 @@ assert_impl_all!(MioDriver: Driver);
 assert_impl_all!(Readiness: Copy, Send, Sync, std::fmt::Debug, Eq);
 assert_impl_all!(RegistrationClosed: Send, Sync, std::fmt::Debug, std::fmt::Display, std::error::Error);
 assert_impl_all!(Registered<TcpStream>: Send, Unpin);
-assert_impl_all!(ExclusiveRegistered<TcpStream>: Send, Unpin);
 
 #[test]
 fn primary_driver_registers_and_reports_repeat_readiness() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (receiver, sender) = udp_pair();
-    let registration = register_primary(&io, &mut driver, receiver);
+    let mut registration = register_primary(&io, &mut driver, receiver);
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
@@ -63,7 +62,7 @@ fn primary_driver_registers_and_reports_repeat_readiness() {
 fn readiness_before_first_poll_and_waiter_replacement_are_lossless() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (receiver, sender) = udp_pair();
-    let registration = register_primary(&io, &mut driver, receiver);
+    let mut registration = register_primary(&io, &mut driver, receiver);
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
@@ -184,21 +183,6 @@ fn drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
 }
 
 #[test]
-fn exclusive_drop_deregisters_through_the_cloned_registry_on_the_caller_thread() {
-    let current = std::thread::current().id();
-    let (io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
-    let (deregister_tx, deregister_rx) = mpsc::channel();
-    let registration = io
-        .register_exclusive(recording_source().with_deregister_reporter(deregister_tx), Interest::READABLE)
-        .unwrap();
-
-    drop(registration);
-
-    assert_eq!(deregister_rx.recv().unwrap(), current);
-    driver.shutdown().unwrap();
-}
-
-#[test]
 fn context_clone_registers_on_the_calling_thread_and_relocation_selects_destination_worker() {
     let (mut io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let external = io.clone();
@@ -295,29 +279,41 @@ fn relocation_keeps_existing_sources_on_their_original_poller() {
 }
 
 #[test]
-fn secondary_shutdown_deregisters_live_sources_before_stopping_the_poller() {
-    let current = std::thread::current().id();
-    let (io, driver) = driver(DriverRole::Secondary, Waker::noop().clone());
-    let (deregister_tx, deregister_rx) = mpsc::channel();
-    let registration = io
-        .register(recording_source().with_deregister_reporter(deregister_tx), Interest::READABLE)
-        .unwrap();
+fn driver_shutdown_closes_registration_without_taking_source_ownership() {
+    for role in [DriverRole::Primary, DriverRole::Secondary] {
+        let current = std::thread::current().id();
+        let (io, driver) = driver(role, Waker::noop().clone());
+        let (deregister_tx, deregister_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let registration = io
+            .register(
+                recording_source()
+                    .with_deregister_reporter(deregister_tx)
+                    .with_drop_reporter(drop_tx),
+                Interest::READABLE,
+            )
+            .unwrap();
 
-    driver.shutdown().unwrap();
+        driver.shutdown().unwrap();
 
-    assert_eq!(deregister_rx.recv().unwrap(), current);
-    assert_eq!(registration.source().err().unwrap(), RegistrationClosed);
+        assert_eq!(registration.source().err().unwrap(), RegistrationClosed);
+        assert_eq!(deregister_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(drop_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        drop(registration);
+        assert_eq!(drop_rx.recv().unwrap(), current);
+        assert_eq!(deregister_rx.recv(), Err(mpsc::RecvError));
+    }
 }
 
 #[test]
-fn exclusive_shutdown_can_race_source_access_and_releases_on_the_owner_thread() {
+fn shutdown_can_race_source_access_and_releases_on_the_owner_thread() {
     let current = std::thread::current().id();
     let (io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let (drop_tx, drop_rx) = mpsc::channel();
     let registration = io
-        .register_exclusive(recording_source().with_drop_reporter(drop_tx), Interest::READABLE)
+        .register(recording_source().with_drop_reporter(drop_tx), Interest::READABLE)
         .unwrap();
 
     let owner = std::thread::spawn(move || {
@@ -337,23 +333,6 @@ fn exclusive_shutdown_can_race_source_access_and_releases_on_the_owner_thread() 
     owner.join().unwrap();
 
     assert_ne!(drop_rx.recv().unwrap(), current);
-}
-
-#[test]
-fn shutdown_reports_a_source_guard_that_is_still_in_use() {
-    let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
-    let registration = register_primary(&io, &mut driver, recording_source());
-    let (deregister_tx, deregister_rx) = mpsc::channel();
-    let second = register_primary(&io, &mut driver, recording_source().with_deregister_reporter(deregister_tx));
-    let source = registration.source().unwrap();
-
-    let error = driver.shutdown().unwrap_err();
-
-    assert_eq!(error.to_string(), "the registered source is in use during driver shutdown");
-    assert_eq!(deregister_rx.recv().unwrap(), std::thread::current().id());
-    drop(source);
-    drop(registration);
-    drop(second);
 }
 
 #[test]
@@ -438,15 +417,12 @@ fn driver_waker_is_latched_distinct_coalescing_and_inert_after_drop() {
 #[test]
 fn shutdown_closes_live_registration_and_rejects_later_registration() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
-    let (deregister_tx, deregister_rx) = mpsc::channel();
-    let live_source = recording_source().with_deregister_reporter(deregister_tx);
-    let live = register_primary(&io, &mut driver, live_source);
+    let mut live = register_primary(&io, &mut driver, recording_source());
     let live_wake = Arc::new(WakeCounter::default());
     assert!(poll_read_ready(&live, &Waker::from(Arc::clone(&live_wake))).is_pending());
 
     driver.shutdown().unwrap();
 
-    assert_eq!(deregister_rx.recv().unwrap(), std::thread::current().id());
     assert_eq!(live.source_mut().err().unwrap(), RegistrationClosed);
     assert_eq!(live_wake.count(), 1);
     assert_eq!(expect_ready(poll_read_ready(&live, Waker::noop())), Err(RegistrationClosed));

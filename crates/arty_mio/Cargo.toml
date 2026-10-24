@@ -35,7 +35,6 @@ default = []
 [dependencies]
 arty_io_core = { workspace = true }
 mio = { workspace = true, features = ["os-poll"] }
-parking_lot = { workspace = true }
 thread_aware_core = { workspace = true, features = ["std"] }
 
 [dev-dependencies]

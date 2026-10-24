@@ -8,7 +8,7 @@ use std::net::{Shutdown, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arty_mio::{ExclusiveRegistered, RegistrationClosed};
+use arty_mio::{Registered, RegistrationClosed};
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use mio::net::TcpStream;
@@ -56,7 +56,7 @@ pub struct MioStream {
 }
 
 struct RegisteredIo {
-    registration: ExclusiveRegistered<TcpStream>,
+    registration: Registered<TcpStream>,
 }
 
 pub(crate) struct StreamCore<I> {
@@ -64,7 +64,7 @@ pub(crate) struct StreamCore<I> {
 }
 
 impl MioStream {
-    pub(crate) fn new(registration: ExclusiveRegistered<TcpStream>, info: MioConnectionInfo) -> Self {
+    pub(crate) fn new(registration: Registered<TcpStream>, info: MioConnectionInfo) -> Self {
         Self {
             core: StreamCore::new(RegisteredIo { registration }),
             info,
