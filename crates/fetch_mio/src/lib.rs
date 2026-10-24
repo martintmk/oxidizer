@@ -45,4 +45,4 @@ mod stream;
 #[doc(hidden)]
 pub use connector::benchmark;
 pub use connector::{MioConnector, MioConnectorOptions};
-pub use stream::{MioConnectionInfo, MioStream};
+pub use stream::MioStream;

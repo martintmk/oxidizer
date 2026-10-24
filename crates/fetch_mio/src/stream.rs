@@ -4,7 +4,7 @@
 use std::fmt;
 use std::io::{self, IoSlice, Read as _, Write as _};
 use std::mem::MaybeUninit;
-use std::net::{Shutdown, SocketAddr};
+use std::net::Shutdown;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -24,35 +24,9 @@ pub(crate) trait StreamIo: Send + Unpin + 'static {
     fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
-/// Socket addresses for one established Mio connection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MioConnectionInfo {
-    local_addr: SocketAddr,
-    peer_addr: SocketAddr,
-}
-
-impl MioConnectionInfo {
-    pub(crate) const fn new(local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
-        Self { local_addr, peer_addr }
-    }
-
-    /// Returns the local socket address.
-    #[must_use]
-    pub const fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Returns the remote socket address.
-    #[must_use]
-    pub const fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
-    }
-}
-
 /// A registered Mio TCP stream that implements the Hyper I/O contract.
 pub struct MioStream {
     core: StreamCore<RegisteredIo>,
-    info: MioConnectionInfo,
 }
 
 struct RegisteredIo {
@@ -64,10 +38,9 @@ pub(crate) struct StreamCore<I> {
 }
 
 impl MioStream {
-    pub(crate) fn new(registration: Registered<TcpStream>, info: MioConnectionInfo) -> Self {
+    pub(crate) fn new(registration: Registered<TcpStream>) -> Self {
         Self {
             core: StreamCore::new(RegisteredIo { registration }),
-            info,
         }
     }
 }
@@ -82,7 +55,6 @@ impl fmt::Debug for MioStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MioStream")
             .field("token", &self.core.io.registration.token())
-            .field("info", &self.info)
             .finish_non_exhaustive()
     }
 }
@@ -217,7 +189,7 @@ impl Write for MioStream {
 
 impl Connection for MioStream {
     fn connected(&self) -> Connected {
-        Connected::new().extra(self.info.clone())
+        Connected::new()
     }
 }
 

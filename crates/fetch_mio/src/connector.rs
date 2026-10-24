@@ -21,11 +21,11 @@ use socket2::SockRef;
 use templated_uri::BaseUri;
 use tick::Clock;
 
+use crate::MioStream;
 use crate::error::{
     AttemptFailure, AttemptPhase, LABEL_DNS, LABEL_RUNTIME, LABEL_SCHEME_NOT_ALLOWED, connect_failures, io_error, unavailable,
 };
 use crate::stream::registration_closed;
-use crate::{MioConnectionInfo, MioStream};
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
 
@@ -308,14 +308,14 @@ impl Future for MioConnectFuture {
         let MioConnectState::Connecting(registration) = &this.state else {
             return Poll::Ready(Err(completed_dial_error(this.address)));
         };
-        let info = match poll_complete_connect(registration, cx) {
-            Poll::Ready(Ok(info)) => info,
+        match poll_complete_connect(registration, cx) {
+            Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => {
                 this.state = MioConnectState::Done;
                 return Poll::Ready(Err(AttemptFailure::new(this.address, AttemptPhase::Connect, error)));
             }
             Poll::Pending => return Poll::Pending,
-        };
+        }
 
         if let Some(no_delay) = this.options.no_delay
             && let Err(error) = registration
@@ -330,7 +330,7 @@ impl Future for MioConnectFuture {
         let MioConnectState::Connecting(registration) = std::mem::replace(&mut this.state, MioConnectState::Done) else {
             return Poll::Ready(Err(completed_dial_error(this.address)));
         };
-        Poll::Ready(Ok(MioStream::new(registration, info)))
+        Poll::Ready(Ok(MioStream::new(registration)))
     }
 }
 
@@ -353,7 +353,7 @@ fn apply_buffer_options(stream: &TcpStream, options: SocketOptions) -> io::Resul
     Ok(())
 }
 
-fn poll_complete_connect(registration: &Registered<TcpStream>, context: &mut Context<'_>) -> Poll<io::Result<MioConnectionInfo>> {
+fn poll_complete_connect(registration: &Registered<TcpStream>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
     loop {
         match registration.poll_write_ready(context) {
             Poll::Ready(Ok(_readiness)) => {}
@@ -379,13 +379,7 @@ fn poll_complete_connect(registration: &Registered<TcpStream>, context: &mut Con
             }
 
             match source.peer_addr() {
-                Ok(peer_addr) => {
-                    let local_addr = match source.local_addr() {
-                        Ok(local_addr) => local_addr,
-                        Err(error) => return Poll::Ready(Err(error)),
-                    };
-                    return Poll::Ready(Ok(MioConnectionInfo::new(local_addr, peer_addr)));
-                }
+                Ok(_) => return Poll::Ready(Ok(())),
                 Err(error) => match connect_error_action(&error) {
                     ConnectErrorAction::Retry => {}
                     ConnectErrorAction::Wait => break,

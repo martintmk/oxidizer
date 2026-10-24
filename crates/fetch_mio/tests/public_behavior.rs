@@ -17,7 +17,7 @@ use anyspawn::Spawner;
 use arty::task::Builtins;
 use arty_mio::{MioContext, MioOptions};
 use fetch_hyper::{HyperIo, HyperTransportBuilder};
-use fetch_mio::{MioConnectionInfo, MioConnector, MioConnectorOptions, MioStream};
+use fetch_mio::{MioConnector, MioConnectorOptions, MioStream};
 use fetch_options::{RequestFilter, SocketOptions, TransportOptions};
 use fetch_tls::TlsBackend;
 use http::StatusCode;
@@ -33,11 +33,9 @@ use thread_aware::{Thread, ThreadAware};
 assert_impl_all!(MioConnector: Clone, Send, Sync);
 assert_impl_all!(MioConnectorOptions: Clone, Send, Sync);
 assert_impl_all!(MioStream: Send, Unpin, HyperIo);
-assert_impl_all!(MioConnectionInfo: Clone, Send, Sync);
 assert_impl_all!(MioOptions: Clone, Send, Sync, Default);
 assert_not_impl_any!(MioConnector: ThreadAware);
 assert_not_impl_any!(MioConnectorOptions: Copy);
-assert_not_impl_any!(MioConnectionInfo: Copy);
 assert_not_impl_any!(MioOptions: Copy);
 assert_not_impl_any!(MioStream: ThreadAware);
 
@@ -81,7 +79,6 @@ async fn hyper_transport_accepts_mio_stream_with_native_tls_path(builtins: Built
     let response = request(&builtins, format!("https://127.0.0.1:{port}/"), builder.build().unwrap().into()).await;
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.extensions().get::<MioConnectionInfo>().is_some());
     server.join().unwrap();
 }
 
@@ -100,7 +97,6 @@ async fn hyper_transport_accepts_mio_stream_with_rustls_path(builtins: Builtins)
     let response = request(&builtins, format!("https://127.0.0.1:{port}/"), tls).await;
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.extensions().get::<MioConnectionInfo>().is_some());
     server.join().unwrap();
 }
 
