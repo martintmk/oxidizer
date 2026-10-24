@@ -233,7 +233,7 @@ impl Connection for MioStream {
     }
 }
 
-fn registration_closed(error: RegistrationClosed) -> io::Error {
+pub(crate) fn registration_closed(error: RegistrationClosed) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, error)
 }
 

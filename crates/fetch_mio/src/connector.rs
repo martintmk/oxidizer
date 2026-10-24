@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arty::task::Scheduler;
-use arty_mio::{MioContext, Registered, RegistrationClosed};
+use arty_mio::{MioContext, Registered};
 use fetch_options::SocketOptions;
 use http::uri::Scheme;
 use http_extensions::{HttpError, Result};
@@ -24,6 +24,7 @@ use tick::Clock;
 use crate::error::{
     AttemptFailure, AttemptPhase, LABEL_DNS, LABEL_RUNTIME, LABEL_SCHEME_NOT_ALLOWED, connect_failures, io_error, unavailable,
 };
+use crate::stream::registration_closed;
 use crate::{MioConnectionInfo, MioStream};
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
@@ -430,10 +431,6 @@ fn is_in_progress(error: &io::Error) -> bool {
 #[cfg(not(any(unix, windows)))]
 const fn is_in_progress(_error: &io::Error) -> bool {
     false
-}
-
-fn registration_closed(error: RegistrationClosed) -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, error)
 }
 
 fn finish_failures(failures: Vec<Option<AttemptFailure>>) -> HttpError {
