@@ -12,7 +12,7 @@ A pull request (PR) is safe for faster review only when:
 
 These rules protect three promises to users. Their code still compiles. The software behaves in the same way. The software is not slower.
 
-The crate must provide evidence for each promise. Its public API must be small and clear. Behavioral tests must cover behavior, not internal details. Deterministic benchmarks must detect performance regressions.
+The crate must provide evidence for each promise. Its public API must be clear, intentional, and stable. Behavioral tests must cover behavior, not internal details. Deterministic benchmarks must detect performance regressions.
 
 If a PR breaks a promise, a human must review and approve that decision. Agents provide speed and evidence. Humans keep control.
 
