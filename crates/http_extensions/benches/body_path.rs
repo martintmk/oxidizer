@@ -5,9 +5,9 @@
 #![expect(missing_docs, reason = "Benchmark code")]
 
 use std::alloc::System;
-use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::{array, mem};
 
 use alloc_tracker::{Allocator, Session};
 use benchmarking::time_sample_with_inputs;
@@ -27,20 +27,24 @@ static ALLOCATOR: Allocator<System> = Allocator::system();
 
 const REQUEST_BYTES: usize = 10_240;
 const RESPONSE_BYTES: usize = 9_216;
-const RESPONSE_FRAME_BYTES: usize = RESPONSE_BYTES / 3;
+const TARGET_RESPONSE_FRAMES: usize = 3;
+const TARGET_RESPONSE_FRAME_BYTES: usize = RESPONSE_BYTES / TARGET_RESPONSE_FRAMES;
+static RESPONSE_PAYLOAD: [u8; RESPONSE_BYTES] = [0; RESPONSE_BYTES];
 
 fn prepared_inputs<T>(iters: u64, mut setup: impl FnMut() -> T) -> Vec<T> {
     (0..iters).map(|_| setup()).collect()
 }
 
-fn response_body(builder: &HttpBodyBuilder) -> HttpBody {
-    let frame = BytesView::from(Bytes::from_static(&[0_u8; RESPONSE_FRAME_BYTES]));
-    builder.body(
-        ThreeFrameBody::new([frame.clone(), frame.clone(), frame]),
-        &HttpBodyOptions::default(),
-    )
+fn owned_frame(frame_bytes: usize) -> Bytes {
+    Bytes::from_static(&RESPONSE_PAYLOAD[..frame_bytes])
 }
 
+fn response_body<const FRAME_COUNT: usize>(builder: &HttpBodyBuilder, frame_bytes: usize) -> HttpBody {
+    let frames: [_; FRAME_COUNT] = array::from_fn(|_| BytesView::from(owned_frame(frame_bytes)));
+    builder.body(FrameBody::new(frames), &HttpBodyOptions::default())
+}
+
+#[expect(clippy::too_many_lines, reason = "the benchmark keeps the complete body-path matrix together")]
 fn entry(c: &mut Criterion) {
     let session = Session::new();
     let memory = TransparentMemory::new();
@@ -78,22 +82,39 @@ fn entry(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("body_path_response");
 
-    let operation = session.operation("hyper_frame_handoff");
-    group.bench_function("hyper_frame_handoff", |b| {
-        b.iter_custom(|iters| {
-            let frames = prepared_inputs(iters, || Some(Frame::data(Bytes::from_static(&[0_u8; RESPONSE_FRAME_BYTES]))));
-            time_sample_with_inputs(
-                frames,
-                |sample_iters| operation.measure_thread().iterations(sample_iters),
-                |frame| frame.take().unwrap().map_data(BytesView::from),
-            )
-        });
-    });
+    macro_rules! bench_handoff {
+        ($name:literal, $operation_name:literal, $frame_count:literal, $frame_bytes:expr) => {
+            let operation = session.operation($operation_name);
+            group.bench_function($name, |b| {
+                b.iter_custom(|iters| {
+                    let frames = prepared_inputs(iters, || {
+                        Some(array::from_fn::<_, $frame_count, _>(|_| owned_frame($frame_bytes)))
+                    });
+                    time_sample_with_inputs(
+                        frames,
+                        |sample_iters| operation.measure_thread().iterations(sample_iters),
+                        |frames| frames.take().unwrap().map(BytesView::from),
+                    )
+                });
+            });
+        };
+    }
+
+    bench_handoff!("hyper_frame_handoff_1x9216", "hyper_frame_handoff_1x9216", 1, RESPONSE_BYTES);
+    bench_handoff!(
+        "hyper_frame_handoff_3x3072",
+        "hyper_frame_handoff_3x3072",
+        3,
+        TARGET_RESPONSE_FRAME_BYTES
+    );
+    bench_handoff!("hyper_frame_handoff_9x1024", "hyper_frame_handoff_9x1024", 9, RESPONSE_BYTES / 9);
 
     let operation = session.operation("response_frame_consumption");
     group.bench_function("response_frame_consumption", |b| {
         b.iter_custom(|iters| {
-            let bodies = prepared_inputs(iters, || response_body(&body_builder));
+            let bodies = prepared_inputs(iters, || {
+                response_body::<TARGET_RESPONSE_FRAMES>(&body_builder, TARGET_RESPONSE_FRAME_BYTES)
+            });
             time_sample_with_inputs(
                 bodies,
                 |sample_iters| operation.measure_thread().iterations(sample_iters),
@@ -108,17 +129,40 @@ fn entry(c: &mut Criterion) {
         });
     });
 
-    let operation = session.operation("complete_response_drain");
-    group.bench_function("complete_response_drain", |b| {
-        b.iter_custom(|iters| {
-            let bodies = prepared_inputs(iters, || response_body(&body_builder));
-            time_sample_with_inputs(
-                bodies,
-                |sample_iters| operation.measure_thread().iterations(sample_iters),
-                |body| block_on(mem::replace(body, body_builder.empty()).into_bytes()).unwrap(),
-            )
-        });
-    });
+    macro_rules! bench_response_drain {
+        ($name:literal, $operation_name:literal, $frame_count:literal, $frame_bytes:expr) => {
+            let operation = session.operation($operation_name);
+            group.bench_function($name, |b| {
+                b.iter_custom(|iters| {
+                    let bodies = prepared_inputs(iters, || response_body::<$frame_count>(&body_builder, $frame_bytes));
+                    time_sample_with_inputs(
+                        bodies,
+                        |sample_iters| operation.measure_thread().iterations(sample_iters),
+                        |body| block_on(mem::replace(body, body_builder.empty()).into_bytes()).unwrap(),
+                    )
+                });
+            });
+        };
+    }
+
+    bench_response_drain!(
+        "complete_response_drain_1x9216",
+        "complete_response_drain_1x9216",
+        1,
+        RESPONSE_BYTES
+    );
+    bench_response_drain!(
+        "complete_response_drain_3x3072",
+        "complete_response_drain_3x3072",
+        3,
+        TARGET_RESPONSE_FRAME_BYTES
+    );
+    bench_response_drain!(
+        "complete_response_drain_9x1024",
+        "complete_response_drain_9x1024",
+        9,
+        RESPONSE_BYTES / 9
+    );
 
     group.finish();
 
@@ -130,9 +174,9 @@ fn entry(c: &mut Criterion) {
             let inputs = prepared_inputs(iters, || CompletePathInput {
                 request: Some(request_payload.clone()),
                 response: Some([
-                    Bytes::from_static(&[0_u8; RESPONSE_FRAME_BYTES]),
-                    Bytes::from_static(&[0_u8; RESPONSE_FRAME_BYTES]),
-                    Bytes::from_static(&[0_u8; RESPONSE_FRAME_BYTES]),
+                    owned_frame(TARGET_RESPONSE_FRAME_BYTES),
+                    owned_frame(TARGET_RESPONSE_FRAME_BYTES),
+                    owned_frame(TARGET_RESPONSE_FRAME_BYTES),
                 ]),
             });
             time_sample_with_inputs(
@@ -146,7 +190,7 @@ fn entry(c: &mut Criterion) {
                     _ = block_on(request_body.frame()).unwrap().unwrap();
 
                     let frames = input.response.take().unwrap().map(BytesView::from);
-                    let response = body_builder.body(ThreeFrameBody::new(frames), &HttpBodyOptions::default());
+                    let response = body_builder.body(FrameBody::new(frames), &HttpBodyOptions::default());
                     block_on(response.into_bytes()).unwrap()
                 },
             )
@@ -162,22 +206,21 @@ struct CompletePathInput {
 }
 
 #[derive(Debug)]
-struct ThreeFrameBody {
-    frames: [Option<BytesView>; 3],
+struct FrameBody<const FRAME_COUNT: usize> {
+    frames: [Option<BytesView>; FRAME_COUNT],
     next: usize,
 }
 
-impl ThreeFrameBody {
-    fn new(frames: [BytesView; 3]) -> Self {
-        let [first, second, third] = frames;
+impl<const FRAME_COUNT: usize> FrameBody<FRAME_COUNT> {
+    fn new(frames: [BytesView; FRAME_COUNT]) -> Self {
         Self {
-            frames: [Some(first), Some(second), Some(third)],
+            frames: frames.map(Some),
             next: 0,
         }
     }
 }
 
-impl Body for ThreeFrameBody {
+impl<const FRAME_COUNT: usize> Body for FrameBody<FRAME_COUNT> {
     type Data = BytesView;
     type Error = HttpError;
 
@@ -193,7 +236,12 @@ impl Body for ThreeFrameBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact((RESPONSE_BYTES - (self.next * RESPONSE_FRAME_BYTES)) as u64)
+        let remaining = self.frames[self.next..]
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(BytesView::len)
+            .sum::<usize>();
+        SizeHint::with_exact(remaining as u64)
     }
 }
 
