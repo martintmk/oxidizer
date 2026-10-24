@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Public behavior for Mio registration, readiness, roles, and lifecycle.
+//! Public behavior for Mio ownership, registration, readiness, and shutdown.
 
 #![allow(clippy::unwrap_used, reason = "test code")]
 #![expect(clippy::panic, reason = "the polling helper reports a failed test precondition")]
@@ -32,10 +32,10 @@ assert_impl_all!(RegistrationClosed: Send, Sync, std::fmt::Debug, std::fmt::Disp
 assert_impl_all!(Registered<TcpStream>: Send, Unpin);
 
 #[test]
-fn primary_driver_registers_and_reports_repeat_readiness() {
+fn read_readiness_is_consumed_and_rearms_after_would_block() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (receiver, sender) = udp_pair();
-    let mut registration = register_primary(&io, &mut driver, receiver);
+    let mut registration = io.register(receiver, Interest::READABLE).unwrap();
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
@@ -61,7 +61,7 @@ fn primary_driver_registers_and_reports_repeat_readiness() {
 fn readiness_before_first_poll_and_waiter_replacement_are_lossless() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (receiver, sender) = udp_pair();
-    let mut registration = register_primary(&io, &mut driver, receiver);
+    let mut registration = io.register(receiver, Interest::READABLE).unwrap();
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
@@ -111,7 +111,7 @@ fn readable_and_writable_waiters_are_independent() {
 }
 
 #[test]
-fn secondary_driver_registers_on_its_poller_and_wakes_the_owner() {
+fn secondary_driver_dispatches_readiness_and_wakes_the_owner() {
     let (owner_tx, owner_rx) = mpsc::channel();
     let owner_waker = Waker::from(Arc::new(ChannelWake(owner_tx)));
     let (io, mut driver) = driver(DriverRole::Secondary, owner_waker);
@@ -238,7 +238,7 @@ fn unattached_context_rejects_registration_and_releases_the_source() {
 fn relocation_keeps_existing_sources_on_their_original_poller() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (old_source, old_sender) = udp_pair();
-    let old_registration = register_primary(&io, &mut driver, old_source);
+    let old_registration = io.register(old_source, Interest::READABLE).unwrap();
     assert!(poll_read_ready(&old_registration, Waker::noop()).is_pending());
     let (destination_ready_tx, destination_ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -333,7 +333,7 @@ fn shutdown_can_race_source_access_and_releases_on_the_owner_thread() {
 #[test]
 fn drop_deregistration_failure_is_reported_by_each_driver_role() {
     let (primary_io, mut primary_driver) = driver(DriverRole::Primary, Waker::noop().clone());
-    let primary = register_primary(&primary_io, &mut primary_driver, FailingDeregisterSource);
+    let primary = primary_io.register(FailingDeregisterSource, Interest::READABLE).unwrap();
     drop(primary);
 
     let error = primary_driver.execute_cycle(&mut Cycle::new(Duration::ZERO)).unwrap_err();
@@ -411,8 +411,8 @@ fn driver_waker_is_latched_distinct_coalescing_and_inert_after_drop() {
 
 #[test]
 fn shutdown_closes_live_registration_and_rejects_later_registration() {
-    let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
-    let mut live = register_primary(&io, &mut driver, recording_source());
+    let (io, driver) = driver(DriverRole::Primary, Waker::noop().clone());
+    let mut live = io.register(recording_source(), Interest::READABLE).unwrap();
     let live_wake = Arc::new(WakeCounter::default());
     assert!(poll_read_ready(&live, &Waker::from(Arc::clone(&live_wake))).is_pending());
 
@@ -430,7 +430,7 @@ fn shutdown_closes_live_registration_and_rejects_later_registration() {
 fn shutdown_reports_accumulated_readiness_before_closure() {
     let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
     let (receiver, sender) = udp_pair();
-    let registration = register_primary(&io, &mut driver, receiver);
+    let registration = io.register(receiver, Interest::READABLE).unwrap();
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
@@ -446,13 +446,6 @@ fn driver(role: DriverRole, owner_waker: Waker) -> (MioContext, MioDriver) {
     io.relocate(None, &worker);
     let driver = io.driver(DriverOptions::new(worker, owner_waker, role)).unwrap();
     (io, driver)
-}
-
-fn register_primary<S>(io: &MioContext, _driver: &mut MioDriver, source: S) -> Registered<S>
-where
-    S: Source + Send + 'static,
-{
-    io.register(source, Interest::READABLE).unwrap()
 }
 
 fn udp_pair() -> (UdpSocket, StdUdpSocket) {

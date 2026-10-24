@@ -14,12 +14,12 @@ use crate::options::MioOptions;
 use crate::registration::{Registered, register};
 use crate::worker::{ContextState, WorkerState};
 
-/// A thread-aware handle that submits sources to a worker-local Mio driver.
+/// A thread-aware route to a worker-local Mio driver.
 ///
 /// New registrations use the current worker when it has a driver. Otherwise,
 /// they use the last driver selected for this clone. Relocation selects an
-/// available destination driver. Existing registrations stay on their
-/// original poller.
+/// available destination driver for new registrations. Existing registrations
+/// stay with their original driver.
 #[derive(Clone)]
 pub struct MioContext {
     state: Arc<ContextState>,
@@ -35,14 +35,15 @@ impl fmt::Debug for MioContext {
 }
 
 impl MioContext {
-    /// Registers an owned Mio source with this context's driver.
+    /// Registers an owned Mio source on the calling thread.
     ///
-    /// The returned registration gives its owner direct access to the source.
-    /// Driver shutdown closes readiness and the native poller. The registration
+    /// The selected worker holds a [`Registry`](mio::Registry) clone created
+    /// with [`Registry::try_clone`](mio::Registry::try_clone). This method uses
+    /// that clone to call [`Source::register`] on the calling thread.
+    ///
+    /// The returned [`Registered`] value owns the source and provides direct
+    /// reference access. Driver shutdown closes readiness, but the registration
     /// keeps the source until its owner drops it.
-    ///
-    /// Registration uses the worker route that is available on the calling
-    /// thread.
     ///
     /// # Errors
     ///

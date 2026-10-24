@@ -25,6 +25,10 @@ pub(crate) trait StreamIo: Send + Unpin + 'static {
 }
 
 /// A registered Mio TCP stream that implements the Hyper I/O contract.
+///
+/// The stream accesses its source directly. After an operation returns
+/// [`WouldBlock`](io::ErrorKind::WouldBlock), it polls only the matching
+/// readiness direction and retries the operation. Readiness is only a hint.
 pub struct MioStream {
     core: StreamCore<RegisteredIo>,
 }

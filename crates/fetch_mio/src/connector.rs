@@ -59,8 +59,9 @@ impl MioConnectorOptions {
 
 /// A cloneable service that opens Arty Mio TCP streams for Hyper.
 ///
-/// Create this value on its target Arty worker. Clones keep the same worker
-/// association. Fetch creates one connector for each worker.
+/// Create this value on its target Arty worker. Its [`MioContext`] routes each
+/// new stream registration to that worker. Clones keep the same worker route.
+/// Fetch creates one connector for each worker.
 #[derive(Clone, Debug)]
 pub struct MioConnector {
     context: MioContext,

@@ -19,9 +19,9 @@ Arty Mio connector for [`fetch_hyper`][__link0].
 streams through [`arty_mio`][__link2]. [`MioStream`][__link3] implements
 [`fetch_hyper::HyperIo`][__link4].
 
-Create one connector on each Arty worker. The connector is cloneable for
-Hyper, but it does not implement `ThreadAware`. [`arty_mio::MioContext`][__link5] is
-the thread-aware boundary.
+Create one connector on each Arty worker. [`arty_mio::MioContext`][__link5] provides
+the thread-aware route for direct source registration. The connector is
+cloneable for Hyper, but it does not implement `ThreadAware`.
 
 Use [`anyspawn::Spawner::new_arty`][__link6] with the same worker scheduler when you
 build a [`fetch_hyper::HyperTransportBuilder`][__link7].
@@ -51,7 +51,7 @@ fn worker_transport_parts(builtins: &Builtins) -> (MioConnector, Spawner) {
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/fetch_mio">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbP-dT-X4xptUb_PCPDUtfMYwbFsNKMu1fF-IbgsBNSjLaKchhZISCaGFueXNwYXduZTAuOS4ygmhhcnR5X21pb2UwLjEuMIJrZmV0Y2hfaHlwZXJmMC4xMC4wgmlmZXRjaF9taW9lMC4xLjA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbbX8Zk1o5YW4ba3wj9SbooMYbmASWACAngpgbyq0XOiOzfBVhZISCaGFueXNwYXduZTAuOS4ygmhhcnR5X21pb2UwLjEuMIJrZmV0Y2hfaHlwZXJmMC4xMC4wgmlmZXRjaF9taW9lMC4xLjA
  [__link0]: https://crates.io/crates/fetch_hyper/0.10.0
  [__link1]: https://docs.rs/fetch_mio/0.1.0/fetch_mio/?search=MioConnector
  [__link2]: https://crates.io/crates/arty_mio/0.1.0

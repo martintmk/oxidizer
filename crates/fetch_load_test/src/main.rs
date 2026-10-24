@@ -95,7 +95,7 @@ struct Measure {
     #[argh(option, default = "\"http1\".to_owned()")]
     protocol: String,
 
-    /// warmup duration
+    /// warm-up duration
     #[argh(option, default = "DurationArg(Duration::from_secs(5))")]
     warmup: DurationArg,
 

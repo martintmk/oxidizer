@@ -43,7 +43,7 @@ pub struct WorkerSpec {
     pub port: u16,
     /// Server process ID.
     pub server_pid: u32,
-    /// Warmup duration.
+    /// Warm-up duration.
     pub warmup: Duration,
     /// Measurement duration.
     pub duration: Duration,

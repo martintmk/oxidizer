@@ -11,9 +11,9 @@
 //! streams through [`arty_mio`]. [`MioStream`] implements
 //! [`fetch_hyper::HyperIo`].
 //!
-//! Create one connector on each Arty worker. The connector is cloneable for
-//! Hyper, but it does not implement `ThreadAware`. [`arty_mio::MioContext`] is
-//! the thread-aware boundary.
+//! Create one connector on each Arty worker. [`arty_mio::MioContext`] provides
+//! the thread-aware route for direct source registration. The connector is
+//! cloneable for Hyper, but it does not implement `ThreadAware`.
 //!
 //! Use [`anyspawn::Spawner::new_arty`] with the same worker scheduler when you
 //! build a [`fetch_hyper::HyperTransportBuilder`].

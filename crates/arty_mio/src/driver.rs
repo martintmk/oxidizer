@@ -19,7 +19,14 @@ const COMPLETION_BUDGET: usize = 256;
 const EVENT_CAPACITY: usize = 1_024;
 const SHUTDOWN_LIMIT: Duration = Duration::from_secs(1);
 
-/// A Mio driver hosted by one Arty worker.
+/// A Mio poll driver for one Arty worker.
+///
+/// This driver owns the [`Poll`] lifecycle and all driver-side registration
+/// state. A primary driver polls on the Arty worker. A secondary driver owns a
+/// helper thread that waits for Mio events.
+///
+/// Shutdown closes readiness for each live registration. It does not take or
+/// drop the registered sources.
 pub struct MioDriver {
     inner: Option<DriverInner>,
 }

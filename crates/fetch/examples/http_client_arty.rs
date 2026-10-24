@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Gets a web page through the Arty runtime and Mio.
+//! Gets a web page through the Arty runtime and its Mio transport.
 
 use arty::task::Builtins;
 use fetch::HttpClient;

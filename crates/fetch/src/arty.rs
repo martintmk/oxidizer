@@ -4,7 +4,7 @@
 //! Arty runtime integration for [`HttpClient`].
 //!
 //! Create [`ArtyDeps`] from one [`Builtins`] value and a memory pool. This keeps
-//! the scheduler, clock, and I/O handle on the same Arty worker.
+//! the scheduler, clock, and I/O route on the same Arty worker.
 //!
 //! Enable the `arty` feature and one TLS feature. Use `rustls` for the default
 //! TLS backend or `native-tls` for the platform TLS backend.
@@ -34,7 +34,7 @@ pub struct ArtyDeps {
     pub clock: Clock,
     /// Scheduler for transport tasks and blocking DNS work.
     pub scheduler: Scheduler,
-    /// Access to the worker-local Mio context.
+    /// Thread-aware route to the worker-local Mio context.
     pub io: Io,
     /// Memory pool for HTTP bodies and internal allocations.
     pub global_pool: GlobalPool,
@@ -64,7 +64,8 @@ impl HttpClient {
     /// Creates an HTTP client builder for the Arty runtime.
     ///
     /// The client creates one Hyper transport for each Arty worker. The
-    /// connector uses Mio for socket I/O and keeps worker-local state isolated.
+    /// connector uses Mio for socket I/O. Its context registers each socket
+    /// directly on the calling worker.
     ///
     /// Enable the `arty` feature and one TLS feature to use this method.
     pub fn builder_arty(deps: impl Into<ArtyDeps>) -> HttpClientBuilder {

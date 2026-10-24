@@ -90,7 +90,9 @@ Changelog
 Chrono
 Clippy
 DI
+DLL
 DLLs
+dll
 DST
 DST's
 DSTs
@@ -198,6 +200,7 @@ Serializers
 Spawner
 Structs
 Symcrypt
+symcrypt
 TCP
 TLS
 TOCTOU
@@ -881,6 +884,8 @@ fallbacks
 googleapis
 gungraun
 http
+http1
+http2
 hyper's
 iai
 injective
@@ -1039,5 +1044,6 @@ snmalloc
 snmalloc's
 unsynchronized
 v1
+worktree
 x64
 NUL

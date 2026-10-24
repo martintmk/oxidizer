@@ -91,9 +91,9 @@ impl Workload {
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
-    /// Cleartext HTTP/1.1.
+    /// Clear-text HTTP/1.1.
     Http1,
-    /// Cleartext HTTP/2 prior knowledge.
+    /// Clear-text HTTP/2 prior knowledge.
     Http2,
 }
 
@@ -202,9 +202,9 @@ impl Accounting {
 pub struct LatencySummary {
     /// Histogram significant digits.
     pub significant_digits: u8,
-    /// Lowest trackable latency in microseconds.
+    /// Lowest latency that the histogram can record, in microseconds.
     pub lowest_us: u64,
-    /// Highest trackable latency in microseconds.
+    /// Highest latency that the histogram can record, in microseconds.
     pub highest_us: u64,
     /// Values below the lower bound.
     pub underflow: u64,
@@ -309,7 +309,7 @@ pub struct Sample {
     pub cell: Cell,
     /// Load model.
     pub load_model: LoadModel,
-    /// Warmup duration.
+    /// Warm-up duration.
     pub warmup_secs: f64,
     /// Requested measurement duration.
     pub requested_duration_secs: f64,

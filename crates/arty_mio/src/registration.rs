@@ -165,17 +165,16 @@ impl RegistrationState {
     }
 }
 
-/// An owned Mio source registered with one Arty Mio driver.
+/// One direct-ownership registration for a Mio source.
 ///
-/// This type gives its owner direct source access without a lock. Driver
-/// shutdown closes readiness and the native poller. The owner keeps the source
-/// until this value drops.
+/// The owner accesses the source through ordinary Rust references. The source
+/// is not behind a mutex. Driver shutdown closes readiness and the native
+/// poller, but this value retains the source until it drops.
 ///
-/// While the driver is active, dropping this value removes the source
-/// registration through a thread-safe clone of the native registry. The source
-/// then drops on the caller thread. Mio binds a source to one `Poll` for its
-/// registered lifetime, so this type does not expose an operation that moves
-/// the source to another registry.
+/// Registration and deregistration use a clone from
+/// [`Registry::try_clone`](mio::Registry::try_clone). They run on the thread
+/// that calls [`MioContext::register`](crate::MioContext::register) or drops
+/// this value.
 pub struct Registered<S>
 where
     S: Source + Send + 'static,
@@ -214,7 +213,7 @@ where
         self.token
     }
 
-    /// Returns a shared reference to the registered source.
+    /// Returns a shared reference to the source while the driver is open.
     ///
     /// # Errors
     ///
@@ -227,7 +226,7 @@ where
         }
     }
 
-    /// Returns an exclusive reference to the registered source.
+    /// Returns an exclusive reference to the source while the driver is open.
     ///
     /// Read or write until the operation returns
     /// [`WouldBlock`](io::ErrorKind::WouldBlock). Then wait for new readiness.
@@ -250,11 +249,8 @@ where
     ///
     /// Call this method only after a read operation returns
     /// [`WouldBlock`](io::ErrorKind::WouldBlock). A readiness signal is a hint
-    /// and can be spurious. This method consumes the accumulated read
-    /// readiness. It does not consume write readiness.
-    ///
-    /// The registration stores only the latest read waker. A later poll can
-    /// replace the waker from an earlier poll.
+    /// and can be spurious. A ready result contains `()` and consumes only the
+    /// accumulated read readiness.
     ///
     /// # Errors
     ///
@@ -272,11 +268,8 @@ where
     ///
     /// Call this method only after a write operation returns
     /// [`WouldBlock`](io::ErrorKind::WouldBlock). A readiness signal is a hint
-    /// and can be spurious. This method consumes the accumulated write
-    /// readiness. It does not consume read readiness.
-    ///
-    /// The registration stores only the latest write waker. A later poll can
-    /// replace the waker from an earlier poll.
+    /// and can be spurious. A ready result contains `()` and consumes only the
+    /// accumulated write readiness.
     ///
     /// # Errors
     ///
