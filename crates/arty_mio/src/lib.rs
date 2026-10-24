@@ -56,13 +56,13 @@
 
 pub use context::MioContext;
 pub use driver::MioDriver;
+pub use error::RegistrationClosed;
 pub use options::MioOptions;
-pub use readiness::{Readiness, RegistrationClosed};
 pub use registration::Registered;
 
 mod context;
 mod driver;
+mod error;
 mod options;
-mod readiness;
 mod registration;
 mod worker;

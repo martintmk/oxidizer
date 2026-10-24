@@ -149,13 +149,13 @@ impl StreamIo for RegisteredIo {
     fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.registration
             .poll_read_ready(context)
-            .map(|result| result.map(|_readiness| ()).map_err(registration_closed))
+            .map(|result| result.map_err(registration_closed))
     }
 
     fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.registration
             .poll_write_ready(context)
-            .map(|result| result.map(|_readiness| ()).map_err(registration_closed))
+            .map(|result| result.map_err(registration_closed))
     }
 }
 

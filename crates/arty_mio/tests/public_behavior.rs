@@ -16,7 +16,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use arty_io_core::{Cycle, Driver, DriverOptions, DriverRole, IoContext};
-use arty_mio::{MioContext, MioDriver, MioOptions, Readiness, Registered, RegistrationClosed};
+use arty_mio::{MioContext, MioDriver, MioOptions, Registered, RegistrationClosed};
 use mio::event::Source;
 use mio::net::{TcpStream, UdpSocket};
 use mio::{Interest, Registry, Token};
@@ -28,7 +28,6 @@ assert_impl_all!(MioContext: Clone, Send, Sync, ThreadAware);
 assert_impl_all!(MioOptions: Clone, Send, Sync, Default, std::fmt::Debug, Eq);
 assert_not_impl_any!(MioOptions: Copy);
 assert_impl_all!(MioDriver: Driver);
-assert_impl_all!(Readiness: Copy, Send, Sync, std::fmt::Debug, Eq);
 assert_impl_all!(RegistrationClosed: Send, Sync, std::fmt::Debug, std::fmt::Display, std::error::Error);
 assert_impl_all!(Registered<TcpStream>: Send, Unpin);
 
@@ -40,7 +39,7 @@ fn primary_driver_registers_and_reports_repeat_readiness() {
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
+    expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap();
 
     let mut buffer = [0; 8];
     assert_eq!(registration.source_mut().unwrap().recv(&mut buffer).unwrap(), 1);
@@ -52,7 +51,7 @@ fn primary_driver_registers_and_reports_repeat_readiness() {
 
     sender.send(&[2]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
+    expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap();
 
     drop(registration);
     driver.shutdown().unwrap();
@@ -66,7 +65,7 @@ fn readiness_before_first_poll_and_waiter_replacement_are_lossless() {
 
     sender.send(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
+    expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap();
     let mut buffer = [0; 8];
     assert_eq!(registration.source_mut().unwrap().recv(&mut buffer).unwrap(), 1);
     assert_eq!(
@@ -97,14 +96,14 @@ fn readable_and_writable_waiters_are_independent() {
     let write_wake = Arc::new(WakeCounter::default());
 
     assert!(poll_read_ready(&registration, &Waker::from(Arc::clone(&read_wake))).is_pending());
-    assert!(expect_ready(poll_write_ready(&registration, Waker::noop())).unwrap().is_writable());
+    expect_ready(poll_write_ready(&registration, Waker::noop())).unwrap();
     assert!(poll_write_ready(&registration, &Waker::from(Arc::clone(&write_wake))).is_pending());
 
     peer.write_all(&[1]).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
 
     assert_eq!((read_wake.count(), write_wake.count()), (1, 0));
-    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
+    expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap();
     assert!(poll_write_ready(&registration, Waker::noop()).is_pending());
 
     drop(registration);
@@ -125,7 +124,7 @@ fn secondary_driver_registers_on_its_poller_and_wakes_the_owner() {
     owner_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     driver.execute_cycle(&mut Cycle::new(Duration::ZERO)).unwrap();
 
-    assert!(expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap().is_readable());
+    expect_ready(poll_read_ready(&registration, Waker::noop())).unwrap();
     drop(registration);
     driver.shutdown().unwrap();
 }
@@ -265,11 +264,7 @@ fn relocation_keeps_existing_sources_on_their_original_poller() {
         destination_ready_rx.recv().unwrap();
         old_sender.send(&[1]).unwrap();
         driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
-        assert!(
-            expect_ready(poll_read_ready(&old_registration, Waker::noop()))
-                .unwrap()
-                .is_readable()
-        );
+        expect_ready(poll_read_ready(&old_registration, Waker::noop())).unwrap();
         release_tx.send(()).unwrap();
         destination.join().unwrap();
     });
@@ -431,6 +426,20 @@ fn shutdown_closes_live_registration_and_rejects_later_registration() {
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
 }
 
+#[test]
+fn shutdown_reports_accumulated_readiness_before_closure() {
+    let (io, mut driver) = driver(DriverRole::Primary, Waker::noop().clone());
+    let (receiver, sender) = udp_pair();
+    let registration = register_primary(&io, &mut driver, receiver);
+
+    sender.send(&[1]).unwrap();
+    driver.execute_cycle(&mut Cycle::new(Duration::from_secs(1))).unwrap();
+    driver.shutdown().unwrap();
+
+    assert_eq!(expect_ready(poll_read_ready(&registration, Waker::noop())), Ok(()));
+    assert_eq!(expect_ready(poll_read_ready(&registration, Waker::noop())), Err(RegistrationClosed));
+}
+
 fn driver(role: DriverRole, owner_waker: Waker) -> (MioContext, MioDriver) {
     let mut io = MioContext::context(MioOptions::default());
     let worker = ThreadBuilder::default().build(std::thread::current().id());
@@ -469,14 +478,14 @@ fn recording_source() -> RecordingSource {
     }
 }
 
-fn poll_read_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>>
+fn poll_read_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<(), RegistrationClosed>>
 where
     S: Source + Send + 'static,
 {
     registration.poll_read_ready(&mut Context::from_waker(waker))
 }
 
-fn poll_write_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>>
+fn poll_write_ready<S>(registration: &Registered<S>, waker: &Waker) -> Poll<Result<(), RegistrationClosed>>
 where
     S: Source + Send + 'static,
 {

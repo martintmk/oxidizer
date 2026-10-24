@@ -9,8 +9,20 @@ use std::{fmt, io};
 use mio::event::Source;
 use mio::{Interest, Token};
 
-use crate::readiness::{Readiness, RegistrationClosed};
+use crate::error::RegistrationClosed;
 use crate::worker::WorkerState;
+
+const READABLE: u8 = 1 << 0;
+const WRITABLE: u8 = 1 << 1;
+const ERROR: u8 = 1 << 2;
+const READ_CLOSED: u8 = 1 << 3;
+const WRITE_CLOSED: u8 = 1 << 4;
+const PRIORITY: u8 = 1 << 5;
+const AIO: u8 = 1 << 6;
+const LIO: u8 = 1 << 7;
+
+const READ_SIGNALS: u8 = READABLE | ERROR | READ_CLOSED | WRITE_CLOSED | PRIORITY | AIO | LIO;
+const WRITE_SIGNALS: u8 = WRITABLE | ERROR | READ_CLOSED | WRITE_CLOSED | AIO | LIO;
 
 struct RegistryOperation<'a>(&'a WorkerState);
 
@@ -54,8 +66,8 @@ impl RegistrationEntry {
 
 #[derive(Default)]
 struct RegistrationInner {
-    readable: Readiness,
-    writable: Readiness,
+    read_ready: bool,
+    write_ready: bool,
     read_waiter: Option<Waker>,
     write_waiter: Option<Waker>,
     closed: bool,
@@ -63,6 +75,10 @@ struct RegistrationInner {
 
 impl RegistrationState {
     pub(crate) fn notify(&self, event: &mio::event::Event) {
+        self.notify_signals(event_signals(event));
+    }
+
+    fn notify_signals(&self, signals: u8) {
         let (read_waiter, write_waiter) = {
             let mut inner = self
                 .inner
@@ -71,24 +87,13 @@ impl RegistrationState {
             if inner.closed {
                 return;
             }
-            let wake_read = event.is_readable()
-                || event.is_error()
-                || event.is_read_closed()
-                || event.is_write_closed()
-                || event.is_priority()
-                || event.is_aio()
-                || event.is_lio();
-            let wake_write = event.is_writable()
-                || event.is_error()
-                || event.is_read_closed()
-                || event.is_write_closed()
-                || event.is_aio()
-                || event.is_lio();
+            let wake_read = signals & READ_SIGNALS != 0;
+            let wake_write = signals & WRITE_SIGNALS != 0;
             if wake_read {
-                inner.readable.merge(event);
+                inner.read_ready = true;
             }
             if wake_write {
-                inner.writable.merge(event);
+                inner.write_ready = true;
             }
             (
                 wake_read.then(|| inner.read_waiter.take()).flatten(),
@@ -125,14 +130,13 @@ impl RegistrationState {
         self.closed.load(Ordering::Acquire)
     }
 
-    fn poll_read(&self, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
+    fn poll_read(&self, waker: &Waker) -> Poll<Result<(), RegistrationClosed>> {
         let mut inner = self
             .inner
             .lock()
             .expect("read readiness polling does not call code that can panic while the readiness lock is held");
-        let readiness = std::mem::take(&mut inner.readable);
-        if !readiness.is_empty() {
-            return Poll::Ready(Ok(readiness));
+        if std::mem::take(&mut inner.read_ready) {
+            return Poll::Ready(Ok(()));
         }
         if inner.closed {
             return Poll::Ready(Err(RegistrationClosed));
@@ -143,14 +147,13 @@ impl RegistrationState {
         Poll::Pending
     }
 
-    fn poll_write(&self, waker: &Waker) -> Poll<Result<Readiness, RegistrationClosed>> {
+    fn poll_write(&self, waker: &Waker) -> Poll<Result<(), RegistrationClosed>> {
         let mut inner = self
             .inner
             .lock()
             .expect("write readiness polling does not call code that can panic while the readiness lock is held");
-        let readiness = std::mem::take(&mut inner.writable);
-        if !readiness.is_empty() {
-            return Poll::Ready(Ok(readiness));
+        if std::mem::take(&mut inner.write_ready) {
+            return Poll::Ready(Ok(()));
         }
         if inner.closed {
             return Poll::Ready(Err(RegistrationClosed));
@@ -246,9 +249,9 @@ where
     /// Polls for read readiness or driver shutdown.
     ///
     /// Call this method only after a read operation returns
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
-    /// be spurious. This method consumes the accumulated read readiness. It
-    /// does not consume write readiness.
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). A readiness signal is a hint
+    /// and can be spurious. This method consumes the accumulated read
+    /// readiness. It does not consume write readiness.
     ///
     /// The registration stores only the latest read waker. A later poll can
     /// replace the waker from an earlier poll.
@@ -261,16 +264,16 @@ where
         clippy::needless_pass_by_ref_mut,
         reason = "the poll API follows Future::poll and accepts the caller's task context"
     )]
-    pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
+    pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), RegistrationClosed>> {
         self.entry.state.poll_read(context.waker())
     }
 
     /// Polls for write readiness or driver shutdown.
     ///
     /// Call this method only after a write operation returns
-    /// [`WouldBlock`](io::ErrorKind::WouldBlock). Readiness is a hint and can
-    /// be spurious. This method consumes the accumulated write readiness. It
-    /// does not consume read readiness.
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock). A readiness signal is a hint
+    /// and can be spurious. This method consumes the accumulated write
+    /// readiness. It does not consume read readiness.
     ///
     /// The registration stores only the latest write waker. A later poll can
     /// replace the waker from an earlier poll.
@@ -283,9 +286,20 @@ where
         clippy::needless_pass_by_ref_mut,
         reason = "the poll API follows Future::poll and accepts the caller's task context"
     )]
-    pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<Readiness, RegistrationClosed>> {
+    pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), RegistrationClosed>> {
         self.entry.state.poll_write(context.waker())
     }
+}
+
+fn event_signals(event: &mio::event::Event) -> u8 {
+    (u8::from(event.is_readable()) * READABLE)
+        | (u8::from(event.is_writable()) * WRITABLE)
+        | (u8::from(event.is_error()) * ERROR)
+        | (u8::from(event.is_read_closed()) * READ_CLOSED)
+        | (u8::from(event.is_write_closed()) * WRITE_CLOSED)
+        | (u8::from(event.is_priority()) * PRIORITY)
+        | (u8::from(event.is_aio()) * AIO)
+        | (u8::from(event.is_lio()) * LIO)
 }
 
 impl<S> Drop for Registered<S>
@@ -341,8 +355,48 @@ mod tests {
     use mio::event::Source;
     use mio::{Interest, Poll, Registry, Token};
 
-    use super::register;
+    use super::{
+        AIO, ERROR, LIO, PRIORITY, READ_CLOSED, READ_SIGNALS, READABLE, RegistrationState, WRITABLE, WRITE_CLOSED, WRITE_SIGNALS, register,
+    };
     use crate::worker::WorkerState;
+
+    #[test]
+    fn mio_signals_map_to_the_expected_directions() {
+        for (signal, read, write) in [
+            (READABLE, true, false),
+            (WRITABLE, false, true),
+            (ERROR, true, true),
+            (READ_CLOSED, true, true),
+            (WRITE_CLOSED, true, true),
+            (PRIORITY, true, false),
+            (AIO, true, true),
+            (LIO, true, true),
+        ] {
+            assert_eq!(signal & READ_SIGNALS != 0, read);
+            assert_eq!(signal & WRITE_SIGNALS != 0, write);
+        }
+    }
+
+    #[test]
+    fn a_shared_signal_sets_both_bits_and_each_poll_takes_only_its_bit() {
+        let state = RegistrationState::default();
+        state.notify_signals(ERROR);
+
+        assert_eq!(state.poll_read(Waker::noop()), std::task::Poll::Ready(Ok(())));
+        assert_eq!(state.poll_read(Waker::noop()), std::task::Poll::Pending);
+        assert_eq!(state.poll_write(Waker::noop()), std::task::Poll::Ready(Ok(())));
+        assert_eq!(state.poll_write(Waker::noop()), std::task::Poll::Pending);
+    }
+
+    #[test]
+    fn repeated_signals_coalesce_into_one_pending_bit() {
+        let state = RegistrationState::default();
+        state.notify_signals(READABLE);
+        state.notify_signals(READABLE);
+
+        assert_eq!(state.poll_read(Waker::noop()), std::task::Poll::Ready(Ok(())));
+        assert_eq!(state.poll_read(Waker::noop()), std::task::Poll::Pending);
+    }
 
     #[test]
     fn shutdown_wins_against_an_in_flight_registration() {

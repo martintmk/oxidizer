@@ -24,12 +24,7 @@ async fn builtins_context_drives_a_mio_source(builtins: Builtins) {
     let mut registration = io.register(receiver, Interest::READABLE).unwrap();
 
     sender.send(&[1]).unwrap();
-    assert!(
-        std::future::poll_fn(|context| registration.poll_read_ready(context))
-            .await
-            .unwrap()
-            .is_readable()
-    );
+    std::future::poll_fn(|context| registration.poll_read_ready(context)).await.unwrap();
 
     let mut buffer = [0; 8];
     assert_eq!(registration.source_mut().unwrap().recv(&mut buffer).unwrap(), 1);

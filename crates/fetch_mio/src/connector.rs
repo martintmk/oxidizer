@@ -356,7 +356,7 @@ fn apply_buffer_options(stream: &TcpStream, options: SocketOptions) -> io::Resul
 fn poll_complete_connect(registration: &Registered<TcpStream>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
     loop {
         match registration.poll_write_ready(context) {
-            Poll::Ready(Ok(_readiness)) => {}
+            Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(error)) => return Poll::Ready(Err(registration_closed(error))),
             Poll::Pending => return Poll::Pending,
         }
