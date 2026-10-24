@@ -32,12 +32,12 @@ impl Drop for RegistryOperation<'_> {
     }
 }
 
-pub(crate) struct RegistrationState {
+pub(crate) struct RegistrationEntry {
     inner: Mutex<RegistrationInner>,
     closed: AtomicBool,
 }
 
-impl Default for RegistrationState {
+impl Default for RegistrationEntry {
     fn default() -> Self {
         Self {
             inner: Mutex::new(RegistrationInner::default()),
@@ -46,34 +46,7 @@ impl Default for RegistrationState {
     }
 }
 
-pub(crate) struct RegistrationEntry {
-    state: Arc<RegistrationState>,
-}
-
 impl RegistrationEntry {
-    fn new(state: Arc<RegistrationState>) -> Self {
-        Self { state }
-    }
-
-    pub(crate) fn notify(&self, event: &mio::event::Event) {
-        self.state.notify(event);
-    }
-
-    pub(crate) fn close(&self) {
-        self.state.close();
-    }
-}
-
-#[derive(Default)]
-struct RegistrationInner {
-    read_ready: bool,
-    write_ready: bool,
-    read_waiter: Option<Waker>,
-    write_waiter: Option<Waker>,
-    closed: bool,
-}
-
-impl RegistrationState {
     pub(crate) fn notify(&self, event: &mio::event::Event) {
         self.notify_signals(event_signals(event));
     }
@@ -165,6 +138,15 @@ impl RegistrationState {
     }
 }
 
+#[derive(Default)]
+struct RegistrationInner {
+    read_ready: bool,
+    write_ready: bool,
+    read_waiter: Option<Waker>,
+    write_waiter: Option<Waker>,
+    closed: bool,
+}
+
 /// One direct-ownership registration for a Mio source.
 ///
 /// The owner accesses the source through ordinary Rust references. The source
@@ -219,7 +201,7 @@ where
     ///
     /// Returns [`RegistrationClosed`] if the driver is closed.
     pub fn source(&self) -> Result<&S, RegistrationClosed> {
-        if self.entry.state.is_closed() {
+        if self.entry.is_closed() {
             Err(RegistrationClosed)
         } else {
             Ok(&self.source)
@@ -238,7 +220,7 @@ where
     ///
     /// Returns [`RegistrationClosed`] if the driver is closed.
     pub fn source_mut(&mut self) -> Result<&mut S, RegistrationClosed> {
-        if self.entry.state.is_closed() {
+        if self.entry.is_closed() {
             Err(RegistrationClosed)
         } else {
             Ok(&mut self.source)
@@ -261,7 +243,7 @@ where
         reason = "the poll API follows Future::poll and accepts the caller's task context"
     )]
     pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), RegistrationClosed>> {
-        self.entry.state.poll_read(context.waker())
+        self.entry.poll_read(context.waker())
     }
 
     /// Polls for write readiness or driver shutdown.
@@ -280,7 +262,7 @@ where
         reason = "the poll API follows Future::poll and accepts the caller's task context"
     )]
     pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<Result<(), RegistrationClosed>> {
-        self.entry.state.poll_write(context.waker())
+        self.entry.poll_write(context.waker())
     }
 }
 
@@ -317,8 +299,7 @@ where
     S: Source + Send + 'static,
 {
     let token = worker.allocate_token()?;
-    let state = Arc::new(RegistrationState::default());
-    let entry = Arc::new(RegistrationEntry::new(state));
+    let entry = Arc::new(RegistrationEntry::default());
     worker.begin_registration(token, Arc::clone(&entry))?;
     let operation = RegistryOperation(&worker);
     if let Err(error) = worker.registry().register(&mut source, token, interest) {
@@ -349,7 +330,7 @@ mod tests {
     use mio::{Interest, Poll, Registry, Token};
 
     use super::{
-        AIO, ERROR, LIO, PRIORITY, READ_CLOSED, READ_SIGNALS, READABLE, RegistrationState, WRITABLE, WRITE_CLOSED, WRITE_SIGNALS, register,
+        AIO, ERROR, LIO, PRIORITY, READ_CLOSED, READ_SIGNALS, READABLE, RegistrationEntry, WRITABLE, WRITE_CLOSED, WRITE_SIGNALS, register,
     };
     use crate::worker::WorkerState;
 
@@ -372,7 +353,7 @@ mod tests {
 
     #[test]
     fn a_shared_signal_sets_both_bits_and_each_poll_takes_only_its_bit() {
-        let state = RegistrationState::default();
+        let state = RegistrationEntry::default();
         state.notify_signals(ERROR);
 
         assert_eq!(state.poll_read(Waker::noop()), std::task::Poll::Ready(Ok(())));
@@ -383,7 +364,7 @@ mod tests {
 
     #[test]
     fn repeated_signals_coalesce_into_one_pending_bit() {
-        let state = RegistrationState::default();
+        let state = RegistrationEntry::default();
         state.notify_signals(READABLE);
         state.notify_signals(READABLE);
 
