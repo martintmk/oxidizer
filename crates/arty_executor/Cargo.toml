@@ -24,6 +24,7 @@ allowed_external_types = [
     "observed::context::transfer::Transfer",
     "observed::sink::core::Sink",
     "thread_aware_core::thread::Thread",
+    "tick::simple_clock::SimpleClock",
 ]
 
 [dependencies]
@@ -46,6 +47,7 @@ metabench = { path = "../metabench", default-features = false }
 mutants = { workspace = true }
 observed_testing = { path = "../observed_testing" }
 static_assertions = { workspace = true }
+tick = { path = "../tick", features = ["test-util"] }
 
 # >>> anvil-managed: anvil-lints
 [lints]

@@ -50,7 +50,7 @@ fn main() {
 
     let mut shutdown_started = false;
 
-    while !matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)) {
+    while !matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)) {
         if !shutdown_started && shutdown_signal.get() {
             shutdown_started = true;
 

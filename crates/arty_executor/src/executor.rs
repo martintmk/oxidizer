@@ -56,7 +56,7 @@ use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCau
 /// Graceful shutdown lets the owner observe when cancellation is complete:
 ///
 /// 1. Call [`shutdown()`][Self::shutdown] and trigger the returned handle.
-/// 2. Keep calling [`execute_cycle()`][Self::execute_cycle] until it returns [`CycleOutcome::Shutdown`].
+/// 2. Keep calling [`execute_cycle()`][Self::execute_cycle] until its outcome is [`CycleOutcome::Shutdown`].
 /// 3. Drop the executor when convenient.
 ///
 /// Dropping the executor without this sequence is also safe and synchronously cancels remaining
@@ -83,9 +83,14 @@ impl Executor {
     }
 
     #[must_use]
-    pub(crate) fn new(owner_waker: task::Waker, sink: Sink, thread_id: ThreadId, panic_policy: crate::PanicPolicy) -> Self {
+    pub(crate) fn new(
+        owner_waker: task::Waker,
+        sink: Sink,
+        thread_id: ThreadId,
+        panic_policy: crate::PanicPolicy,
+        clock: SimpleClock,
+    ) -> Self {
         let shared = ExecutorShared::new(owner_waker, sink, thread_id, panic_policy);
-        let clock = SimpleClock::new_system().with_fast_instant(true);
         // Register before creating an executor whose Drop would unregister this thread.
         executor_context::register(thread_id);
         Self {
@@ -121,9 +126,12 @@ impl Executor {
 
     /// Executes one processing cycle to progress registered tasks.
     ///
-    /// More work may remain after a cycle completes. The return value will indicate whether the
-    /// executor believes it has more work to do, in which case it should be called again as soon as
-    /// possible.
+    /// Returns the outcome and the cycle completion timestamp from the configured
+    /// [`clock`][ExecutorBuilder::clock]. The timestamp is sampled after task processing,
+    /// before publishing cycle metrics, and can be reused by the executor owner.
+    ///
+    /// More work may remain after a cycle completes. The outcome indicates whether the executor
+    /// believes it has more work to do, in which case it should be called again as soon as possible.
     ///
     /// This function is not safe to call in a reentrant manner - only the owner may
     /// call it in an exclusive context.
@@ -136,7 +144,7 @@ impl Executor {
     /// Panics from cleanup and notification hooks may also propagate. Continued operation
     /// after such a panic is not guaranteed.
     #[must_use]
-    pub fn execute_cycle(&mut self) -> CycleOutcome {
+    pub fn execute_cycle(&mut self) -> (CycleOutcome, Instant) {
         let _cycle = executor_context::enter_cycle(self.shared.wake().thread_id());
         let cycle_started = self.start_cycle();
         self.accept_new_tasks();
@@ -144,8 +152,8 @@ impl Executor {
         self.poll_active_tasks();
         self.cancel_if_shutting_down();
         let outcome = self.cycle_outcome();
-        self.finish_cycle(cycle_started);
-        outcome
+        let cycle_finished = self.finish_cycle(cycle_started);
+        (outcome, cycle_finished)
     }
 
     fn start_cycle(&self) -> Instant {
@@ -158,13 +166,14 @@ impl Executor {
         started
     }
 
-    fn finish_cycle(&mut self, started: Instant) {
+    fn finish_cycle(&mut self, started: Instant) -> Instant {
         let ended = self.clock.instant();
         self.last_cycle_ended = Some(ended);
         CYCLE_DURATION_MILLIS.with(|event| {
             event.observe_millis(ended.saturating_duration_since(started));
         });
         EXECUTOR_PUSHER.with(MetricsPusher::push);
+        ended
     }
 
     fn accept_new_tasks(&mut self) {

@@ -77,6 +77,20 @@ stop commands so workers can reject or dispose queued factories without waiting
 for FIFO delivery. The worker must complete executor retirement before its
 unsafe executor storage is dropped.
 
+Each worker cycle selects one next action after command processing, task polling,
+and timer advancement. The action can poll again, wait in the primary I/O
+driver, wait for a worker signal, or finish shutdown. All actions still execute
+secondary I/O drivers before the primary driver.
+
+The executor and worker wait budgets use the fast system clock. The worker
+reuses the executor's cycle-end sample directly for system timer advancement, so
+normal cycles take no additional time sample after task polling. Tick treats a
+timer removed by the driver as complete, even when a precise sample has not
+reached that coarse deadline. Controlled time remains externally owned:
+`ClockControl` advancement wakes the worker when a timer becomes due. Final
+shutdown takes a fresh precise system sample after task cancellation before it
+runs timer callbacks.
+
 ## Scoped borrowed work
 
 [`task/runtime_scheduler.rs`](../src/task/runtime_scheduler.rs) lets

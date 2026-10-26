@@ -55,6 +55,7 @@ rt = [
     "dep:pin-project",
     "dep:plurality",
     "dep:thread_aware",
+    "tick/fast-instant",
 ]
 time = ["dep:tick"]
 test-util = ["tick?/test-util", "many_cpus?/test-util"]

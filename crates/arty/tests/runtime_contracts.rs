@@ -303,7 +303,7 @@ fn pending_future_is_woken_from_an_unrelated_thread() {
 
 #[cfg(all(feature = "macros", feature = "test-util"))]
 #[arty::test]
-async fn worker_can_drive_a_controlled_clock_without_io(cx: Builtins, control: ClockControl) {
+async fn controlled_clock_auto_advance_does_not_require_io(cx: Builtins, control: ClockControl) {
     let _control = control.auto_advance_timers(true);
     let watch = cx.clock().stopwatch();
     cx.clock().delay(Duration::from_secs(5)).await;

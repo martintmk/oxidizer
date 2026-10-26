@@ -40,7 +40,7 @@ impl TaskCompletion<()> for CountCompletion {
 
 fn spawn_complete_once(executor: &mut Executor, tasks: &TaskSet, completed: &Rc<Cell<usize>>) {
     tasks.add(async {}, TaskOptions::default(), CountCompletion(Rc::clone(completed)));
-    let _ = executor.execute_cycle();
+    let _ = executor.execute_cycle().0;
 }
 
 fn allocation_totals(session: &Session, operation_name: &str) -> (u64, u64) {
@@ -62,7 +62,7 @@ fn spawn_and_complete_one_reuses_all_storage() {
     for _ in 0..WARM_UP_OPERATIONS {
         spawn_complete_once(&mut executor, &tasks, &completed);
     }
-    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
     completed.set(0);
 
     let session = Session::new().no_stdout().no_file();
@@ -88,5 +88,5 @@ fn spawn_and_complete_one_reuses_all_storage() {
     assert_eq!(completed.get(), MEASURED_OPERATIONS);
     assert!(!executor.has_tasks());
     executor.shutdown().trigger(arty_executor::ShutdownCause::default());
-    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
 }

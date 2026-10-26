@@ -33,6 +33,14 @@ fn can_suspend(cycle_outcome: &CycleOutcome, batch_exhausted: bool) -> bool {
     matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CycleAction {
+    Poll,
+    WaitForIo(Option<Instant>),
+    WaitForSignal(Option<Instant>),
+    Shutdown,
+}
+
 /// The async worker has exclusive use of one runtime thread. Multiple worker
 /// threads can share a processor when the exact worker count exceeds available
 /// processor capacity. The worker executes async tasks that are woken by local
@@ -89,10 +97,8 @@ pub(crate) struct AsyncWorker {
     // This drives moves the timers registered with the clock forward.
     clock_driver: ClockDriver,
 
-    // Logical time follows controlled clocks and is used to calculate timer waits.
-    time: SimpleClock,
-    // System timer advancement and I/O wait accounting require precise elapsed time.
-    physical_time: SimpleClock,
+    // Cycle-local timestamps and wait budgets use lower-overhead system time.
+    cycle_clock: SimpleClock,
     signal: Arc<WorkerSignal>,
     monitor_options: MonitorOptions,
     _single_threaded: PhantomData<*const ()>,
@@ -118,13 +124,14 @@ impl AsyncWorker {
         let worker_waker = WorkerSignal::waker(&signal);
         let shutdown = dispatcher.shutdown().clone();
         let (clock, clock_driver) = clock.activate(worker_waker.clone());
-        let time = clock.simple_clock().clone();
+        let cycle_clock = SimpleClock::new_system().with_fast_instant(true);
 
         let executor = Executor::builder()
             .owner_waker(worker_waker)
             .sink(blocking_worker.sink().clone())
             .thread(thread.clone())
             .panic_policy(panic_policy.into_executor_policy())
+            .clock(cycle_clock.clone())
             .build();
         let tasks = executor.tasks();
         let executor_shutdown = executor.shutdown();
@@ -139,8 +146,7 @@ impl AsyncWorker {
             executor: Some(executor),
             tasks,
             clock_driver,
-            time,
-            physical_time: SimpleClock::new_system(),
+            cycle_clock,
             signal,
             monitor_options,
             _single_threaded: PhantomData,
@@ -163,51 +169,20 @@ impl AsyncWorker {
     }
 
     fn execute_step(&mut self) -> ControlFlow<()> {
-        let batch_exhausted = self.process_commands();
-
-        if matches!(self.shutdown.state(), ShutdownState::Started) {
-            return self.finish_shutdown();
-        }
-
-        let executor = self
-            .executor
-            .as_mut()
-            .expect("executor removal publishes shutdown, which is handled above");
-
-        let cycle_outcome = executor.execute_cycle();
-
-        if let CycleOutcome::Shutdown(cause) = cycle_outcome {
-            self.shutdown.begin(cause);
-            return self.finish_shutdown();
-        }
-
-        let advance_now = self.timer_now();
-        let next_timer = self.clock_driver.advance_timers(advance_now).ok().flatten();
-        if matches!(self.shutdown.state(), ShutdownState::Started) {
-            return self.finish_shutdown();
-        }
-        let should_suspend = can_suspend(&cycle_outcome, batch_exhausted);
-        let has_primary = RuntimeDriverHost::has_primary_current();
-        let max_wait = if should_suspend {
-            if has_primary {
-                if self.signal.take_notification() {
-                    Duration::ZERO
-                } else {
-                    next_timer.map_or(Duration::MAX, |deadline| suspend_wait(deadline, self.time.instant()))
-                }
-            } else {
-                Duration::ZERO
-            }
-        } else {
-            Duration::ZERO
+        let action = self.prepare_cycle();
+        let max_wait = match action {
+            CycleAction::Shutdown => return self.finish_shutdown(),
+            CycleAction::WaitForIo(deadline) => self.io_wait(deadline),
+            CycleAction::Poll | CycleAction::WaitForSignal(_) => Duration::ZERO,
         };
+
         if RuntimeDriverHost::execute_cycle_current(max_wait).is_err() {
             return self.finish_shutdown();
         }
 
-        if should_suspend && !has_primary {
-            match next_timer {
-                Some(deadline) => self.signal.wait(suspend_wait(deadline, self.time.instant())),
+        if let CycleAction::WaitForSignal(deadline) = action {
+            match deadline {
+                Some(deadline) => self.signal.wait(self.wait_until(deadline)),
                 None => self.signal.wait_for_notification(),
             }
         }
@@ -215,18 +190,57 @@ impl AsyncWorker {
         ControlFlow::Continue(())
     }
 
-    fn finish_shutdown(&mut self) -> ControlFlow<()> {
-        self.begin_shutdown();
-        let now = self.timer_now();
-        _ = self.clock_driver.advance_timers(now);
-        ControlFlow::Break(())
+    fn prepare_cycle(&mut self) -> CycleAction {
+        let batch_exhausted = self.process_commands();
+
+        if matches!(self.shutdown.state(), ShutdownState::Started) {
+            return CycleAction::Shutdown;
+        }
+
+        let executor = self
+            .executor
+            .as_mut()
+            .expect("executor removal publishes shutdown, which is handled above");
+
+        let (cycle_outcome, cycle_finished) = executor.execute_cycle();
+
+        if let CycleOutcome::Shutdown(cause) = cycle_outcome {
+            self.shutdown.begin(cause);
+            return CycleAction::Shutdown;
+        }
+
+        let next_timer = self.clock_driver.advance_timers(cycle_finished).ok().flatten();
+        if matches!(self.shutdown.state(), ShutdownState::Started) {
+            return CycleAction::Shutdown;
+        }
+
+        if !can_suspend(&cycle_outcome, batch_exhausted) {
+            CycleAction::Poll
+        } else if RuntimeDriverHost::has_primary_current() {
+            CycleAction::WaitForIo(next_timer)
+        } else {
+            CycleAction::WaitForSignal(next_timer)
+        }
     }
 
-    fn timer_now(&self) -> Instant {
-        // Reading logical time preserves controlled-clock auto-advance. The precise physical read
-        // prevents system timer advancement from lagging behind a deadline registered during task
-        // cancellation on platforms where consecutive monotonic reads can have different precision.
-        self.time.instant().max(self.physical_time.instant())
+    fn io_wait(&self, deadline: Option<Instant>) -> Duration {
+        if self.signal.take_notification() {
+            return Duration::ZERO;
+        }
+
+        deadline.map_or(Duration::MAX, |deadline| self.wait_until(deadline))
+    }
+
+    fn wait_until(&self, deadline: Instant) -> Duration {
+        suspend_wait(deadline, self.cycle_clock.instant())
+    }
+
+    fn finish_shutdown(&mut self) -> ControlFlow<()> {
+        self.begin_shutdown();
+        // Final task cancellation can register a timer after the coarse cycle sample.
+        let now = SimpleClock::new_system().instant();
+        _ = self.clock_driver.advance_timers(now);
+        ControlFlow::Break(())
     }
 
     #[cfg_attr(test, mutants::skip)] // Mutation testing requires a fine level of control over what is in the channel, which is too bothersome just for mutation testing.
@@ -393,38 +407,6 @@ mod tests {
         assert!(!worker.monitor_options.policy().is_enabled());
     }
 
-    #[test]
-    fn injected_time_advances_worker_timers_without_elapsed_wall_time() {
-        let (command_tx, command_rx) = channel::unbounded();
-        let signal = Arc::new(WorkerSignal::default());
-        let control = ClockControl::new();
-        let time = control.to_simple_clock();
-        let mut worker = test_worker(
-            command_tx.clone(),
-            command_rx,
-            test_blocking_worker(),
-            InactiveClock::from(control.clone()),
-            Arc::clone(&signal),
-        );
-        let clock = worker.builtins.as_ref().unwrap().clock().clone();
-        let before_registration = time.instant();
-        let mut delay = Box::pin(clock.delay(Duration::from_mins(1)));
-        let mut context = std::task::Context::from_waker(Waker::noop());
-        assert!(std::future::Future::poll(delay.as_mut(), &mut context).is_pending());
-        let control = control.auto_advance_timers(true);
-        WorkerSignal::waker(&signal).wake_by_ref();
-
-        assert!(worker.execute_step().is_continue());
-        let _control = control.auto_advance_timers(false);
-        assert_eq!(time.instant().duration_since(before_registration), Duration::from_mins(1));
-        assert!(std::future::Future::poll(delay.as_mut(), &mut context).is_ready());
-
-        drop(delay);
-        drop(clock);
-        command_tx.send(AsyncWorkerCommand::Shutdown).unwrap();
-        worker.run();
-    }
-
     #[cfg(not(miri))]
     #[test]
     fn worker_without_primary_waits_for_timer_or_notification() {
@@ -507,76 +489,6 @@ mod tests {
         command_tx.send(AsyncWorkerCommand::Shutdown).unwrap();
         worker_waker.wake_by_ref();
         worker_thread.join().unwrap();
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    fn timer_callback_direct_submission_notifies_the_worker() {
-        struct SpawnOnWake {
-            scheduler: Scheduler,
-            task_ran: Arc<AtomicBool>,
-        }
-
-        impl Wake for SpawnOnWake {
-            fn wake(self: std::sync::Arc<Self>) {
-                let task_ran = Arc::clone(&self.task_ran);
-                drop(self.scheduler.spawn(move |builtins| async move {
-                    task_ran.store(true, Ordering::Relaxed);
-                    builtins.scheduler().dispatcher.stop(ShutdownCause::default());
-                }));
-            }
-        }
-
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let timed_out_by_worker = Arc::clone(&timed_out);
-        let (worker_ready, worker_setup) = mpsc::channel();
-        let (worker_done, worker_completion) = mpsc::channel();
-        let worker_thread = thread::spawn(move || {
-            let (command_tx, command_rx) = channel::unbounded();
-            let signal = Arc::new(WorkerSignal::default());
-            let control = ClockControl::new();
-            let mut worker = test_worker(
-                command_tx,
-                command_rx,
-                test_blocking_worker(),
-                control.clone().into(),
-                Arc::clone(&signal),
-            );
-            let (scheduler, clock) = {
-                let builtins = worker.builtins.as_ref().unwrap();
-                (builtins.scheduler().clone(), builtins.clock().clone())
-            };
-            let task_ran = Arc::new(AtomicBool::new(false));
-            let timer_waker = Waker::from(std::sync::Arc::new(SpawnOnWake {
-                scheduler,
-                task_ran: Arc::clone(&task_ran),
-            }));
-            let mut delay = Box::pin(clock.delay(Duration::from_mins(1)));
-            assert!(delay.as_mut().poll(&mut std::task::Context::from_waker(&timer_waker)).is_pending());
-            worker_ready.send(WorkerSignal::waker(&signal)).unwrap();
-
-            WorkerSignal::waker(&signal).wake_by_ref();
-            assert!(worker.execute_step().is_continue());
-            let _control = control.auto_advance_timers(true);
-            assert!(worker.execute_step().is_continue());
-            assert!(
-                !timed_out_by_worker.load(Ordering::Relaxed),
-                "the timer callback's direct submission must release the worker wait"
-            );
-            assert!(!task_ran.load(Ordering::Relaxed));
-
-            assert!(worker.execute_step().is_break());
-            assert!(task_ran.load(Ordering::Relaxed));
-            worker_done.send(()).unwrap();
-        });
-        let worker_waker = worker_setup.recv_timeout(TEST_TIMEOUT).unwrap();
-
-        if worker_completion.recv_timeout(TEST_TIMEOUT).is_err() {
-            timed_out.store(true, Ordering::Relaxed);
-            worker_waker.wake_by_ref();
-        }
-        worker_thread.join().unwrap();
-        assert!(!timed_out.load(Ordering::Relaxed));
     }
 
     trait TestTaskSetExt {

@@ -80,7 +80,7 @@ fn shutdown_cancelled_deferred_task_stays_pending_without_invoking_factory() {
 
 /// Drives the executor until it reports that no further progress can be made.
 fn run_to_completion(executor: &mut Executor) {
-    while matches!(executor.execute_cycle(), CycleOutcome::Continue) {}
+    while matches!(executor.execute_cycle().0, CycleOutcome::Continue) {}
 }
 
 struct PanicWake;
