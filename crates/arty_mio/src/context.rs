@@ -1,12 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Arc;
 use std::{fmt, io};
 
 use arty_io_core::{DriverError, DriverOptions, IoContext};
 use mio::Interest;
 use mio::event::Source;
+use performables::arc::Arc;
 use thread_aware_core::{Thread, ThreadAware};
 
 use crate::driver::MioDriver;

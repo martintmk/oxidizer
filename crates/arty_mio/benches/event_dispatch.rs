@@ -8,16 +8,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hint::black_box;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
+use performables::arc::Arc;
+use performables::sync::mutex::Mutex;
 
 const BATCH_SIZES: [usize; 6] = [1, 4, 16, 64, 256, 1_024];
 const COMPLETION_BUDGET: usize = 256;
 const BUDGETS: [usize; 3] = [64, 256, 1_024];
 const BUDGET_GROUP: &str = "arty_mio/event_dispatch/budget";
 const PRIMARY_GROUP: &str = "arty_mio/event_dispatch/primary";
+const READINESS_GROUP: &str = "arty_mio/event_dispatch/readiness";
 const SECONDARY_GROUP: &str = "arty_mio/event_dispatch/secondary";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,7 +48,7 @@ impl Dispatcher {
     }
 
     fn dispatch_one(&self, token: usize) {
-        let registration = self.registrations.lock().unwrap().get(&token).cloned();
+        let registration = self.registrations.lock().get(&token).cloned();
         if let Some(registration) = registration {
             registration.fetch_add(1, Ordering::Relaxed);
         }
@@ -53,7 +56,7 @@ impl Dispatcher {
 
     fn dispatch_batch(&self, tokens: &[usize], resolved: &mut Vec<Option<Arc<AtomicUsize>>>) {
         resolved.clear();
-        let registrations = self.registrations.lock().unwrap();
+        let registrations = self.registrations.lock();
         resolved.extend(tokens.iter().map(|token| registrations.get(token).cloned()));
         drop(registrations);
         for registration in resolved.iter().flatten() {
@@ -147,7 +150,7 @@ impl SecondaryState {
 }
 
 fn secondary_allocating(state: &SecondaryState) -> Metrics {
-    let total = state.queue.lock().unwrap().events.len();
+    let total = state.queue.lock().events.len();
     let mut metrics = Metrics {
         owner_wakes: usize::from(total != 0),
         pauses: usize::from(total != 0),
@@ -157,7 +160,7 @@ fn secondary_allocating(state: &SecondaryState) -> Metrics {
         metrics.driver_cycles += 1;
         metrics.shared_locks += 1;
         let (events, resume) = {
-            let mut queue = state.queue.lock().unwrap();
+            let mut queue = state.queue.lock();
             let count = COMPLETION_BUDGET.min(queue.events.len());
             let events: Vec<_> = queue.events.drain(..count).collect();
             let resume = queue.events.is_empty();
@@ -172,7 +175,7 @@ fn secondary_allocating(state: &SecondaryState) -> Metrics {
             metrics.registration_locks += 1;
         }
         metrics.shared_locks += 1;
-        let has_events = !state.queue.lock().unwrap().events.is_empty();
+        let has_events = !state.queue.lock().events.is_empty();
         if resume {
             metrics.resumes += 1;
         }
@@ -190,7 +193,7 @@ fn secondary_reused_batch(state: &mut SecondaryState) -> Metrics {
 }
 
 fn secondary_reused_batch_with_budget(state: &mut SecondaryState, budget: usize) -> Metrics {
-    let total = state.queue.lock().unwrap().events.len();
+    let total = state.queue.lock().events.len();
     let mut metrics = Metrics {
         owner_wakes: usize::from(total != 0),
         pauses: usize::from(total != 0),
@@ -201,7 +204,7 @@ fn secondary_reused_batch_with_budget(state: &mut SecondaryState, budget: usize)
         metrics.shared_locks += 1;
         state.events.clear();
         let (resume, has_events) = {
-            let mut queue = state.queue.lock().unwrap();
+            let mut queue = state.queue.lock();
             let count = budget.min(queue.events.len());
             state.events.extend(queue.events.drain(..count));
             let has_events = !queue.events.is_empty();
@@ -223,6 +226,46 @@ fn secondary_reused_batch_with_budget(state: &mut SecondaryState, budget: usize)
     }
     metrics.events = total;
     metrics
+}
+
+struct StdReadiness {
+    inner: StdMutex<ReadinessInner>,
+}
+
+impl StdReadiness {
+    fn new() -> Self {
+        Self {
+            inner: StdMutex::new(ReadinessInner { ready: true }),
+        }
+    }
+}
+
+struct PerformablesReadiness {
+    inner: Mutex<ReadinessInner>,
+}
+
+impl PerformablesReadiness {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ReadinessInner { ready: true }),
+        }
+    }
+}
+
+struct ReadinessInner {
+    ready: bool,
+}
+
+#[metabench::benchmark(READINESS_STD, READINESS_GROUP, "std")]
+#[bench::state(&StdReadiness::new())]
+fn readiness_std(state: &StdReadiness) -> bool {
+    std::mem::take(&mut state.inner.lock().unwrap().ready)
+}
+
+#[metabench::benchmark(READINESS_PERFORMABLES, READINESS_GROUP, "performables")]
+#[bench::state(&PerformablesReadiness::new())]
+fn readiness_performables(state: &PerformablesReadiness) -> bool {
+    std::mem::take(&mut state.inner.lock().ready)
 }
 
 #[metabench::benchmark(PRIMARY_PER_EVENT_1024, PRIMARY_GROUP, "per_event_1024")]
@@ -316,6 +359,23 @@ fn criterion_benchmarks(criterion: &mut Criterion) {
     }
     secondary.finish();
 
+    let mut readiness = criterion.benchmark_group(READINESS_GROUP);
+    readiness.bench_function(READINESS_STD.benchmark_name(), |bencher| {
+        bencher.iter_batched(
+            StdReadiness::new,
+            |state| black_box(readiness_std(black_box(&state))),
+            BatchSize::SmallInput,
+        );
+    });
+    readiness.bench_function(READINESS_PERFORMABLES.benchmark_name(), |bencher| {
+        bencher.iter_batched(
+            PerformablesReadiness::new,
+            |state| black_box(readiness_performables(black_box(&state))),
+            BatchSize::SmallInput,
+        );
+    });
+    readiness.finish();
+
     let mut budgets = criterion.benchmark_group(BUDGET_GROUP);
     budgets.throughput(Throughput::Elements(1_024));
     for budget in BUDGETS {
@@ -343,7 +403,9 @@ metabench::main!(
         PRIMARY_PER_EVENT_1024,
         PRIMARY_BATCHED_1024,
         SECONDARY_ALLOCATING_1024,
-        SECONDARY_REUSED_BATCH_1024
+        SECONDARY_REUSED_BATCH_1024,
+        READINESS_STD,
+        READINESS_PERFORMABLES
     ],
     allocator = std::alloc::System,
 );

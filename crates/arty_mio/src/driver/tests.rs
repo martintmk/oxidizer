@@ -1,12 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Arc;
+use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Wake, Waker};
 use std::time::Duration;
 
 use mio::{Events, Poll, Token};
+use performables::arc::Arc;
 
 use super::primary::PrimaryDriver;
 use super::secondary::{SecondaryDriver, SecondaryShared, drain_secondary_events};
@@ -31,11 +32,11 @@ fn secondary_background_failure_becomes_driver_error() {
 #[test]
 fn primary_full_capacity_batch_yields_after_each_budget() {
     let poll = Poll::new().unwrap();
-    let owner = Arc::new(WakeCounter::default());
+    let owner = StdArc::new(WakeCounter::default());
     let worker = Arc::new(WorkerState::new(
         std::thread::current().id(),
         poll.registry().try_clone().unwrap(),
-        Waker::from(Arc::clone(&owner)),
+        Waker::from(StdArc::clone(&owner)),
     ));
     let mut driver = PrimaryDriver::new(poll);
     driver.pending.extend(std::iter::repeat_n(wake_event(), EVENT_CAPACITY));
@@ -92,11 +93,11 @@ impl WakeCounter {
 }
 
 impl Wake for WakeCounter {
-    fn wake(self: Arc<Self>) {
+    fn wake(self: StdArc<Self>) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn wake_by_ref(self: &Arc<Self>) {
+    fn wake_by_ref(self: &StdArc<Self>) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 }

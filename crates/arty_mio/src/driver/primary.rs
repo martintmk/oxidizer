@@ -3,12 +3,12 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::Arc;
 use std::time::Duration;
 
 use arty_io_core::DriverError;
 use mio::event::Event;
 use mio::{Events, Poll};
+use performables::arc::Arc;
 
 use super::{COMPLETION_BUDGET, EVENT_CAPACITY};
 use crate::registration::RegistrationEntry;

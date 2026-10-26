@@ -1,13 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Arc;
+use std::sync::Arc as StdArc;
 use std::task::Waker;
 use std::time::Duration;
 use std::{fmt, thread};
 
 use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, DriverRole};
 use mio::Poll;
+use performables::arc::Arc;
 
 use self::poll_wake::PollWake;
 use self::primary::PrimaryDriver;
@@ -53,7 +54,7 @@ impl MioDriver {
         let (mode, poll_waker, registry) = match options.role() {
             DriverRole::Primary => {
                 let poll = Poll::new().map_err(DriverError::from_source)?;
-                let poll_waker = Arc::new(PollWake::new(poll.registry()).map_err(DriverError::from_source)?);
+                let poll_waker = StdArc::new(PollWake::new(poll.registry()).map_err(DriverError::from_source)?);
                 let registry = poll.registry().try_clone().map_err(DriverError::from_source)?;
                 (DriverMode::Primary(PrimaryDriver::new(poll)), poll_waker, registry)
             }
@@ -104,7 +105,7 @@ impl MioDriver {
 
 impl Driver for MioDriver {
     fn waker(&self) -> Waker {
-        Waker::from(Arc::clone(&self.inner().poll_waker))
+        Waker::from(StdArc::clone(&self.inner().poll_waker))
     }
 
     fn execute_cycle(&mut self, cycle: &mut Cycle) -> Result<(), DriverError> {
@@ -130,7 +131,7 @@ impl Drop for MioDriver {
 struct DriverInner {
     context: Arc<ContextState>,
     worker: Arc<WorkerState>,
-    poll_waker: Arc<PollWake>,
+    poll_waker: StdArc<PollWake>,
     mode: DriverMode,
 }
 

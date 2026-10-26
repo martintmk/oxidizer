@@ -2,12 +2,13 @@
 // Licensed under the MIT License.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::{fmt, io};
 
 use mio::event::Source;
 use mio::{Interest, Token};
+use performables::arc::Arc;
+use performables::sync::mutex::Mutex;
 
 use crate::error::RegistrationClosed;
 use crate::worker::WorkerState;
@@ -53,10 +54,7 @@ impl RegistrationEntry {
 
     fn notify_signals(&self, signals: u8) {
         let (read_waiter, write_waiter) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .expect("readiness notification does not call code that can panic while the readiness lock is held");
+            let mut inner = self.inner.lock();
             if inner.closed {
                 return;
             }
@@ -84,10 +82,7 @@ impl RegistrationEntry {
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let (read_waiter, write_waiter) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .expect("registration close does not call code that can panic while the readiness lock is held");
+            let mut inner = self.inner.lock();
             inner.closed = true;
             (inner.read_waiter.take(), inner.write_waiter.take())
         };
@@ -104,10 +99,7 @@ impl RegistrationEntry {
     }
 
     fn poll_read(&self, waker: &Waker) -> Poll<Result<(), RegistrationClosed>> {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("read readiness polling does not call code that can panic while the readiness lock is held");
+        let mut inner = self.inner.lock();
         if std::mem::take(&mut inner.read_ready) {
             return Poll::Ready(Ok(()));
         }
@@ -121,10 +113,7 @@ impl RegistrationEntry {
     }
 
     fn poll_write(&self, waker: &Waker) -> Poll<Result<(), RegistrationClosed>> {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("write readiness polling does not call code that can panic while the readiness lock is held");
+        let mut inner = self.inner.lock();
         if std::mem::take(&mut inner.write_ready) {
             return Poll::Ready(Ok(()));
         }
@@ -323,11 +312,12 @@ where
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::sync::{Arc, mpsc};
+    use std::sync::mpsc;
     use std::task::Waker;
 
     use mio::event::Source;
     use mio::{Interest, Poll, Registry, Token};
+    use performables::arc::Arc;
 
     use super::{
         AIO, ERROR, LIO, PRIORITY, READ_CLOSED, READ_SIGNALS, READABLE, RegistrationEntry, WRITABLE, WRITE_CLOSED, WRITE_SIGNALS, register,

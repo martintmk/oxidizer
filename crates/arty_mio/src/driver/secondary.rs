@@ -3,13 +3,16 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc as StdArc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
 use arty_io_core::DriverError;
 use mio::event::Event;
 use mio::{Events, Poll, Registry};
+use performables::arc::Arc;
+use performables::sync::condition::Condvar;
+use performables::sync::mutex::{Mutex, MutexGuard};
 
 use super::poll_wake::PollWake;
 use super::{COMPLETION_BUDGET, EVENT_CAPACITY, SHUTDOWN_LIMIT};
@@ -25,7 +28,7 @@ pub(super) struct SecondaryDriver {
 }
 
 impl SecondaryDriver {
-    pub(super) fn new() -> io::Result<(Self, Arc<PollWake>, Registry)> {
+    pub(super) fn new() -> io::Result<(Self, StdArc<PollWake>, Registry)> {
         let shared = Arc::new(SecondaryShared::default());
         let thread_shared = Arc::clone(&shared);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -33,10 +36,10 @@ impl SecondaryDriver {
         let thread = thread::Builder::new().name("arty-mio-secondary".to_owned()).spawn(move || {
             let result = (|| -> io::Result<()> {
                 let mut poll = Poll::new()?;
-                let poll_waker = Arc::new(PollWake::new(poll.registry())?);
+                let poll_waker = StdArc::new(PollWake::new(poll.registry())?);
                 let registry = poll.registry().try_clone()?;
                 started_tx
-                    .send(Ok((Arc::clone(&poll_waker), registry)))
+                    .send(Ok((StdArc::clone(&poll_waker), registry)))
                     .map_err(|_send_error| io::Error::other("the Arty worker stopped secondary driver creation"))?;
                 let mut events = Events::with_capacity(EVENT_CAPACITY);
                 loop {
@@ -159,9 +162,7 @@ pub(super) struct SecondaryShared {
 
 impl SecondaryShared {
     pub(super) fn state(&self) -> MutexGuard<'_, SecondaryState> {
-        self.inner
-            .lock()
-            .expect("secondary poller state changes do not call user code while the state lock is held")
+        self.inner.lock()
     }
 
     fn set_worker(&self, worker: Arc<WorkerState>) {
@@ -173,10 +174,7 @@ impl SecondaryShared {
     fn worker(&self) -> io::Result<Arc<WorkerState>> {
         let mut state = self.state();
         while state.worker.is_none() && !state.shutdown {
-            state = self
-                .ready
-                .wait(state)
-                .expect("only the secondary poller waits for its worker attachment");
+            state = self.ready.wait(state);
         }
         state
             .worker
@@ -191,10 +189,7 @@ impl SecondaryShared {
     fn wait_until_resumed(&self) {
         let mut state = self.state();
         while state.paused && !state.shutdown {
-            state = self
-                .ready
-                .wait(state)
-                .expect("only the secondary poller waits while queued events are pending");
+            state = self.ready.wait(state);
         }
     }
 

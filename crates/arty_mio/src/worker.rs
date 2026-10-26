@@ -4,12 +4,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::task::Waker;
 use std::thread::ThreadId;
 
 use mio::event::Event;
 use mio::{Registry, Token};
+use performables::arc::Arc;
+use performables::sync::condition::Condvar;
+use performables::sync::mutex::Mutex;
 
 use crate::registration::RegistrationEntry;
 
@@ -22,22 +24,15 @@ pub(crate) struct ContextState {
 
 impl ContextState {
     pub(crate) fn worker(&self, thread_id: ThreadId) -> Option<Arc<WorkerState>> {
-        self.workers
-            .lock()
-            .expect("worker lookup does not call user code while the worker map lock is held")
-            .get(&thread_id)
-            .cloned()
+        self.workers.lock().get(&thread_id).cloned()
     }
 
     pub(crate) fn try_worker(&self, thread_id: ThreadId) -> Option<Arc<WorkerState>> {
-        self.workers.try_lock().ok()?.get(&thread_id).cloned()
+        self.workers.try_lock_result().ok().flatten()?.get(&thread_id).cloned()
     }
 
     pub(crate) fn install(&self, worker: Arc<WorkerState>) -> io::Result<()> {
-        let mut workers = self
-            .workers
-            .lock()
-            .expect("driver creation is the only code that mutates the worker map while its lock is held");
+        let mut workers = self.workers.lock();
         if workers.contains_key(&worker.thread_id) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -49,10 +44,7 @@ impl ContextState {
     }
 
     pub(crate) fn remove(&self, worker: &Arc<WorkerState>) {
-        let mut workers = self
-            .workers
-            .lock()
-            .expect("driver shutdown is the only code that mutates the worker map while its lock is held");
+        let mut workers = self.workers.lock();
         if workers.get(&worker.thread_id).is_some_and(|current| Arc::ptr_eq(current, worker)) {
             workers.remove(&worker.thread_id);
         }
@@ -103,10 +95,7 @@ impl WorkerState {
     }
 
     pub(crate) fn begin_registration(&self, token: Token, entry: Arc<RegistrationEntry>) -> io::Result<()> {
-        let mut registrations = self
-            .registrations
-            .lock()
-            .expect("registration insertion does not call user code while the registration lock is held");
+        let mut registrations = self.registrations.lock();
         if registrations.closed {
             return Err(closed_error());
         }
@@ -116,10 +105,7 @@ impl WorkerState {
     }
 
     pub(crate) fn finish_registration(&self, token: Token, entry: &Arc<RegistrationEntry>, registered: bool) -> bool {
-        let mut registrations = self
-            .registrations
-            .lock()
-            .expect("registration completion does not call user code while the registration lock is held");
+        let mut registrations = self.registrations.lock();
         let active =
             registered && !registrations.closed && registrations.values.get(&token).is_some_and(|current| Arc::ptr_eq(current, entry));
         if !active {
@@ -129,10 +115,7 @@ impl WorkerState {
     }
 
     pub(crate) fn begin_deregistration(&self, token: Token, entry: &Arc<RegistrationEntry>) -> bool {
-        let mut registrations = self
-            .registrations
-            .lock()
-            .expect("deregistration removal does not call user code while the registration lock is held");
+        let mut registrations = self.registrations.lock();
         if registrations.closed || !registrations.values.get(&token).is_some_and(|current| Arc::ptr_eq(current, entry)) {
             return false;
         }
@@ -142,10 +125,7 @@ impl WorkerState {
     }
 
     pub(crate) fn finish_registry_operation(&self) {
-        let mut registrations = self
-            .registrations
-            .lock()
-            .expect("deregistration completion does not call user code while the registration lock is held");
+        let mut registrations = self.registrations.lock();
         registrations.active_operations -= 1;
         if registrations.active_operations == 0 {
             self.registrations_idle.notify_all();
@@ -157,10 +137,7 @@ impl WorkerState {
         if events.is_empty() {
             return;
         }
-        let registrations = self
-            .registrations
-            .lock()
-            .expect("event batch resolution does not call user code while the registration lock is held");
+        let registrations = self.registrations.lock();
         resolved.extend(events.iter().map(|event| registrations.values.get(&event.token()).cloned()));
         drop(registrations);
         for (event, registration) in events.iter().zip(resolved.iter()) {
@@ -172,16 +149,10 @@ impl WorkerState {
 
     pub(crate) fn close_registrations(&self) {
         let registrations: Vec<_> = {
-            let mut registrations = self
-                .registrations
-                .lock()
-                .expect("driver shutdown does not call user code while the registration lock is held");
+            let mut registrations = self.registrations.lock();
             registrations.closed = true;
             while registrations.active_operations != 0 {
-                registrations = self
-                    .registrations_idle
-                    .wait(registrations)
-                    .expect("only driver shutdown waits for active registry operations");
+                registrations = self.registrations_idle.wait(registrations);
             }
             registrations.values.drain().map(|(_, registration)| registration).collect()
         };
@@ -192,10 +163,7 @@ impl WorkerState {
 
     #[cfg(test)]
     pub(crate) fn registrations_are_closed(&self) -> bool {
-        self.registrations
-            .lock()
-            .expect("test inspection does not call user code while the registration lock is held")
-            .closed
+        self.registrations.lock().closed
     }
 
     pub(crate) fn wake_owner(&self) {
@@ -203,10 +171,7 @@ impl WorkerState {
     }
 
     pub(crate) fn record_failure(&self, error: io::Error) {
-        let mut failure = self
-            .failure
-            .lock()
-            .expect("driver failure recording does not call user code while the failure lock is held");
+        let mut failure = self.failure.lock();
         if failure.is_none() {
             *failure = Some(error);
             drop(failure);
@@ -215,10 +180,7 @@ impl WorkerState {
     }
 
     pub(crate) fn take_failure(&self) -> Option<io::Error> {
-        self.failure
-            .lock()
-            .expect("driver failure inspection does not call user code while the failure lock is held")
-            .take()
+        self.failure.lock().take()
     }
 }
 
