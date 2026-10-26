@@ -25,7 +25,7 @@ use thread_aware::ThreadBuilder;
 use thread_aware_core::ThreadAware;
 
 assert_impl_all!(MioContext: Clone, Send, Sync, ThreadAware);
-assert_impl_all!(MioOptions: Clone, Send, Sync, Default, std::fmt::Debug, Eq);
+assert_impl_all!(MioOptions: Clone, Send, Sync, Default, std::fmt::Debug);
 assert_not_impl_any!(MioOptions: Copy);
 assert_impl_all!(MioDriver: Driver);
 assert_impl_all!(RegistrationClosed: Send, Sync, std::fmt::Debug, std::fmt::Display, std::error::Error);

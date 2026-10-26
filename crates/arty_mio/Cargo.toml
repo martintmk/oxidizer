@@ -25,6 +25,7 @@ allowed_external_types = [
     "mio::event::Source",
     "mio::interest::Interest",
     "mio::token::Token",
+    "observed::sink::core::Sink",
     "thread_aware_core::thread::Thread",
     "thread_aware_core::thread_aware::ThreadAware",
 ]
@@ -34,7 +35,9 @@ default = []
 
 [dependencies]
 arty_io_core = { workspace = true }
+data_privacy = { workspace = true }
 mio = { workspace = true, features = ["os-poll"] }
+observed = { workspace = true }
 performables = { workspace = true }
 thread_aware_core = { workspace = true, features = ["std"] }
 
@@ -44,6 +47,7 @@ ctor = { workspace = true, features = ["proc_macro"] }
 criterion = { workspace = true }
 metabench = { path = "../metabench", default-features = false }
 mio = { workspace = true, features = ["net", "os-poll"] }
+observed_testing = { path = "../observed_testing" }
 static_assertions = { workspace = true }
 testing_aids = { path = "../testing_aids" }
 thread_aware = { path = "../thread_aware", features = ["std", "test-utils"] }

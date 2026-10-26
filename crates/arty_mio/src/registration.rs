@@ -11,6 +11,7 @@ use performables::arc::Arc;
 use performables::sync::mutex::Mutex;
 
 use crate::error::RegistrationClosed;
+use crate::telemetry::SourceOperation;
 use crate::worker::WorkerState;
 
 const READABLE: u8 = 1 << 0;
@@ -277,6 +278,7 @@ where
         }
         let _operation = RegistryOperation(&self.worker);
         if let Err(error) = self.worker.registry().deregister(&mut self.source) {
+            self.worker.report_source_failure(SourceOperation::Deregistration, &error);
             self.worker.record_failure(error);
         }
         self.entry.close();
@@ -287,23 +289,31 @@ pub(crate) fn register<S>(mut source: S, interest: Interest, worker: Arc<WorkerS
 where
     S: Source + Send + 'static,
 {
-    let token = worker.allocate_token()?;
+    let token = worker
+        .allocate_token()
+        .inspect_err(|error| worker.report_source_failure(SourceOperation::Registration, error))?;
     let entry = Arc::new(RegistrationEntry::default());
-    worker.begin_registration(token, Arc::clone(&entry))?;
+    worker
+        .begin_registration(token, Arc::clone(&entry))
+        .inspect_err(|error| worker.report_source_failure(SourceOperation::Registration, error))?;
     let operation = RegistryOperation(&worker);
     if let Err(error) = worker.registry().register(&mut source, token, interest) {
         worker.finish_registration(token, &entry, false);
         entry.close();
+        worker.report_source_failure(SourceOperation::Registration, &error);
         return Err(error);
     }
     if !worker.finish_registration(token, &entry, true) {
         if let Err(error) = worker.registry().deregister(&mut source) {
+            worker.report_source_failure(SourceOperation::Deregistration, &error);
             worker.record_failure(error);
         }
-        return Err(io::Error::new(
+        let error = io::Error::new(
             io::ErrorKind::BrokenPipe,
             "the Arty Mio driver closed while it registered the source",
-        ));
+        );
+        worker.report_source_failure(SourceOperation::Registration, &error);
+        return Err(error);
     }
     drop(operation);
     Ok(Registered::new(source, worker, token, entry))
@@ -372,6 +382,7 @@ mod tests {
             std::thread::current().id(),
             poll.registry().try_clone().unwrap(),
             Waker::noop().clone(),
+            observed::Sink::noop(),
         ));
         let registration_worker = Arc::clone(&worker);
         let registration_thread = std::thread::spawn(move || {

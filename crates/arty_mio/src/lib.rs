@@ -72,4 +72,5 @@ mod driver;
 mod error;
 mod options;
 mod registration;
+mod telemetry;
 mod worker;

@@ -12,6 +12,7 @@ use thread_aware_core::{Thread, ThreadAware};
 use crate::driver::MioDriver;
 use crate::options::MioOptions;
 use crate::registration::{Registered, register};
+use crate::telemetry;
 use crate::worker::{ContextState, WorkerState};
 
 /// A thread-aware route to a worker-local Mio driver.
@@ -65,10 +66,12 @@ impl MioContext {
             .or_else(|| self.state.worker(current))
             .or_else(|| self.worker.clone())
             .ok_or_else(|| {
-                io::Error::new(
+                let error = io::Error::new(
                     io::ErrorKind::NotConnected,
                     "the Arty Mio context is not attached to a worker driver",
-                )
+                );
+                self.state.report_attachment_failure(&error);
+                error
             })
     }
 }
@@ -86,15 +89,19 @@ impl IoContext for MioContext {
     type ContextOptions = MioOptions;
     type Driver = MioDriver;
 
-    fn context(_options: Self::ContextOptions) -> Self {
+    fn context(options: Self::ContextOptions) -> Self {
         Self {
-            state: Arc::new(ContextState::default()),
+            state: Arc::new(ContextState::new(options.into_sink())),
             worker: None,
         }
     }
 
     fn driver(&mut self, options: DriverOptions) -> Result<Self::Driver, DriverError> {
-        let (driver, worker) = MioDriver::new(Arc::clone(&self.state), &options)?;
+        let role = options.role();
+        let thread_id = options.thread().id();
+        let (driver, worker) = MioDriver::new(Arc::clone(&self.state), &options).inspect_err(|error| {
+            telemetry::report_driver_failed(self.state.sink(), role, thread_id, telemetry::DriverOperation::Creation, error);
+        })?;
         self.worker = Some(worker);
         Ok(driver)
     }

@@ -7,6 +7,7 @@ use std::task::{Wake, Waker};
 use std::time::Duration;
 
 use mio::{Events, Poll, Token};
+use observed::Sink;
 use performables::arc::Arc;
 
 use super::primary::PrimaryDriver;
@@ -17,7 +18,12 @@ use crate::worker::WorkerState;
 #[test]
 fn secondary_background_failure_becomes_driver_error() {
     let (mut driver, poll_waker, registry) = SecondaryDriver::new().unwrap();
-    let worker = Arc::new(WorkerState::new(std::thread::current().id(), registry, Waker::noop().clone()));
+    let worker = Arc::new(WorkerState::new(
+        std::thread::current().id(),
+        registry,
+        Waker::noop().clone(),
+        Sink::noop(),
+    ));
     driver.attach(Arc::clone(&worker));
     driver.shared.fail(std::io::Error::other("scripted poll failure"));
 
@@ -37,6 +43,7 @@ fn primary_full_capacity_batch_yields_after_each_budget() {
         std::thread::current().id(),
         poll.registry().try_clone().unwrap(),
         Waker::from(StdArc::clone(&owner)),
+        Sink::noop(),
     ));
     let mut driver = PrimaryDriver::new(poll);
     driver.pending.extend(std::iter::repeat_n(wake_event(), EVENT_CAPACITY));

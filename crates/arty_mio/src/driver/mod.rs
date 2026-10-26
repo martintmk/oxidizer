@@ -13,6 +13,7 @@ use performables::arc::Arc;
 use self::poll_wake::PollWake;
 use self::primary::PrimaryDriver;
 use self::secondary::SecondaryDriver;
+use crate::telemetry::{self, DriverOperation, DriverOutcome};
 use crate::worker::{ContextState, WorkerState};
 
 mod poll_wake;
@@ -64,7 +65,14 @@ impl MioDriver {
             }
         };
 
-        let worker = Arc::new(WorkerState::new(options.thread().id(), registry, options.owner_waker().clone()));
+        let role = options.role();
+        let thread_id = options.thread().id();
+        let worker = Arc::new(WorkerState::new(
+            thread_id,
+            registry,
+            options.owner_waker().clone(),
+            state.sink().clone(),
+        ));
         if let DriverMode::Secondary(driver) = &mode {
             driver.attach(Arc::clone(&worker));
         }
@@ -79,12 +87,16 @@ impl MioDriver {
             return Err(DriverError::from_source(error));
         }
 
+        telemetry::report_driver_started(state.sink(), role, thread_id);
         let driver = Self {
             inner: Some(DriverInner {
                 context: state,
                 worker: Arc::clone(&worker),
                 poll_waker,
                 mode,
+                role,
+                thread_id,
+                failure_reported: false,
             }),
         };
         Ok((driver, worker))
@@ -133,23 +145,42 @@ struct DriverInner {
     worker: Arc<WorkerState>,
     poll_waker: StdArc<PollWake>,
     mode: DriverMode,
+    role: DriverRole,
+    thread_id: thread::ThreadId,
+    failure_reported: bool,
 }
 
 impl DriverInner {
     fn execute_cycle(&mut self, cycle: &Cycle) -> Result<(), DriverError> {
-        match &mut self.mode {
+        let result = match &mut self.mode {
             DriverMode::Primary(driver) => driver.execute_cycle(&self.worker, cycle.max_wait()),
             DriverMode::Secondary(driver) => driver.execute_cycle(&self.worker),
+        };
+        if let Err(error) = &result
+            && !self.failure_reported
+        {
+            telemetry::report_driver_failed(self.worker.sink(), self.role, self.thread_id, DriverOperation::Cycle, error);
+            self.failure_reported = true;
         }
+        result
     }
 
     fn shutdown(self) -> Result<(), DriverError> {
-        self.context.remove(&self.worker);
-        self.worker.close_registrations();
-        match self.mode {
+        let Self {
+            context,
+            worker,
+            poll_waker,
+            mode,
+            role,
+            thread_id,
+            failure_reported,
+        } = self;
+        context.remove(&worker);
+        worker.close_registrations();
+        let result = match mode {
             DriverMode::Primary(driver) => {
-                let control_error = self.worker.take_failure().map(DriverError::from_source);
-                self.poll_waker.deactivate();
+                let control_error = worker.take_failure().map(DriverError::from_source);
+                poll_waker.deactivate();
                 drop(driver);
                 match control_error {
                     Some(error) => Err(error),
@@ -157,11 +188,23 @@ impl DriverInner {
                 }
             }
             DriverMode::Secondary(driver) => {
-                let result = driver.shutdown(&self.poll_waker, &self.worker);
-                self.poll_waker.deactivate();
+                let result = driver.shutdown(&poll_waker, &worker);
+                poll_waker.deactivate();
                 result
             }
+        };
+        if let Err(error) = &result
+            && !failure_reported
+        {
+            telemetry::report_driver_failed(worker.sink(), role, thread_id, DriverOperation::Shutdown, error);
         }
+        let outcome = if result.is_ok() {
+            DriverOutcome::Succeeded
+        } else {
+            DriverOutcome::Failed
+        };
+        telemetry::report_driver_stopped(worker.sink(), role, thread_id, outcome);
+        result
     }
 }
 

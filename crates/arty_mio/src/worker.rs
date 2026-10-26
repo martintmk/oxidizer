@@ -3,26 +3,51 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Waker;
 use std::thread::ThreadId;
 
 use mio::event::Event;
 use mio::{Registry, Token};
+use observed::Sink;
 use performables::arc::Arc;
 use performables::sync::condition::Condvar;
 use performables::sync::mutex::Mutex;
 
 use crate::registration::RegistrationEntry;
+use crate::telemetry::{self, SourceOperation};
 
 pub(crate) const DRIVER_WAKE_TOKEN: Token = Token(usize::MAX);
 
-#[derive(Default)]
 pub(crate) struct ContextState {
     workers: Mutex<HashMap<ThreadId, Arc<WorkerState>>>,
+    sink: Sink,
+    attachment_failure_reported: AtomicBool,
 }
 
 impl ContextState {
+    pub(crate) fn new(sink: Sink) -> Self {
+        Self {
+            workers: Mutex::new(HashMap::new()),
+            sink,
+            attachment_failure_reported: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) const fn sink(&self) -> &Sink {
+        &self.sink
+    }
+
+    pub(crate) fn report_attachment_failure(&self, error: &io::Error) {
+        if self
+            .attachment_failure_reported
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            telemetry::report_context_attachment_failed(&self.sink, error);
+        }
+    }
+
     pub(crate) fn worker(&self, thread_id: ThreadId) -> Option<Arc<WorkerState>> {
         self.workers.lock().get(&thread_id).cloned()
     }
@@ -59,6 +84,9 @@ pub(crate) struct WorkerState {
     registrations: Mutex<Registrations>,
     registrations_idle: Condvar,
     failure: Mutex<Option<io::Error>>,
+    sink: Sink,
+    registration_failure_reported: AtomicBool,
+    deregistration_failure_reported: AtomicBool,
 }
 
 #[derive(Default)]
@@ -69,7 +97,7 @@ struct Registrations {
 }
 
 impl WorkerState {
-    pub(crate) fn new(thread_id: ThreadId, registry: Registry, owner_waker: Waker) -> Self {
+    pub(crate) fn new(thread_id: ThreadId, registry: Registry, owner_waker: Waker, sink: Sink) -> Self {
         Self {
             thread_id,
             owner_waker,
@@ -78,11 +106,18 @@ impl WorkerState {
             registrations: Mutex::new(Registrations::default()),
             registrations_idle: Condvar::new(),
             failure: Mutex::new(None),
+            sink,
+            registration_failure_reported: AtomicBool::new(false),
+            deregistration_failure_reported: AtomicBool::new(false),
         }
     }
 
     pub(crate) const fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    pub(crate) const fn sink(&self) -> &Sink {
+        &self.sink
     }
 
     pub(crate) fn allocate_token(&self) -> io::Result<Token> {
@@ -182,6 +217,16 @@ impl WorkerState {
     pub(crate) fn take_failure(&self) -> Option<io::Error> {
         self.failure.lock().take()
     }
+
+    pub(crate) fn report_source_failure(&self, operation: SourceOperation, error: &io::Error) {
+        let reported = match operation {
+            SourceOperation::Registration => &self.registration_failure_reported,
+            SourceOperation::Deregistration => &self.deregistration_failure_reported,
+        };
+        if reported.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            telemetry::report_source_operation_failed(&self.sink, operation, error);
+        }
+    }
 }
 
 fn closed_error() -> io::Error {
@@ -195,6 +240,7 @@ mod tests {
     use std::task::Waker;
 
     use mio::{Poll, Token};
+    use observed::Sink;
 
     use super::WorkerState;
 
@@ -205,6 +251,7 @@ mod tests {
             std::thread::current().id(),
             poll.registry().try_clone().unwrap(),
             Waker::noop().clone(),
+            Sink::noop(),
         );
         worker.next_token.store(usize::MAX - 2, Ordering::Relaxed);
 
