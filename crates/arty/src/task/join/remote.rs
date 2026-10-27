@@ -175,12 +175,8 @@ where
         let this = self.get_mut();
         assert_not_current_blocking_pool(this.blocking_pool.as_ref());
         let shutdown_cause = this.shutdown.cause();
-        let blocking = this.blocking_pool.is_some();
         let mut result = match &mut this.state {
             State::Pending(inner) => match Pin::new(inner).poll(cx) {
-                Poll::Ready(Ok(_)) if shutdown_cause.is_some() && !blocking => {
-                    Poll::Ready(Err(JoinError::shutdown(shutdown_cause.and_then(ShutdownCause::into_error))))
-                }
                 Poll::Ready(Ok(result)) => Poll::Ready(Ok(result)),
                 Poll::Ready(Err(ReceiveError::Panicked(panic))) => {
                     if this.panic_starts_shutdown {
@@ -189,9 +185,6 @@ where
                     Poll::Ready(Err(JoinError::panicked(panic)))
                 }
                 Poll::Ready(Err(ReceiveError::Disconnected)) => {
-                    Poll::Ready(Err(JoinError::shutdown(shutdown_cause.and_then(ShutdownCause::into_error))))
-                }
-                Poll::Pending if shutdown_cause.is_some() && !blocking => {
                     Poll::Ready(Err(JoinError::shutdown(shutdown_cause.and_then(ShutdownCause::into_error))))
                 }
                 Poll::Pending => Poll::Pending,

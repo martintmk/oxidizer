@@ -33,7 +33,6 @@ impl TaskSet {
     {
         self.shared.add_task(future, options, completion);
     }
-
 }
 
 #[cfg(test)]

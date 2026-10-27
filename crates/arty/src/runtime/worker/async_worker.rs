@@ -321,6 +321,7 @@ impl Drop for AsyncWorker {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))] // Test scaffolding is not runtime behavior.
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     #[cfg(not(miri))]
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -330,7 +331,7 @@ mod tests {
     use std::task::Waker;
     use std::thread;
 
-    use arty_executor::{JoinHandle as ExecutorJoinHandle, ShutdownCause, TaskOptions};
+    use arty_executor::{ShutdownCause, TaskCompletion, TaskOptions, TaskPanicPayload, discard_task_panic_payload};
     use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, IoContext};
     #[cfg(not(miri))]
     use events_once::BoxedSender;
@@ -587,20 +588,37 @@ mod tests {
     }
 
     trait TestTaskSetExt {
-        fn add_test<F, R>(&self, future: F) -> ExecutorJoinHandle<R>
+        fn add_test<F, R>(&self, future: F)
         where
             F: IntoFuture<Output = R> + 'static,
             R: 'static;
     }
 
     impl TestTaskSetExt for TaskSet {
-        fn add_test<F, R>(&self, future: F) -> ExecutorJoinHandle<R>
+        fn add_test<F, R>(&self, future: F)
         where
             F: IntoFuture<Output = R> + 'static,
             R: 'static,
         {
-            self.add(future, TaskOptions::default())
+            self.add(future, TaskOptions::default(), DiscardCompletion);
         }
+    }
+
+    #[derive(Debug)]
+    struct DiscardCompletion;
+
+    impl<R: 'static> TaskCompletion<R> for DiscardCompletion {
+        fn completed(self, result: R) {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(result))) {
+                discard_task_panic_payload(panic);
+            }
+        }
+
+        fn panicked(self, panic: TaskPanicPayload) {
+            discard_task_panic_payload(panic);
+        }
+
+        fn cancelled(self, _cause: ShutdownCause) {}
     }
 
     fn enqueue(factory: RemoteFutureFactory) -> AsyncWorkerCommand {
@@ -749,15 +767,15 @@ mod tests {
                 control.clone().into(),
                 Arc::clone(&signal),
             );
-            drop(worker.tasks.add_test(async move {
+            worker.tasks.add_test(async move {
                 task_ready.await.unwrap();
                 task_observer.store(true, Ordering::Relaxed);
-            }));
+            });
             let clock = worker.builtins.as_ref().unwrap().clock().clone();
-            drop(worker.tasks.add_test(async move {
+            worker.tasks.add_test(async move {
                 clock.delay(Duration::from_secs(1)).await;
                 timer_observer.store(true, Ordering::Relaxed);
-            }));
+            });
             let mut scenario = Self {
                 command_tx,
                 ready_task: Some(ready_task),
@@ -929,16 +947,16 @@ mod tests {
             control.clone().into(),
             Arc::new(WorkerSignal::default()),
         );
-        drop(worker.tasks.add_test(async move {
+        worker.tasks.add_test(async move {
             progress.await.unwrap();
             task_observer.store(true, Ordering::Relaxed);
-        }));
+        });
         let clock = worker.builtins.as_ref().unwrap().clock().clone();
-        drop(worker.tasks.add_test(async move {
+        worker.tasks.add_test(async move {
             clock.delay(Duration::from_secs(1)).await;
             timer_observer.store(true, Ordering::Relaxed);
             shutdown.send(AsyncWorkerCommand::Shutdown).unwrap();
-        }));
+        });
         _ = worker.executor.as_mut().unwrap().execute_cycle();
         assert!(!task_done.load(Ordering::Relaxed));
         assert!(!timer_done.load(Ordering::Relaxed));
@@ -1084,13 +1102,13 @@ mod tests {
             command_tx
                 .send(enqueue(RemoteFutureFactory::new({
                     move |_: Builtins, tasks: &TaskSet| {
-                        drop(tasks.add_test(async move {
+                        tasks.add_test(async move {
                             inner_completed_tx.send(());
-                        }));
-                        drop(tasks.add_test(async move {
+                        });
+                        tasks.add_test(async move {
                             inner_completed_rx.await.unwrap();
                             outer_completed_tx.send(());
-                        }));
+                        });
                     }
                 })))
                 .unwrap();
@@ -1128,7 +1146,7 @@ mod tests {
                     InactiveClock::default(),
                     worker_signal,
                 );
-                drop(worker.tasks.add_test(async move { initial_completed_tx.send(()) }));
+                worker.tasks.add_test(async move { initial_completed_tx.send(()) });
 
                 worker.run();
             });
@@ -1136,9 +1154,9 @@ mod tests {
             command_tx
                 .send(enqueue(RemoteFutureFactory::new({
                     move |_: Builtins, tasks: &TaskSet| {
-                        drop(tasks.add_test(async move {
+                        tasks.add_test(async move {
                             spawned_completed_tx.send(());
-                        }));
+                        });
                     }
                 })))
                 .unwrap();
@@ -1190,9 +1208,9 @@ mod tests {
         // We ignore the result because the worker is shutting down and the channel might be closed already.
         let _ = command_tx.send(enqueue(RemoteFutureFactory::new({
             move |_: Builtins, tasks: &TaskSet| {
-                drop(tasks.add_test(async move {
+                tasks.add_test(async move {
                     completed_tx.send(14);
-                }));
+                });
             }
         })));
 
@@ -1219,9 +1237,9 @@ mod tests {
 
         command_tx
             .send(enqueue(RemoteFutureFactory::new(move |_, tasks| {
-                drop(tasks.add_test(async move {
+                tasks.add_test(async move {
                     invoked_by_task.store(true, Ordering::Relaxed);
-                }));
+                });
             })))
             .unwrap();
         command_tx.send(AsyncWorkerCommand::Shutdown).unwrap();
@@ -1307,9 +1325,9 @@ mod tests {
                     if index + 1 == COMMANDS_PER_CYCLE {
                         shutdown.begin(ShutdownCause::default());
                     }
-                    drop(tasks.add_test(async move {
+                    tasks.add_test(async move {
                         invoked.fetch_add(1, Ordering::Relaxed);
-                    }));
+                    });
                 })))
                 .unwrap();
         }

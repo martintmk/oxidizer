@@ -276,8 +276,8 @@ where
                     self.options.report_panicked(&self.sink, self.poll_count.get());
                 }
                 result_target.cancelled(cause);
-                for panic in [future_panic].into_iter().flatten() {
-                    on_unhandled_task_panic(panic);
+                if let Some(panic) = future_panic {
+                    discard_task_panic_payload(panic);
                 }
             }
         }

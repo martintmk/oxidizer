@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_preparation_reports_shutdown() {
+    fn discarded_preparation_reports_the_shutdown_cause() {
         let result_pool = RemotePool::new();
         let shutdown = Shutdown::default();
         shutdown.begin(arty_executor::ShutdownError::new(std::io::Error::other("blocking shutdown")).into());
@@ -422,7 +422,7 @@ mod tests {
             panic!("discarded work must report shutdown");
         };
         assert!(error.is_shutdown());
-        assert!(error.source().is_none());
+        assert!(error.source().is_some());
     }
 
     #[test]
@@ -442,7 +442,7 @@ mod tests {
 
         let error = block_on(handle).unwrap_err();
         assert!(error.is_shutdown());
-        assert!(error.source().is_none());
+        assert!(error.source().is_some());
     }
 
     #[test]
