@@ -410,6 +410,7 @@ mod tests {
     fn check_borrowed_future_completion(panics: bool) {
         let runtime = Runtime::builder()
             .workers(crate::runtime::WorkersPolicy::exactly(1))
+            .panic(crate::runtime::PanicPolicy::ignore())
             .build()
             .unwrap();
         let worker = runtime.scheduler().block_on(async |_| thread::current().id()).unwrap();

@@ -293,8 +293,8 @@ impl AsyncWorker {
         self.shutdown.begin(cause.clone());
 
         // Safe executor shutdown synchronously cancels and releases all remaining task storage.
-        if let Some(mut executor) = self.executor.take() {
-            executor.begin_shutdown(cause);
+        if let Some(executor) = self.executor.take() {
+            executor.shutdown().trigger(cause);
             drop(executor);
         }
         let driver_host = RuntimeDriverHost::uninstall();
@@ -1342,7 +1342,7 @@ mod tests {
         );
         WorkerSignal::waker(&signal).wake_by_ref();
         assert!(worker.execute_step().is_continue());
-        worker.executor.as_mut().unwrap().begin_shutdown(ShutdownCause::default());
+        worker.executor.as_ref().unwrap().shutdown().trigger(ShutdownCause::default());
 
         let outcome = worker.execute_step();
 

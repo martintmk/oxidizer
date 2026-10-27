@@ -69,7 +69,7 @@ impl JoinError {
     ///
     /// ```
     /// # #[cfg(all(feature = "macros", feature = "rt"))]
-    /// # #[arty::main]
+    /// # #[arty::main(panic = ignore)]
     /// # async fn main(cx: arty::task::Builtins) -> Result<(), arty::task::JoinError> {
     /// let result: Result<(), arty::task::JoinError> =
     ///     cx.scheduler().spawn(async |_| panic!("task failed")).await;

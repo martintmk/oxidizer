@@ -241,7 +241,7 @@ impl IntoFuture for ShutdownDuringRemoteConversion {
     type IntoFuture = Ready<usize>;
 
     fn into_future(self) -> Self::IntoFuture {
-        self.0.begin_shutdown(ShutdownCause::default());
+        self.0.shutdown().trigger(ShutdownCause::default());
         ready(42)
     }
 }
@@ -271,7 +271,7 @@ fn retained_handle_reports_shutdown_without_delaying_shutdown() {
     let mut executor = Executor::builder().build();
     let mut handle = executor.tasks().add(pending::<()>(), TaskOptions::default());
 
-    executor.begin_shutdown(ShutdownCause::default());
+    executor.shutdown().trigger(ShutdownCause::default());
 
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     assert!(!executor.has_tasks());
@@ -286,8 +286,9 @@ fn caused_shutdown_is_attached_to_cancelled_and_rejected_tasks() {
     let mut pending = tasks.add(pending::<()>(), TaskOptions::default());
     let (cause, expected) = shutdown_cause("executor failed");
 
-    executor.begin_shutdown(cause);
+    executor.shutdown().trigger(cause);
     let mut rejected = tasks.add(async {}, TaskOptions::default());
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
 
     for error in [poll_error(&mut pending), poll_error(&mut rejected)] {
         let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
@@ -303,9 +304,10 @@ fn remote_task_cancellation_carries_the_shutdown_cause() {
     tasks.add_with_remote_result(pending::<usize>(), TaskOptions::default(), result_tx);
     let (cause, expected) = shutdown_cause("remote executor failed");
 
-    executor.begin_shutdown(cause);
+    executor.shutdown().trigger(cause);
     let (rejected_tx, rejected_join) = RemotePool::new().channel::<usize>();
     tasks.add_with_remote_result(async { 42 }, TaskOptions::default(), rejected_tx);
+    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
 
     for mut join in [remote_join, rejected_join] {
         let error = ready_error(Pin::new(&mut join).poll(&mut Context::from_waker(Waker::noop())));
@@ -316,23 +318,23 @@ fn remote_task_cancellation_carries_the_shutdown_cause() {
 
 #[test]
 fn clean_shutdown_remains_authoritative_for_rejected_tasks() {
-    let mut executor = Executor::builder().build();
+    let executor = Executor::builder().build();
     let tasks = executor.tasks();
     let cause = shutdown_cause("later failure").0;
 
-    executor.begin_shutdown(ShutdownCause::default());
+    executor.shutdown().trigger(ShutdownCause::default());
     let mut rejected = tasks.add(async {}, TaskOptions::default());
-    executor.begin_shutdown(cause);
+    executor.shutdown().trigger(cause);
 
     assert!(poll_error(&mut rejected).source().is_none());
 }
 
 #[test]
 fn retained_task_set_preserves_the_shutdown_cause_after_executor_drop() {
-    let mut executor = Executor::builder().build();
+    let executor = Executor::builder().build();
     let tasks = executor.tasks();
     let (cause, expected) = shutdown_cause("owner failed");
-    executor.begin_shutdown(cause);
+    executor.shutdown().trigger(cause);
     drop(executor);
 
     let mut local = tasks.add(async {}, TaskOptions::default());
@@ -364,7 +366,7 @@ fn task_set_shutdown_cancels_tasks_without_executor_drop() {
     let tasks = executor.tasks();
     let mut handle = tasks.add(pending::<()>(), TaskOptions::default());
 
-    tasks.begin_shutdown(ShutdownCause::default());
+    tasks.shutdown().trigger(ShutdownCause::default());
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     assert!(!executor.has_tasks());
     drop(executor);
@@ -415,9 +417,9 @@ impl IntoFuture for IntoFutureProbe {
 
 #[test]
 fn rejected_submission_does_not_convert_the_future() {
-    let mut executor = Executor::builder().build();
+    let executor = Executor::builder().build();
     let tasks = executor.tasks();
-    executor.begin_shutdown(ShutdownCause::default());
+    executor.shutdown().trigger(ShutdownCause::default());
     let converted = Arc::new(AtomicBool::new(false));
 
     let mut handle = tasks.add(IntoFutureProbe(Arc::clone(&converted)), TaskOptions::default());
@@ -473,9 +475,9 @@ fn disconnected_remote_submission_contains_panicking_join_notification() {
 
 #[test]
 fn submission_during_shutdown_returns_shutdown_error() {
-    let mut executor = Executor::builder().build();
+    let executor = Executor::builder().build();
     let tasks = executor.tasks();
-    executor.begin_shutdown(ShutdownCause::default());
+    executor.shutdown().trigger(ShutdownCause::default());
 
     let mut handle = tasks.add(async { 42 }, TaskOptions::default());
 
@@ -625,7 +627,7 @@ impl IntoFuture for ShutdownDuringIntoFuture {
     type IntoFuture = std::future::Ready<usize>;
 
     fn into_future(self) -> Self::IntoFuture {
-        self.tasks.begin_shutdown(ShutdownCause::default());
+        self.tasks.shutdown().trigger(ShutdownCause::default());
         std::future::ready(42)
     }
 }
@@ -674,7 +676,7 @@ fn cancelled_future_drop_can_submit_and_receive_shutdown_error() {
     );
     assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
 
-    executor.begin_shutdown(ShutdownCause::default());
+    executor.shutdown().trigger(ShutdownCause::default());
 
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     let mut submitted_handle = submitted.borrow_mut().take().expect("future destructor submitted a task");
@@ -706,7 +708,7 @@ fn shutdown_retires_a_batch_of_queued_tasks() {
         waker.wake_by_ref();
     }
 
-    executor.begin_shutdown(ShutdownCause::default());
+    executor.shutdown().trigger(ShutdownCause::default());
 
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     for mut handle in handles {

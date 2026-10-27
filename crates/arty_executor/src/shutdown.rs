@@ -1,10 +1,86 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt::{self, Debug};
+use std::marker::PhantomData;
+use std::sync::{Arc, OnceLock};
+use std::task::Waker;
 
 use ohno::OhnoCore;
+
+/// A handle that requests executor shutdown.
+///
+/// Clones share the first shutdown cause. The handle can move to another
+/// thread, but it cannot be shared between threads. Clone it before sending it
+/// to each thread that can request shutdown.
+#[derive(Clone)]
+pub struct Shutdown {
+    state: ShutdownState,
+    owner_waker: Waker,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ShutdownState(Arc<OnceLock<ShutdownCause>>);
+
+impl Shutdown {
+    pub(crate) fn new(owner_waker: Waker) -> Self {
+        Self {
+            state: ShutdownState(Arc::new(OnceLock::new())),
+            owner_waker,
+            not_sync: PhantomData,
+        }
+    }
+
+    /// Requests executor shutdown with `cause`.
+    ///
+    /// The first cause remains authoritative. Later requests do not replace it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the executor owner waker panics.
+    pub fn trigger(&self, cause: ShutdownCause) {
+        if self.state.trigger(cause) {
+            self.owner_waker.wake_by_ref();
+        }
+    }
+
+    pub(crate) fn is_triggered(&self) -> bool {
+        self.state.is_triggered()
+    }
+
+    pub(crate) fn cause(&self) -> ShutdownCause {
+        self.state.cause()
+    }
+
+    pub(crate) fn state(&self) -> ShutdownState {
+        self.state.clone()
+    }
+}
+
+impl Debug for Shutdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shutdown")
+            .field("triggered", &self.is_triggered())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShutdownState {
+    pub(crate) fn trigger(&self, cause: ShutdownCause) -> bool {
+        self.0.set(cause).is_ok()
+    }
+
+    pub(crate) fn is_triggered(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    pub(crate) fn cause(&self) -> ShutdownCause {
+        self.0.get().cloned().unwrap_or_default()
+    }
+}
 
 /// A cloneable error that caused executor shutdown.
 ///
@@ -128,10 +204,13 @@ mod tests {
     use std::error::Error;
     use std::fmt::{self, Debug, Display};
     use std::panic::{RefUnwindSafe, UnwindSafe};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Waker;
 
-    use static_assertions::assert_impl_all;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
 
-    use super::{ShutdownCause, ShutdownError};
+    use super::{Shutdown, ShutdownCause, ShutdownError};
 
     #[derive(Debug)]
     struct SourceError;
@@ -143,6 +222,37 @@ mod tests {
     }
 
     impl Error for SourceError {}
+
+    struct WakeCount(AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn shutdown_handle_is_cloneable_and_send_only() {
+        assert_impl_all!(Shutdown: Clone, Debug, Send);
+        assert_not_impl_any!(Shutdown: Sync);
+    }
+
+    #[test]
+    fn first_trigger_publishes_the_cause_and_wakes_the_owner_once() {
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let shutdown = Shutdown::new(Waker::from(Arc::clone(&wake_count)));
+        let expected = ShutdownError::new(SourceError);
+
+        shutdown.trigger(expected.clone().into());
+        shutdown.trigger(ShutdownCause::default());
+
+        let actual = shutdown.cause().into_error().unwrap();
+        assert!(std::ptr::eq(
+            actual.inner().downcast_ref::<SourceError>().unwrap(),
+            expected.inner().downcast_ref::<SourceError>().unwrap()
+        ));
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn default_cause_has_no_error() {

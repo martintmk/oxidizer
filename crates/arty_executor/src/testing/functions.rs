@@ -17,7 +17,7 @@ pub(crate) fn new_test_task_handle() -> crate::TaskHandle {
 #[cfg_attr(test, mutants::skip)] // This is test scaffolding, mutation here is unhelpful.
 pub(crate) fn new_guarded_executor(owner_waker: Waker) -> ScopeGuard<Executor, fn(Executor), Always> {
     scopeguard::guard(Executor::builder().owner_waker(owner_waker).build(), |mut executor: Executor| {
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
 
         for _ in 0..16 {
             if executor.execute_cycle() == CycleOutcome::Shutdown {

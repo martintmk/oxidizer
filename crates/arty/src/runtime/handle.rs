@@ -226,7 +226,6 @@ mod tests {
     use std::thread;
 
     use observed::Sink;
-    use performables::arc::Arc;
     use performables::sync::channel;
     use testing_aids::TEST_TIMEOUT;
     use thread_aware::{ThreadBuilder, Unaware};

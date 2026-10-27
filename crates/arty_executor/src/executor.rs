@@ -11,7 +11,7 @@ use nm::{Event, Magnitude, MetricsPusher, Push};
 use observed::Sink;
 use tick::SimpleClock;
 
-use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, ShutdownCause, TaskHandle, TaskList, TaskSet, executor_context};
+use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskSet, executor_context};
 
 /// The async task executor for a single thread.
 ///
@@ -55,7 +55,7 @@ use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, ShutdownCause, TaskHa
 ///
 /// Graceful shutdown lets the owner observe when cancellation is complete:
 ///
-/// 1. Call [`begin_shutdown()`][Self::begin_shutdown] to start the shutdown process.
+/// 1. Call [`shutdown()`][Self::shutdown] and trigger the returned handle.
 /// 2. Keep calling [`execute_cycle()`][Self::execute_cycle] until it returns [`CycleOutcome::Shutdown`].
 /// 3. Drop the executor when convenient.
 ///
@@ -105,6 +105,12 @@ impl Executor {
         TaskSet::new(&self.shared)
     }
 
+    /// Returns a handle that can request executor shutdown.
+    #[must_use]
+    pub fn shutdown(&self) -> Shutdown {
+        self.shared.shutdown()
+    }
+
     /// Returns whether the executor still owns any registered tasks.
     ///
     /// Completed tasks stop counting during the cycle that observes their completion. Join handles
@@ -141,27 +147,6 @@ impl Executor {
         let outcome = self.cycle_outcome();
         self.finish_cycle(cycle_started);
         outcome
-    }
-
-    /// Starts the executor shutdown process.
-    ///
-    /// The next [`execute_cycle()`][1] returns [`CycleOutcome::Shutdown`] after releasing cancelled
-    /// task storage. Retained join handles resolve independently and do not delay shutdown.
-    ///
-    /// This function is not safe to call in a reentrant manner - only the owner may
-    /// call it in an exclusive context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called in a reentrant manner (e.g. from external code called
-    /// from within [`execute_cycle()`][1]).
-    ///
-    /// [1]: Self::execute_cycle
-    #[cfg_attr(test, mutants::skip)] // Mutation can lead to deadlocked executor as it never shuts down.
-    pub fn begin_shutdown(&mut self, cause: ShutdownCause) {
-        let cause = self.shared.begin_shutdown(cause);
-        let aborted_count = self.prepare_task_abort();
-        self.abort_prepared_tasks(aborted_count, true, &cause);
     }
 
     fn start_cycle(&self) -> Instant {
@@ -344,7 +329,7 @@ impl Drop for Executor {
             }
         }
 
-        let cause = self.shared.request_shutdown(ShutdownCause::default());
+        let cause = self.shared.publish_shutdown(ShutdownCause::default());
         let guard = FinishDrop(self);
         let aborted_count = guard.0.prepare_task_abort();
         guard.0.abort_prepared_tasks(aborted_count, false, &cause);
@@ -439,6 +424,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, atomic};
     use std::task::{Context, Poll, Waker};
+    use std::thread;
 
     use static_assertions::assert_not_impl_any;
     use testing_aids::YieldFuture;
@@ -788,8 +774,8 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_drops_futures() {
-        // We verify that the future of a task is dropped when we initiate shutdown. This is
+    fn shutdown_drops_futures_during_the_next_cycle() {
+        // We verify that the future of a task is dropped when the executor applies shutdown. This is
         // important to ensure that any resources held by the future's state machine are released.
 
         struct SetSignalOnDrop(Rc<Cell<bool>>);
@@ -820,30 +806,31 @@ mod tests {
 
         assert!(!drop_signal.get());
 
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
 
-        assert!(drop_signal.get());
+        assert!(!drop_signal.get());
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(drop_signal.get());
     }
 
     #[test]
     fn shutdown_without_tasks_is_immediate() {
         let mut executor = Executor::builder().build();
 
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     }
 
     #[test]
-    fn task_set_shutdown_is_applied_by_the_next_cycle() {
+    fn task_set_shutdown_handle_is_applied_by_the_next_cycle() {
         let mut executor = Executor::builder().build();
         let tasks = executor.tasks();
         let dropped = Rc::new(Cell::new(false));
         let mut handle = tasks.add_test(DropSignalFuture(Rc::clone(&dropped)));
 
-        tasks.begin_shutdown(ShutdownCause::default());
+        tasks.shutdown().trigger(ShutdownCause::default());
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
         assert!(dropped.get());
@@ -857,9 +844,9 @@ mod tests {
     fn shutdown_requested_during_poll_cancels_the_pending_task() {
         let mut executor = Executor::builder().build();
         let tasks = executor.tasks();
-        let shutdown = tasks.clone();
+        let shutdown = executor.shutdown();
         let mut handle = tasks.add_test(poll_fn(move |_| {
-            shutdown.begin_shutdown(ShutdownCause::default());
+            shutdown.trigger(ShutdownCause::default());
             Poll::Pending::<()>
         }));
 
@@ -868,6 +855,18 @@ mod tests {
             Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(crate::JoinError::Shutdown(_)))
         ));
+    }
+
+    #[test]
+    fn shutdown_handle_wakes_the_owner_from_another_thread() {
+        let owner_waker = Arc::new(TestWaker::new());
+        let mut executor = new_guarded_executor(Waker::from(Arc::clone(&owner_waker)));
+        let shutdown = executor.shutdown();
+
+        thread::spawn(move || shutdown.trigger(ShutdownCause::default())).join().unwrap();
+
+        assert!(owner_waker.awakened.load(atomic::Ordering::Relaxed));
+        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     }
 
     #[test]
@@ -889,7 +888,7 @@ mod tests {
         // This task has nothing holding on to its resources, so it can be cleaned up at any time.
         tasks.add_test(TestSubjectFuture::new());
 
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     }
@@ -901,7 +900,7 @@ mod tests {
 
         let mut join_handle = tasks.add_test(TestSubjectFuture::new());
 
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
         let mut cx = Context::from_waker(Waker::noop());
@@ -912,10 +911,10 @@ mod tests {
 
     #[test]
     fn enqueue_after_shutdown_reports_shutdown() {
-        let mut executor = Executor::builder().build();
+        let executor = Executor::builder().build();
         let tasks = executor.tasks();
 
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
 
         let mut handle = tasks.add_test(async { 42 });
         let result = Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop()));
@@ -1137,7 +1136,7 @@ mod tests {
         }));
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
         drop(executor);
 
@@ -1217,7 +1216,7 @@ mod tests {
         assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
         let retained_waiter = retained_waiter.borrow_mut().take().unwrap();
         drop(task);
-        executor.begin_shutdown(ShutdownCause::default());
+        executor.shutdown().trigger(ShutdownCause::default());
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
         drop(executor);
 

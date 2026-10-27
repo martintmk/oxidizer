@@ -4,13 +4,11 @@
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::pin::Pin;
-use std::rc::Rc;
-use std::sync::OnceLock;
 use std::task;
 
 use events_once::{LocalEventLake, PooledLocalReceiver};
 
-use crate::{ShutdownCause, TaskPanicPayload};
+use crate::{ShutdownCause, ShutdownState, TaskPanicPayload};
 
 /// A task failed to return its result.
 ///
@@ -91,18 +89,18 @@ impl Error for JoinError {
 #[derive(Debug)]
 pub struct JoinHandle<R: 'static> {
     rx: PooledLocalReceiver<R>,
-    shutdown_cause: Rc<OnceLock<ShutdownCause>>,
+    shutdown: ShutdownState,
 }
 
 impl<R: 'static> JoinHandle<R> {
-    pub(crate) fn new(rx: PooledLocalReceiver<R>, shutdown_cause: Rc<OnceLock<ShutdownCause>>) -> Self {
-        Self { rx, shutdown_cause }
+    pub(crate) fn new(rx: PooledLocalReceiver<R>, shutdown: ShutdownState) -> Self {
+        Self { rx, shutdown }
     }
 
-    pub(crate) fn disconnected(events: &LocalEventLake, shutdown_cause: Rc<OnceLock<ShutdownCause>>) -> Self {
+    pub(crate) fn disconnected(events: &LocalEventLake, shutdown: ShutdownState) -> Self {
         let (tx, rx) = events.rent();
         drop(tx);
-        Self::new(rx, shutdown_cause)
+        Self::new(rx, shutdown)
     }
 }
 
@@ -111,12 +109,9 @@ impl<R: 'static> Future for JoinHandle<R> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         let this = self.get_mut();
-        Pin::new(&mut this.rx).poll(cx).map(|result| {
-            result.map_err(|_disconnected| {
-                let cause = this.shutdown_cause.get().cloned().unwrap_or_default();
-                JoinError::shutdown(cause)
-            })
-        })
+        Pin::new(&mut this.rx)
+            .poll(cx)
+            .map(|result| result.map_err(|_disconnected| JoinError::shutdown(this.shutdown.cause())))
     }
 }
 

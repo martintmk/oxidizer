@@ -5,7 +5,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem;
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::task::Waker;
 use std::thread::ThreadId;
 
@@ -17,7 +16,7 @@ use plurality::MultiPool;
 use crate::remote::Sender as RemoteSender;
 use crate::wake::RemoteWake;
 use crate::{
-    JoinHandle, ShutdownCause, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_remote_task, allocate_task,
+    JoinHandle, Shutdown, ShutdownCause, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_remote_task, allocate_task,
     discard_task_panic_payload,
 };
 
@@ -33,7 +32,7 @@ struct ExecutorSharedInner {
     task_storage: MultiPool,
     task_count: Cell<usize>,
     join_events: LocalEventLake,
-    shutdown_cause: Rc<OnceLock<ShutdownCause>>,
+    shutdown: Shutdown,
     wake: WakeShared,
     // Owner-only reception breaks the wake queue -> task -> shared wake state ownership cycle.
     remote_wakes: channel::Receiver<RemoteWake>,
@@ -42,6 +41,7 @@ struct ExecutorSharedInner {
 
 impl ExecutorShared {
     pub(crate) fn new(owner_waker: Waker, sink: Sink, thread_id: ThreadId) -> Self {
+        let shutdown = Shutdown::new(owner_waker.clone());
         let (wake, remote_wakes) = WakeShared::new(owner_waker, thread_id);
         Self {
             inner: Rc::new(ExecutorSharedInner {
@@ -49,7 +49,7 @@ impl ExecutorShared {
                 task_storage: MultiPool::new(),
                 task_count: Cell::new(0),
                 join_events: LocalEventLake::new(),
-                shutdown_cause: Rc::new(OnceLock::new()),
+                shutdown,
                 wake,
                 remote_wakes,
                 sink,
@@ -70,11 +70,20 @@ impl ExecutorShared {
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
-        self.inner.shutdown_cause.get().is_some()
+        self.inner.shutdown.is_triggered()
     }
 
     pub(crate) fn shutdown_cause(&self) -> ShutdownCause {
-        self.inner.shutdown_cause.get().cloned().unwrap_or_default()
+        self.inner.shutdown.cause()
+    }
+
+    pub(crate) fn shutdown(&self) -> Shutdown {
+        self.inner.shutdown.clone()
+    }
+
+    pub(crate) fn publish_shutdown(&self, cause: ShutdownCause) -> ShutdownCause {
+        _ = self.inner.shutdown.state().trigger(cause);
+        self.shutdown_cause()
     }
 
     pub(crate) fn accept_new_tasks(&self, active: &mut VecDeque<TaskHandle>) -> usize {
@@ -111,15 +120,6 @@ impl ExecutorShared {
         self.is_shutting_down() && self.inner.task_count.get() == 0
     }
 
-    pub(crate) fn begin_shutdown(&self, cause: ShutdownCause) -> ShutdownCause {
-        _ = self.inner.shutdown_cause.set(cause);
-        self.shutdown_cause()
-    }
-
-    pub(crate) fn request_shutdown(&self, cause: ShutdownCause) -> ShutdownCause {
-        self.begin_shutdown(cause)
-    }
-
     pub(crate) fn add_task<F, R>(&self, future: F, options: TaskOptions) -> JoinHandle<R>
     where
         F: IntoFuture<Output = R> + 'static,
@@ -140,7 +140,7 @@ impl ExecutorShared {
             options,
             self.inner.sink.clone(),
         ));
-        JoinHandle::new(result_rx, Rc::clone(&self.inner.shutdown_cause))
+        JoinHandle::new(result_rx, self.inner.shutdown.state())
     }
 
     pub(crate) fn add_remote_task<F, R>(&self, future: F, options: TaskOptions, remote_result_tx: RemoteSender<R>)
@@ -172,7 +172,7 @@ impl ExecutorShared {
 
     fn rejected_submission<R: 'static>(&self) -> Option<JoinHandle<R>> {
         self.is_shutting_down()
-            .then(|| JoinHandle::disconnected(&self.inner.join_events, Rc::clone(&self.inner.shutdown_cause)))
+            .then(|| JoinHandle::disconnected(&self.inner.join_events, self.inner.shutdown.state()))
     }
 
     fn register_task(&self, task_handle: TaskHandle) {
@@ -211,7 +211,7 @@ mod tests {
         let shared = ExecutorShared::new(Waker::noop().clone(), Sink::noop(), std::thread::current().id());
 
         assert!(!shared.shutdown_complete());
-        shared.request_shutdown(ShutdownCause::default());
+        shared.shutdown().trigger(ShutdownCause::default());
         assert!(shared.shutdown_complete());
     }
 }

@@ -116,7 +116,7 @@ impl Scheduler {
                 return;
             };
             if dispatcher.owns(&current.thread) {
-                current.tasks.begin_shutdown(cause);
+                current.tasks.shutdown().trigger(cause);
             }
         });
     }
