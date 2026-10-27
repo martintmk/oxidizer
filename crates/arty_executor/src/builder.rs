@@ -124,4 +124,15 @@ mod tests {
 
         result.unwrap_err();
     }
+
+    #[test]
+    fn configured_current_thread_builds_the_executor() {
+        let thread = thread_aware_core::__private::v1::new_thread(
+            thread_aware_core::__private::v1::new_owner(),
+            std::thread::current().id(),
+            thread_aware_core::__private::v1::new_numa_node(0),
+        );
+
+        drop(ExecutorBuilder::new().thread(thread).build());
+    }
 }

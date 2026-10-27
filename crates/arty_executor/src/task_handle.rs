@@ -210,3 +210,45 @@ impl std::fmt::Debug for TaskHandle {
         f.debug_tuple("TaskHandle").field(&self.as_ptr()).finish()
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use plurality::MultiPool;
+    use static_assertions::assert_not_impl_any;
+
+    use super::*;
+
+    #[test]
+    fn owner_handle_is_thread_affine() {
+        assert_not_impl_any!(TaskHandle: Send, Sync);
+    }
+
+    #[test]
+    fn raw_ownership_and_diagnostics_preserve_identity() {
+        let pool = MultiPool::new();
+        let handle = crate::allocate_test_task_in(&pool);
+        let pointer = handle.as_ptr();
+        assert_eq!(format!("{handle:?}"), format!("TaskHandle({pointer:?})"));
+        let template = handle.inner.as_ref().get_ref().handle_slot().get().unwrap();
+        assert_eq!(format!("{:?}", **template), "TaskHandleTemplate { .. }");
+
+        let owned = handle.into_raw();
+        assert_eq!(owned, pointer);
+        // SAFETY: `into_raw` transferred exactly one strong reference.
+        drop(unsafe { owned.into_handle() });
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn different_task_pointers_are_not_equal() {
+        let pool = MultiPool::new();
+        let first = crate::allocate_test_task_in(&pool);
+        let second = crate::allocate_test_task_in(&pool);
+
+        assert_ne!(first.as_ptr(), second.as_ptr());
+
+        drop((first, second));
+        assert!(pool.is_empty());
+    }
+}

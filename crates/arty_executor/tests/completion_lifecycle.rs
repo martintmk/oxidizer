@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Public join-handle and executor-lifecycle contracts.
+//! Public task-completion and executor-lifecycle contracts.
+
+mod support;
 
 use std::cell::{Cell, RefCell};
 use std::error::Error as _;
@@ -13,14 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use arty_executor::{
-    CycleOutcome, Executor, JoinError, JoinHandle, Shutdown, ShutdownCause, ShutdownError, TaskOptions, TaskPlacement, TaskSet,
-};
+use arty_executor::{CycleOutcome, Executor, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskOptions, TaskPlacement, TaskSet};
 use observed::Sink;
 use observed::enrichment::{Enrichment, EnrichmentEntry};
 use observed::metadata::EventDescription;
 use observed::processing::{EventProcessor, EventView};
 use observed_testing::{TEST_ID, test_emitter};
+use support::{CompletionHandle, TaskOutcome, TaskSetExt as _};
 
 thread_local! {
     static THREAD_LOCAL_EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
@@ -58,7 +59,7 @@ impl Enrichment for CallerContext {
 struct OwnerDropState {
     owner: Executor,
     tasks: TaskSet,
-    nested: Rc<RefCell<Option<JoinHandle<usize>>>>,
+    nested: Rc<RefCell<Option<CompletionHandle<usize>>>>,
 }
 
 impl EventProcessor for ReentrantSubmissionProcessor {
@@ -70,7 +71,7 @@ impl EventProcessor for ReentrantSubmissionProcessor {
         let Some((tasks, completed)) = REENTRANT_TELEMETRY_SUBMISSION.take() else {
             return;
         };
-        drop(tasks.add(
+        drop(tasks.add_test(
             async move {
                 completed.set(true);
             },
@@ -93,7 +94,7 @@ impl EventProcessor for OwnerDropProcessor {
             return;
         };
         drop(state.owner);
-        let nested = state.tasks.add(async { 42 }, TaskOptions::default());
+        let nested = state.tasks.add_test(async { 42 }, TaskOptions::default());
         assert!(state.nested.replace(Some(nested)).is_none());
     }
 
@@ -102,20 +103,24 @@ impl EventProcessor for OwnerDropProcessor {
     }
 }
 
-fn poll_once<R: 'static>(handle: &mut JoinHandle<R>) -> Poll<Result<R, JoinError>> {
+fn poll_once<R: 'static>(handle: &mut CompletionHandle<R>) -> Poll<TaskOutcome<R>> {
     Pin::new(handle).poll(&mut Context::from_waker(Waker::noop()))
 }
 
-#[expect(clippy::panic, reason = "test helper reports an unexpected pending or successful result")]
-fn ready_error<T, E>(poll: Poll<Result<T, E>>) -> E {
-    let Poll::Ready(Err(error)) = poll else {
-        panic!("join handle must be immediately ready with an error");
+#[expect(clippy::panic, reason = "test helper reports an unexpected completion state")]
+fn poll_completed<R: 'static>(handle: &mut CompletionHandle<R>) -> R {
+    let Poll::Ready(TaskOutcome::Completed(result)) = poll_once(handle) else {
+        panic!("completion target must receive a result");
     };
-    error
+    result
 }
 
-fn poll_error<R: 'static>(handle: &mut JoinHandle<R>) -> JoinError {
-    ready_error(poll_once(handle))
+#[expect(clippy::panic, reason = "test helper reports an unexpected completion state")]
+fn poll_cancelled<R: 'static>(handle: &mut CompletionHandle<R>) -> ShutdownCause {
+    let Poll::Ready(TaskOutcome::Cancelled(cause)) = poll_once(handle) else {
+        panic!("completion target must receive cancellation");
+    };
+    cause
 }
 
 #[derive(Debug)]
@@ -170,7 +175,7 @@ fn failed_construction_preserves_existing_executor_notifications() {
     let mut executor = Executor::builder().build();
     let ready = Rc::new(Cell::new(false));
     let retained = Rc::new(RefCell::new(None));
-    let mut handle = executor.tasks().add(
+    let mut handle = executor.tasks().add_test(
         poll_fn({
             let ready = Rc::clone(&ready);
             let retained = Rc::clone(&retained);
@@ -192,7 +197,7 @@ fn failed_construction_preserves_existing_executor_notifications() {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Executor::builder().build())).unwrap_err();
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-    assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
+    assert_eq!(poll_completed(&mut handle), 42);
 }
 
 #[test]
@@ -205,55 +210,212 @@ fn noop_executor_applies_task_context_and_restores_caller_context() {
 
     let mut executor = Executor::builder().build();
     let task_sink = sink.clone();
-    let mut handle = executor.tasks().add(
+    let mut handle = executor.tasks().add_test(
         async move { enrichment_keys(&task_sink) },
         TaskOptions::observed(task_context, TaskPlacement::Any),
     );
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-    assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(vec![String::from("task.context")])));
+    assert_eq!(poll_completed(&mut handle), [String::from("task.context")]);
     assert_eq!(enrichment_keys(&sink), ["caller.context"]);
 }
 
 #[test]
-fn completed_result_reports_shutdown_if_executor_stops_before_join() {
+fn completed_result_remains_available_after_executor_stops() {
     let mut executor = Executor::builder().build();
-    let mut handle = executor.tasks().add(async { 42 }, TaskOptions::default());
+    let mut handle = executor.tasks().add_test(async { 42 }, TaskOptions::default());
 
     assert!(executor.has_tasks());
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert!(!executor.has_tasks());
     drop(executor);
 
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Completed(42))));
+}
+
+#[test]
+fn task_panic_publishes_the_original_payload_and_keeps_the_executor_usable() {
+    let (sink, processor) = test_emitter(TEST_ID);
+    let mut executor = Executor::builder().sink(sink.clone()).panic_policy(PanicPolicy::ignore()).build();
+    let tasks = executor.tasks();
+    let mut panicked = tasks.add_test(
+        poll_fn(|_| -> Poll<usize> { panic!("task panic") }),
+        TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any),
+    );
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut panicked) else {
+        panic!("panicking task must publish its panic payload");
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"task panic"));
+    assert!(processor.events().iter().any(|event| event.name() == "arty.rt.task.panicked"));
+
+    let mut completed = tasks.add_test(async { 7 }, TaskOptions::default());
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    assert_eq!(poll_completed(&mut completed), 7);
+}
+
+#[test]
+fn self_wake_requests_an_immediate_follow_up_cycle() {
+    let mut executor = Executor::builder().build();
+    let polls = Rc::new(Cell::new(0));
+    let mut completion = executor.tasks().add_test(
+        poll_fn({
+            let polls = Rc::clone(&polls);
+            move |cx| {
+                let poll = polls.get();
+                polls.set(poll + 1);
+                if poll < 2 {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(42)
+                }
+            }
+        }),
+        TaskOptions::default(),
+    );
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    assert_eq!(poll_completed(&mut completion), 42);
+}
+
+#[test]
+fn shutdown_panic_policy_publishes_the_payload_before_shutdown() {
+    let mut executor = Executor::builder().panic_policy(PanicPolicy::shutdown()).build();
+    let mut completion = executor
+        .tasks()
+        .add_test(poll_fn(|_| -> Poll<()> { panic!("shutdown panic") }), TaskOptions::default());
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
+    let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
+        panic!("panicking task must publish its payload before shutdown");
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"shutdown panic"));
+}
+
+struct ReadyDropPanic;
+
+impl Future for ReadyDropPanic {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(42)
+    }
+}
+
+impl Drop for ReadyDropPanic {
+    fn drop(&mut self) {
+        panic!("ready future destructor");
+    }
+}
+
+#[test]
+fn completed_future_destructor_panic_is_published_as_the_task_panic() {
+    let mut executor = Executor::builder().build();
+    let mut completion = executor.tasks().add_test(ReadyDropPanic, TaskOptions::default());
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
+        panic!("completed future destructor panic must be published");
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"ready future destructor"));
+}
+
+struct PollAndDropPanic;
+
+impl Future for PollAndDropPanic {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        panic!("poll panic");
+    }
+}
+
+impl Drop for PollAndDropPanic {
+    fn drop(&mut self) {
+        panic!("secondary destructor panic");
+    }
+}
+
+#[test]
+fn poll_panic_remains_primary_when_future_disposal_also_panics() {
+    let mut executor = Executor::builder().build();
+    let mut completion = executor.tasks().add_test(PollAndDropPanic, TaskOptions::default());
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
+        panic!("poll panic must be published");
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"poll panic"));
+}
+
+struct CancellationDropPanic {
+    dropped: Rc<Cell<bool>>,
+}
+
+impl Future for CancellationDropPanic {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
+}
+
+impl Drop for CancellationDropPanic {
+    fn drop(&mut self) {
+        assert!(!self.dropped.replace(true));
+        panic!("cancellation destructor");
+    }
+}
+
+#[test]
+fn cancellation_destructor_panic_still_publishes_cancellation_and_completes_shutdown() {
+    let mut executor = Executor::builder().build();
+    let dropped = Rc::new(Cell::new(false));
+    let mut completion = executor.tasks().add_test(
+        CancellationDropPanic {
+            dropped: Rc::clone(&dropped),
+        },
+        TaskOptions::default(),
+    );
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+
+    executor.shutdown().trigger(ShutdownCause::default());
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
+    assert!(dropped.get());
+    assert!(matches!(poll_once(&mut completion), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
 fn retained_handle_reports_shutdown_without_delaying_shutdown() {
     let mut executor = Executor::builder().build();
-    let mut handle = executor.tasks().add(pending::<()>(), TaskOptions::default());
+    let mut handle = executor.tasks().add_test(pending::<()>(), TaskOptions::default());
 
     executor.shutdown().trigger(ShutdownCause::default());
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(!executor.has_tasks());
     drop(executor);
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
 fn caused_shutdown_is_attached_to_cancelled_and_rejected_tasks() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
-    let mut pending = tasks.add(pending::<()>(), TaskOptions::default());
+    let mut pending = tasks.add_test(pending::<()>(), TaskOptions::default());
     let (cause, expected) = shutdown_cause("executor failed");
 
     executor.shutdown().trigger(cause);
-    let mut rejected = tasks.add(async {}, TaskOptions::default());
+    let mut rejected = tasks.add_test(async {}, TaskOptions::default());
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 
-    for error in [poll_error(&mut pending), poll_error(&mut rejected)] {
-        let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
+    for cause in [poll_cancelled(&mut pending), poll_cancelled(&mut rejected)] {
+        let source = cause.as_error().unwrap();
         assert_same_shutdown_source(source, &expected);
     }
 }
@@ -265,10 +427,10 @@ fn clean_shutdown_remains_authoritative_for_rejected_tasks() {
     let cause = shutdown_cause("later failure").0;
 
     executor.shutdown().trigger(ShutdownCause::default());
-    let mut rejected = tasks.add(async {}, TaskOptions::default());
+    let mut rejected = tasks.add_test(async {}, TaskOptions::default());
     executor.shutdown().trigger(cause);
 
-    assert!(poll_error(&mut rejected).source().is_none());
+    assert!(poll_cancelled(&mut rejected).as_error().is_none());
 }
 
 #[test]
@@ -279,20 +441,20 @@ fn retained_task_set_preserves_the_shutdown_cause_after_executor_drop() {
     executor.shutdown().trigger(cause);
     drop(executor);
 
-    let mut local = tasks.add(async {}, TaskOptions::default());
-    let error = poll_error(&mut local);
-    let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
+    let mut local = tasks.add_test(async {}, TaskOptions::default());
+    let cause = poll_cancelled(&mut local);
+    let source = cause.as_error().unwrap();
     assert_same_shutdown_source(source, &expected);
 }
 
 #[test]
 fn direct_executor_drop_cancels_tasks_safely() {
     let executor = Executor::builder().build();
-    let mut handle = executor.tasks().add(pending::<()>(), TaskOptions::default());
+    let mut handle = executor.tasks().add_test(pending::<()>(), TaskOptions::default());
 
     drop(executor);
 
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
@@ -300,14 +462,14 @@ fn shutdown_handle_cancels_tasks_without_executor_drop() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
     let shutdown = executor.shutdown();
-    let mut handle = tasks.add(pending::<()>(), TaskOptions::default());
+    let mut handle = tasks.add_test(pending::<()>(), TaskOptions::default());
 
     shutdown.trigger(ShutdownCause::default());
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(!executor.has_tasks());
     drop(executor);
 
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
@@ -334,9 +496,9 @@ fn disconnected_task_set_returns_shutdown_error() {
     let tasks = executor.tasks();
     drop(executor);
 
-    let mut handle = tasks.add(async { 42 }, TaskOptions::default());
+    let mut handle = tasks.add_test(async { 42 }, TaskOptions::default());
 
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 struct IntoFutureProbe(Arc<AtomicBool>);
@@ -358,10 +520,10 @@ fn rejected_submission_does_not_convert_the_future() {
     executor.shutdown().trigger(ShutdownCause::default());
     let converted = Arc::new(AtomicBool::new(false));
 
-    let mut handle = tasks.add(IntoFutureProbe(Arc::clone(&converted)), TaskOptions::default());
+    let mut handle = tasks.add_test(IntoFutureProbe(Arc::clone(&converted)), TaskOptions::default());
 
     assert!(!converted.load(Ordering::Acquire));
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
@@ -370,9 +532,9 @@ fn submission_during_shutdown_returns_shutdown_error() {
     let tasks = executor.tasks();
     executor.shutdown().trigger(ShutdownCause::default());
 
-    let mut handle = tasks.add(async { 42 }, TaskOptions::default());
+    let mut handle = tasks.add_test(async { 42 }, TaskOptions::default());
 
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
@@ -386,7 +548,7 @@ fn task_created_processor_may_submit_a_nested_task() {
     let nested_completed = Rc::new(Cell::new(false));
     REENTRANT_TELEMETRY_SUBMISSION.set(Some((tasks.clone(), Rc::clone(&nested_completed))));
 
-    let _outer = tasks.add(async {}, TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any));
+    let _outer = tasks.add_test(async {}, TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any));
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert!(nested_completed.get());
@@ -396,7 +558,7 @@ fn task_created_processor_may_submit_a_nested_task() {
 fn default_options_emit_lifecycle_events_without_context_enrichment() {
     let (sink, processor) = test_emitter(TEST_ID);
     let mut executor = Executor::builder().sink(sink).build();
-    let _handle = executor.tasks().add(async {}, TaskOptions::default());
+    let _handle = executor.tasks().add_test(async {}, TaskOptions::default());
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
@@ -415,7 +577,7 @@ impl IntoFuture for ReentrantIntoFuture {
     type IntoFuture = std::future::Ready<usize>;
 
     fn into_future(self) -> Self::IntoFuture {
-        self.tasks.add(
+        self.tasks.add_test(
             {
                 let nested_completed = Rc::clone(&self.nested_completed);
                 async move {
@@ -433,7 +595,7 @@ fn into_future_conversion_may_submit_a_nested_task() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
     let nested_completed = Rc::new(Cell::new(false));
-    let mut handle = tasks.add(
+    let mut handle = tasks.add_test(
         ReentrantIntoFuture {
             tasks: tasks.clone(),
             nested_completed: Rc::clone(&nested_completed),
@@ -442,14 +604,14 @@ fn into_future_conversion_may_submit_a_nested_task() {
     );
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-    assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
+    assert_eq!(poll_completed(&mut handle), 42);
     assert!(nested_completed.get());
 }
 
 struct DropOwnerDuringIntoFuture {
     owner: Rc<RefCell<Option<Executor>>>,
     tasks: TaskSet,
-    nested: Rc<RefCell<Option<JoinHandle<usize>>>>,
+    nested: Rc<RefCell<Option<CompletionHandle<usize>>>>,
 }
 
 impl IntoFuture for DropOwnerDuringIntoFuture {
@@ -458,7 +620,7 @@ impl IntoFuture for DropOwnerDuringIntoFuture {
 
     fn into_future(self) -> Self::IntoFuture {
         drop(self.owner.borrow_mut().take());
-        let nested = self.tasks.add(async { 42 }, TaskOptions::default());
+        let nested = self.tasks.add_test(async { 42 }, TaskOptions::default());
         assert!(self.nested.replace(Some(nested)).is_none());
         ready(7)
     }
@@ -468,10 +630,10 @@ impl IntoFuture for DropOwnerDuringIntoFuture {
 fn owner_drop_during_conversion_cancels_tasks_and_rejects_nested_submission() {
     let owner = Rc::new(RefCell::new(Some(Executor::builder().build())));
     let tasks = owner.borrow().as_ref().unwrap().tasks();
-    let mut existing = tasks.add(pending::<()>(), TaskOptions::default());
+    let mut existing = tasks.add_test(pending::<()>(), TaskOptions::default());
     let nested = Rc::new(RefCell::new(None));
 
-    let mut outer = tasks.add(
+    let mut outer = tasks.add_test(
         DropOwnerDuringIntoFuture {
             owner: Rc::clone(&owner),
             tasks: tasks.clone(),
@@ -481,10 +643,10 @@ fn owner_drop_during_conversion_cancels_tasks_and_rejects_nested_submission() {
     );
 
     assert!(owner.borrow().is_none());
-    assert!(matches!(poll_once(&mut existing), Poll::Ready(Err(JoinError::Shutdown(_)))));
-    assert!(matches!(poll_once(&mut outer), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut existing), Poll::Ready(TaskOutcome::Cancelled(_))));
+    assert!(matches!(poll_once(&mut outer), Poll::Ready(TaskOutcome::Cancelled(_))));
     let mut nested = nested.borrow_mut().take().unwrap();
-    assert!(matches!(poll_once(&mut nested), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut nested), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
@@ -502,11 +664,11 @@ fn owner_drop_during_spawn_telemetry_cancels_task_and_rejects_nested_submission(
         nested: Rc::clone(&nested),
     }));
 
-    let mut outer = tasks.add(pending::<()>(), TaskOptions::default());
+    let mut outer = tasks.add_test(pending::<()>(), TaskOptions::default());
 
-    assert!(matches!(poll_once(&mut outer), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut outer), Poll::Ready(TaskOutcome::Cancelled(_))));
     let mut nested = nested.borrow_mut().take().unwrap();
-    assert!(matches!(poll_once(&mut nested), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut nested), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 struct ShutdownDuringIntoFuture {
@@ -527,20 +689,20 @@ impl IntoFuture for ShutdownDuringIntoFuture {
 fn shutdown_during_into_future_conversion_rejects_the_outer_task() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
-    let mut handle = tasks.add(
+    let mut handle = tasks.add_test(
         ShutdownDuringIntoFuture {
             shutdown: executor.shutdown(),
         },
         TaskOptions::default(),
     );
 
-    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 }
 
 struct SubmitOnDrop {
     tasks: TaskSet,
-    submitted: Rc<RefCell<Option<JoinHandle<usize>>>>,
+    submitted: Rc<RefCell<Option<CompletionHandle<usize>>>>,
 }
 
 impl Future for SubmitOnDrop {
@@ -553,7 +715,7 @@ impl Future for SubmitOnDrop {
 
 impl Drop for SubmitOnDrop {
     fn drop(&mut self) {
-        let handle = self.tasks.add(async { 42 }, TaskOptions::default());
+        let handle = self.tasks.add_test(async { 42 }, TaskOptions::default());
         assert!(self.submitted.replace(Some(handle)).is_none());
     }
 }
@@ -563,7 +725,7 @@ fn cancelled_future_drop_can_submit_and_receive_shutdown_error() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
     let submitted = Rc::new(RefCell::new(None));
-    let _outer_handle = tasks.add(
+    let _outer_handle = tasks.add_test(
         SubmitOnDrop {
             tasks: tasks.clone(),
             submitted: Rc::clone(&submitted),
@@ -576,7 +738,7 @@ fn cancelled_future_drop_can_submit_and_receive_shutdown_error() {
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     let mut submitted_handle = submitted.borrow_mut().take().expect("future destructor submitted a task");
-    assert!(matches!(poll_once(&mut submitted_handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+    assert!(matches!(poll_once(&mut submitted_handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
 #[test]
@@ -588,7 +750,7 @@ fn shutdown_retires_a_batch_of_queued_tasks() {
     let wakers = Rc::new(RefCell::new(Vec::new()));
     let mut handles = Vec::new();
     for _ in 0..TASK_COUNT {
-        handles.push(tasks.add(
+        handles.push(tasks.add_test(
             {
                 let wakers = Rc::clone(&wakers);
                 poll_fn(move |cx| {
@@ -608,6 +770,6 @@ fn shutdown_retires_a_batch_of_queued_tasks() {
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     for mut handle in handles {
-        assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
+        assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
     }
 }

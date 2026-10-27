@@ -87,3 +87,39 @@ impl Drop for TaskList {
         while self.pop_front().is_some() {}
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use plurality::MultiPool;
+    use static_assertions::assert_not_impl_any;
+
+    use super::*;
+
+    #[test]
+    fn task_list_is_thread_affine() {
+        assert_not_impl_any!(TaskList: Send, Sync);
+    }
+
+    #[test]
+    fn insertion_removal_and_drop_preserve_ownership() {
+        let pool = MultiPool::new();
+        let first = crate::allocate_test_task_in(&pool);
+        let first_pointer = first.as_ptr();
+        let second = crate::allocate_test_task_in(&pool);
+        let second_pointer = second.as_ptr();
+        let mut list = TaskList::default();
+
+        assert_eq!(list.insert(first), first_pointer);
+        assert_eq!(list.insert(second), second_pointer);
+        assert_eq!(format!("{list:?}"), "TaskList { .. }");
+        // SAFETY: `first_pointer` is live and belongs to `list`.
+        drop(unsafe { list.remove(first_pointer) }.unwrap());
+        assert_eq!(list.pop_front().unwrap().as_ptr(), second_pointer);
+        assert!(list.is_empty());
+
+        _ = list.insert(crate::allocate_test_task_in(&pool));
+        drop(list);
+        assert!(pool.is_empty());
+    }
+}

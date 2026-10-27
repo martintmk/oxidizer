@@ -118,6 +118,34 @@ where
     TaskHandle::new(pool.alloc_arc_pin(Task::new_with_target(future, completion, options, sink)))
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct TestCompletion;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+impl TaskCompletion<()> for TestCompletion {
+    fn completed(self, _result: ()) {}
+
+    fn panicked(self, panic: TaskPanicPayload) {
+        discard_task_panic_payload(panic);
+    }
+
+    fn cancelled(self, _cause: ShutdownCause) {}
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) fn allocate_test_task_in(pool: &MultiPool) -> TaskHandle {
+    allocate_task(
+        pool,
+        std::future::pending::<()>(),
+        TaskOptions::default(),
+        Sink::noop(),
+        TestCompletion,
+    )
+}
+
 impl<F, R, T> TypeErasedTask for Task<F, R, T>
 where
     F: Future<Output = R> + 'static,
@@ -438,4 +466,46 @@ pub(crate) trait TypeErasedTask: Send + Sync {
     ///
     /// Panics if called more than once.
     fn initialize(self: Pin<&Self>, wake_signal: WakeSignal);
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::task::Waker;
+
+    use super::*;
+
+    fn initialized_task(pool: &MultiPool, future: impl Future<Output = ()> + 'static) -> TaskHandle {
+        let handle = allocate_task(pool, future, TaskOptions::default(), Sink::noop(), TestCompletion);
+        let (shared, _remote_wakes) = crate::WakeShared::new(Waker::noop().clone(), std::thread::current().id());
+        let signal = WakeSignal::new(shared, handle.as_ptr());
+        // SAFETY: The handle owns the task on its creating thread.
+        unsafe { handle.as_task() }.initialize(signal);
+        handle
+    }
+
+    #[test]
+    fn abort_is_idempotent_after_the_payload_is_cleared() {
+        let pool = MultiPool::new();
+        let handle = initialized_task(&pool, std::future::pending());
+        // SAFETY: The handle owns the task on its creating thread.
+        let task = unsafe { handle.as_task() };
+
+        task.abort(ShutdownCause::default());
+        task.abort(ShutdownCause::default());
+
+        drop(handle);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn polling_after_completion_panics() {
+        let pool = MultiPool::new();
+        let handle = initialized_task(&pool, std::future::ready(()));
+        // SAFETY: The handle owns the task on its creating thread.
+        let task = unsafe { handle.as_task() };
+
+        assert!(matches!(task.poll(), TaskPoll::Ready));
+        assert!(catch_unwind(AssertUnwindSafe(|| task.poll())).is_err());
+    }
 }

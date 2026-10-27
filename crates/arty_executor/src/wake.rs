@@ -172,7 +172,7 @@ impl WakeSignal {
         let notification_state = if remote { TASK_ACTIVE_REMOTE } else { TASK_ACTIVE_LOCAL };
         matches!(
             self.schedule_state
-                .fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |state| match state {
+                .try_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |state| match state {
                     TASK_ACTIVE => Some(notification_state),
                     TASK_ACTIVE_LOCAL | TASK_ACTIVE_REMOTE => Some(state),
                     _ => None,
@@ -240,6 +240,93 @@ impl Deref for BorrowedWakerRef<'_> {
 
     fn deref(&self) -> &Self::Target {
         &self.waker
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+    use std::thread;
+
+    use plurality::MultiPool;
+
+    use super::*;
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn retirement_removes_a_local_notification() {
+        let _executor = crate::Executor::builder().build();
+        let pool = MultiPool::new();
+        let task = crate::allocate_test_task_in(&pool);
+        let (shared, _remote_wakes) = WakeShared::new(Waker::noop().clone(), thread::current().id());
+        let signal = pin!(WakeSignal::new(shared, task.as_ptr()));
+
+        assert!(signal.begin_notification(false));
+        signal.schedule_local();
+        assert!(executor_context::has_wakes(thread::current().id()));
+        signal.retire();
+
+        assert!(!executor_context::has_wakes(thread::current().id()));
+        drop(task);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn local_schedule_after_owner_loss_notifies_the_parent() {
+        let pool = MultiPool::new();
+        let foreign_owner = thread::spawn(|| thread::current().id()).join().unwrap();
+        let parent = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let task = crate::allocate_test_task_in(&pool);
+        let (shared, _remote_wakes) = WakeShared::new(Waker::from(Arc::clone(&parent)), foreign_owner);
+        let signal = pin!(WakeSignal::new(shared, task.as_ptr()));
+
+        assert!(signal.begin_notification(false));
+        signal.schedule_local();
+
+        assert_eq!(parent.0.load(Ordering::Relaxed), 1);
+        assert_eq!(signal.schedule_state.load(atomic::Ordering::Acquire), TASK_ACTIVE);
+        drop(task);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn closed_remote_channel_clears_the_notification() {
+        let pool = MultiPool::new();
+        let foreign_owner = thread::spawn(|| thread::current().id()).join().unwrap();
+        let task = crate::allocate_test_task_in(&pool);
+        let (shared, remote_wakes) = WakeShared::new(Waker::noop().clone(), foreign_owner);
+        drop(remote_wakes);
+        let signal = pin!(WakeSignal::new(shared, task.as_ptr()));
+
+        assert!(signal.begin_notification(true));
+        signal.schedule_remote();
+
+        assert_eq!(signal.schedule_state.load(atomic::Ordering::Acquire), TASK_ACTIVE);
+        drop(task);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn remote_wake_has_non_exhaustive_diagnostics() {
+        let pool = MultiPool::new();
+        let task = crate::allocate_test_task_in(&pool);
+        // SAFETY: `task` keeps the initialized template alive.
+        let remote = RemoteWake(unsafe { task.as_ptr().retain_remote() });
+
+        assert_eq!(format!("{remote:?}"), "RemoteWake { .. }");
+
+        drop((remote, task));
+        assert!(pool.is_empty());
     }
 }
 
