@@ -15,10 +15,7 @@ use plurality::MultiPool;
 
 use crate::remote::Sender as RemoteSender;
 use crate::wake::RemoteWake;
-use crate::{
-    JoinHandle, Shutdown, ShutdownCause, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_remote_task, allocate_task,
-    discard_task_panic_payload,
-};
+use crate::{JoinHandle, Shutdown, ShutdownCause, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_remote_task, allocate_task};
 
 /// Cloneable handle to state used by reentrant task submissions.
 #[derive(Clone, Debug)]
@@ -149,16 +146,12 @@ impl ExecutorShared {
         R: Send + 'static,
     {
         if self.is_shutting_down() {
-            if let Err(panic) = remote_result_tx.shutdown(self.shutdown_cause()) {
-                discard_task_panic_payload(panic);
-            }
+            drop(remote_result_tx);
             return;
         }
         let future = future.into_future();
         if self.is_shutting_down() {
-            if let Err(panic) = remote_result_tx.shutdown(self.shutdown_cause()) {
-                discard_task_panic_payload(panic);
-            }
+            drop(remote_result_tx);
             return;
         }
         self.register_task(allocate_remote_task(

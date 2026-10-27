@@ -109,6 +109,9 @@ impl<R: 'static> Future for JoinHandle<R> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         let this = self.get_mut();
+        if this.shutdown.is_triggered() {
+            return task::Poll::Ready(Err(JoinError::shutdown(this.shutdown.cause())));
+        }
         Pin::new(&mut this.rx)
             .poll(cx)
             .map(|result| result.map_err(|_disconnected| JoinError::shutdown(this.shutdown.cause())))

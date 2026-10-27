@@ -495,7 +495,8 @@ impl<R: Send + 'static> TaskResultTarget<R> for RemoteSender<R> {
     }
 
     fn cancelled(self, cause: ShutdownCause) -> Result<(), TaskPanicPayload> {
-        self.shutdown(cause)
+        drop(cause);
+        catch_unwind(AssertUnwindSafe(|| drop(self)))
     }
 }
 
@@ -606,7 +607,6 @@ mod tests {
     use std::future::{Ready, pending};
     use std::pin::pin;
     use std::rc::Rc;
-    #[cfg(not(debug_assertions))]
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};

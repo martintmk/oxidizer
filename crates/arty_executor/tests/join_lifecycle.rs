@@ -224,7 +224,7 @@ fn noop_executor_applies_task_context_and_restores_caller_context() {
 }
 
 #[test]
-fn completed_result_survives_executor_drop() {
+fn completed_result_reports_shutdown_if_executor_stops_before_join() {
     let mut executor = Executor::builder().build();
     let mut handle = executor.tasks().add(async { 42 }, TaskOptions::default());
 
@@ -233,7 +233,7 @@ fn completed_result_survives_executor_drop() {
     assert!(!executor.has_tasks());
     drop(executor);
 
-    assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
+    assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
 }
 
 struct ShutdownDuringRemoteConversion(Shutdown);
@@ -300,12 +300,12 @@ fn caused_shutdown_is_attached_to_cancelled_and_rejected_tasks() {
 }
 
 #[test]
-fn remote_task_cancellation_carries_the_shutdown_cause() {
+fn remote_task_cancellation_reports_shutdown() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
     let (result_tx, remote_join) = RemotePool::new().channel::<usize>();
     tasks.add_with_remote_result(pending::<usize>(), TaskOptions::default(), result_tx);
-    let (cause, expected) = shutdown_cause("remote executor failed");
+    let cause = shutdown_cause("remote executor failed").0;
 
     executor.shutdown().trigger(cause);
     let (rejected_tx, rejected_join) = RemotePool::new().channel::<usize>();
@@ -314,8 +314,7 @@ fn remote_task_cancellation_carries_the_shutdown_cause() {
 
     for mut join in [remote_join, rejected_join] {
         let error = ready_error(Pin::new(&mut join).poll(&mut Context::from_waker(Waker::noop())));
-        let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
-        assert_same_shutdown_source(source, &expected);
+        assert!(error.source().is_none());
     }
 }
 

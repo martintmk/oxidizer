@@ -55,11 +55,15 @@ impl Shutdown {
         }
     }
 
-    pub(crate) fn is_triggered(&self) -> bool {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_triggered(&self) -> bool {
         self.inner.cause.get().is_some()
     }
 
-    pub(crate) fn cause(&self) -> ShutdownCause {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cause(&self) -> ShutdownCause {
         self.inner.cause.get().cloned().unwrap_or_default()
     }
 

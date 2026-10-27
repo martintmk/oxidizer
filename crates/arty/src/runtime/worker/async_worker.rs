@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use arty_executor::{CycleOutcome, Executor, TaskSet};
+use arty_executor::{CycleOutcome, Executor, Shutdown as ExecutorShutdown, TaskSet};
 use observed::Sink;
 use performables::arc::Arc;
 use performables::sync::channel;
@@ -81,6 +81,7 @@ pub(crate) struct AsyncWorker {
 
     // Becomes None during shutdown when the executor is dropped to cancel and release its tasks.
     executor: Option<Executor>,
+    executor_shutdown: ExecutorShutdown,
 
     // Connected to the `executor`. Submissions after shutdown resolve to an executor-shutdown
     // JoinError rather than registering a task.
@@ -128,13 +129,14 @@ impl AsyncWorker {
         let executor_shutdown = executor.shutdown();
 
         let builtins = Builtins::new(dispatcher, clock, io, thread, sink);
-        Scheduler::register_current(builtins.clone(), tasks.clone(), executor_shutdown);
+        Scheduler::register_current(builtins.clone(), tasks.clone(), executor_shutdown.clone());
 
         Self {
             command_rx: Some(command_rx),
             builtins: Some(builtins),
             shutdown,
             executor: Some(executor),
+            executor_shutdown,
             tasks,
             clock_driver,
             time,
@@ -180,6 +182,7 @@ impl AsyncWorker {
         if matches!(cycle_outcome, CycleOutcome::Shutdown) {
             // An alternate low-level owner initiated executor shutdown. Complete the surrounding
             // worker shutdown before final timer callbacks run.
+            self.shutdown.begin(self.executor_shutdown.cause());
             self.begin_shutdown();
             let now = self.timer_now();
             _ = self.clock_driver.advance_timers(now);
