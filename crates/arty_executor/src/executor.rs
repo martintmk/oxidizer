@@ -824,13 +824,14 @@ mod tests {
     }
 
     #[test]
-    fn task_set_shutdown_handle_is_applied_by_the_next_cycle() {
+    fn shutdown_handle_is_applied_by_the_next_cycle() {
         let mut executor = Executor::builder().build();
         let tasks = executor.tasks();
+        let shutdown = executor.shutdown();
         let dropped = Rc::new(Cell::new(false));
         let mut handle = tasks.add_test(DropSignalFuture(Rc::clone(&dropped)));
 
-        tasks.shutdown().trigger(ShutdownCause::default());
+        shutdown.trigger(ShutdownCause::default());
 
         assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
         assert!(dropped.get());

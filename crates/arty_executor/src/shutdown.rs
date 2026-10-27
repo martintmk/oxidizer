@@ -15,21 +15,29 @@ use ohno::OhnoCore;
 /// Clones share the first shutdown cause. The handle can move to another
 /// thread, but it cannot be shared between threads. Clone it before sending it
 /// to each thread that can request shutdown.
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 pub struct Shutdown {
-    state: ShutdownState,
-    owner_waker: Waker,
+    #[debug(ignore)]
+    inner: Arc<ShutdownInner>,
+    #[debug(ignore)]
     not_sync: PhantomData<Cell<()>>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ShutdownState(Arc<OnceLock<ShutdownCause>>);
+impl std::panic::UnwindSafe for Shutdown {}
+impl std::panic::RefUnwindSafe for Shutdown {}
+
+struct ShutdownInner {
+    cause: OnceLock<ShutdownCause>,
+    owner_waker: Waker,
+}
 
 impl Shutdown {
     pub(crate) fn new(owner_waker: Waker) -> Self {
         Self {
-            state: ShutdownState(Arc::new(OnceLock::new())),
-            owner_waker,
+            inner: Arc::new(ShutdownInner {
+                cause: OnceLock::new(),
+                owner_waker,
+            }),
             not_sync: PhantomData,
         }
     }
@@ -42,43 +50,21 @@ impl Shutdown {
     ///
     /// Panics if the executor owner waker panics.
     pub fn trigger(&self, cause: ShutdownCause) {
-        if self.state.trigger(cause) {
-            self.owner_waker.wake_by_ref();
+        if self.publish(cause) {
+            self.inner.owner_waker.wake_by_ref();
         }
     }
 
     pub(crate) fn is_triggered(&self) -> bool {
-        self.state.is_triggered()
+        self.inner.cause.get().is_some()
     }
 
     pub(crate) fn cause(&self) -> ShutdownCause {
-        self.state.cause()
+        self.inner.cause.get().cloned().unwrap_or_default()
     }
 
-    pub(crate) fn state(&self) -> ShutdownState {
-        self.state.clone()
-    }
-}
-
-impl Debug for Shutdown {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Shutdown")
-            .field("triggered", &self.is_triggered())
-            .finish_non_exhaustive()
-    }
-}
-
-impl ShutdownState {
-    pub(crate) fn trigger(&self, cause: ShutdownCause) -> bool {
-        self.0.set(cause).is_ok()
-    }
-
-    pub(crate) fn is_triggered(&self) -> bool {
-        self.0.get().is_some()
-    }
-
-    pub(crate) fn cause(&self) -> ShutdownCause {
-        self.0.get().cloned().unwrap_or_default()
+    pub(crate) fn publish(&self, cause: ShutdownCause) -> bool {
+        self.inner.cause.set(cause).is_ok()
     }
 }
 

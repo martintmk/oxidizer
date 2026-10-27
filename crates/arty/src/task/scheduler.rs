@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 
 use arty_executor::remote::Pool as RemotePool;
-use arty_executor::{ShutdownCause, TaskOptions, TaskPlacement, TaskSet};
+use arty_executor::{Shutdown as ExecutorShutdown, ShutdownCause, TaskOptions, TaskPlacement, TaskSet};
 use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
 
@@ -29,6 +29,7 @@ struct CurrentWorker {
     thread: Thread,
     builtins: Builtins,
     tasks: TaskSet,
+    executor_shutdown: ExecutorShutdown,
     // Child submissions must not contend with every other worker's result-channel rentals.
     results: RemotePool,
 }
@@ -87,7 +88,7 @@ impl Scheduler {
         CURRENT_WORKER.with_borrow(|current| current.as_ref().map(|current| current.thread.clone()))
     }
 
-    pub(crate) fn register_current(builtins: Builtins, tasks: TaskSet) {
+    pub(crate) fn register_current(builtins: Builtins, tasks: TaskSet, executor_shutdown: ExecutorShutdown) {
         assert!(!ACTIVE_WORKER.replace(true), "a worker is already active on this thread");
         CURRENT_WORKER.with_borrow_mut(|current| {
             assert!(current.is_none(), "a worker already owns this scheduler context");
@@ -95,6 +96,7 @@ impl Scheduler {
                 thread: builtins.thread().clone(),
                 builtins,
                 tasks,
+                executor_shutdown,
                 results: RemotePool::new(),
             });
         });
@@ -116,7 +118,7 @@ impl Scheduler {
                 return;
             };
             if dispatcher.owns(&current.thread) {
-                current.tasks.shutdown().trigger(cause);
+                current.executor_shutdown.trigger(cause);
             }
         });
     }

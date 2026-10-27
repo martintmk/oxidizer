@@ -8,7 +8,7 @@ use std::task;
 
 use events_once::{LocalEventLake, PooledLocalReceiver};
 
-use crate::{ShutdownCause, ShutdownState, TaskPanicPayload};
+use crate::{Shutdown, ShutdownCause, TaskPanicPayload};
 
 /// A task failed to return its result.
 ///
@@ -89,15 +89,15 @@ impl Error for JoinError {
 #[derive(Debug)]
 pub struct JoinHandle<R: 'static> {
     rx: PooledLocalReceiver<R>,
-    shutdown: ShutdownState,
+    shutdown: Shutdown,
 }
 
 impl<R: 'static> JoinHandle<R> {
-    pub(crate) fn new(rx: PooledLocalReceiver<R>, shutdown: ShutdownState) -> Self {
+    pub(crate) fn new(rx: PooledLocalReceiver<R>, shutdown: Shutdown) -> Self {
         Self { rx, shutdown }
     }
 
-    pub(crate) fn disconnected(events: &LocalEventLake, shutdown: ShutdownState) -> Self {
+    pub(crate) fn disconnected(events: &LocalEventLake, shutdown: Shutdown) -> Self {
         let (tx, rx) = events.rent();
         drop(tx);
         Self::new(rx, shutdown)

@@ -82,7 +82,7 @@ impl ExecutorShared {
     }
 
     pub(crate) fn publish_shutdown(&self, cause: ShutdownCause) -> ShutdownCause {
-        _ = self.inner.shutdown.state().trigger(cause);
+        _ = self.inner.shutdown.publish(cause);
         self.shutdown_cause()
     }
 
@@ -140,7 +140,7 @@ impl ExecutorShared {
             options,
             self.inner.sink.clone(),
         ));
-        JoinHandle::new(result_rx, self.inner.shutdown.state())
+        JoinHandle::new(result_rx, self.shutdown())
     }
 
     pub(crate) fn add_remote_task<F, R>(&self, future: F, options: TaskOptions, remote_result_tx: RemoteSender<R>)
@@ -172,7 +172,7 @@ impl ExecutorShared {
 
     fn rejected_submission<R: 'static>(&self) -> Option<JoinHandle<R>> {
         self.is_shutting_down()
-            .then(|| JoinHandle::disconnected(&self.inner.join_events, self.inner.shutdown.state()))
+            .then(|| JoinHandle::disconnected(&self.inner.join_events, self.shutdown()))
     }
 
     fn register_task(&self, task_handle: TaskHandle) {

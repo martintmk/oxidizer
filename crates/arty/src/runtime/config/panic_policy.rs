@@ -48,7 +48,7 @@ impl PanicPolicy {
         Self { shutdown: false }
     }
 
-    pub(crate) const fn starts_shutdown(&self) -> bool {
+    pub(crate) const fn starts_shutdown(self) -> bool {
         self.shutdown
     }
 }

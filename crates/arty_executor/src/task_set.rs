@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use crate::remote::Sender as RemoteSender;
-use crate::{ExecutorShared, JoinHandle, Shutdown, TaskOptions};
+use crate::{ExecutorShared, JoinHandle, TaskOptions};
 
 /// Represents the set of tasks currently registered with an executor and allows new tasks
 /// to be registered.
@@ -48,12 +48,6 @@ impl TaskSet {
         R: Send + 'static,
     {
         self.shared.add_remote_task(future, options, result_tx);
-    }
-
-    /// Returns a handle that can request executor shutdown.
-    #[must_use]
-    pub fn shutdown(&self) -> Shutdown {
-        self.shared.shutdown()
     }
 
     #[cfg(test)]

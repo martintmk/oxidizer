@@ -28,6 +28,7 @@ allowed_external_types = [
 
 [dependencies]
 data_privacy = { workspace = true }
+derive_more = { workspace = true, features = ["debug"] }
 events_once = { workspace = true }
 nm = { workspace = true }
 observed = { workspace = true }
@@ -41,7 +42,6 @@ tick = { workspace = true, features = ["fast-instant"] }
 [dev-dependencies]
 alloc_tracker = { workspace = true }
 criterion = { workspace = true }
-derive_more = { workspace = true, features = ["debug"] }
 foldhash = { workspace = true, features = ["std"] }
 gungraun = { workspace = true, features = ["default"] }
 metabench = { path = "../metabench", default-features = false }

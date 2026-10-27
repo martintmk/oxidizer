@@ -4,6 +4,8 @@
 //! Public runtime panic-policy contracts.
 
 #![cfg(feature = "rt")]
+#![expect(clippy::panic, reason = "these tests inject task panics to verify panic-policy behavior")]
+#![expect(clippy::unwrap_used, reason = "test failures use unwrap for concise backtraces")]
 
 mod support;
 
@@ -35,42 +37,38 @@ fn shutdown_cause(error: &arty::runtime::Error) -> &arty_executor::ShutdownError
         .unwrap()
 }
 
-fn panic_async(_: Builtins, (): ()) -> impl Future<Output = ()> {
-    async { panic!("async panic") }
+async fn panic_async(_: Builtins, (): ()) {
+    std::panic::panic_any("async panic");
 }
 
 fn panic_factory(_: Builtins, (): ()) -> Ready<()> {
-    panic!("factory panic")
+    std::panic::panic_any("factory panic")
 }
 
 fn pending_forever(_: Builtins, (): ()) -> impl Future<Output = ()> {
     pending()
 }
 
-fn return_value(_: Builtins, Unaware(value): Unaware<u32>) -> impl Future<Output = u32> {
-    async move { value }
+async fn return_value(_: Builtins, Unaware(value): Unaware<u32>) -> u32 {
+    value
 }
 
-fn concurrent_panic(_: Builtins, Unaware(barrier): Unaware<Arc<Barrier>>) -> impl Future<Output = ()> {
-    async move {
-        barrier.wait();
-        panic!("concurrent panic");
-    }
+async fn concurrent_panic(_: Builtins, Unaware(barrier): Unaware<Arc<Barrier>>) {
+    barrier.wait();
+    std::panic::panic_any("concurrent panic");
 }
 
-fn detached_panic(_: Builtins, Unaware(panicking): Unaware<mpsc::Sender<()>>) -> impl Future<Output = ()> {
-    async move {
-        panicking.send(()).unwrap();
-        panic!("detached panic");
-    }
+async fn detached_panic(_: Builtins, Unaware(panicking): Unaware<mpsc::Sender<()>>) {
+    panicking.send(()).unwrap();
+    std::panic::panic_any("detached panic");
 }
 
-fn relocated_panic(Unaware(()): Unaware<()>) -> impl Future<Output = ()> {
-    async { panic!("relocated panic") }
+async fn relocated_panic(Unaware(()): Unaware<()>) {
+    std::panic::panic_any("relocated panic");
 }
 
-fn relocated_value(Unaware(value): Unaware<u32>) -> impl Future<Output = u32> {
-    async move { value }
+async fn relocated_value(Unaware(value): Unaware<u32>) -> u32 {
+    value
 }
 
 #[test]

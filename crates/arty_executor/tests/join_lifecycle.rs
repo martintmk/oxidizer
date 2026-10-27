@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use arty_executor::remote::Pool as RemotePool;
-use arty_executor::{CycleOutcome, Executor, JoinError, JoinHandle, ShutdownCause, ShutdownError, TaskOptions, TaskPlacement, TaskSet};
+use arty_executor::{
+    CycleOutcome, Executor, JoinError, JoinHandle, Shutdown, ShutdownCause, ShutdownError, TaskOptions, TaskPlacement, TaskSet,
+};
 use observed::Sink;
 use observed::enrichment::{Enrichment, EnrichmentEntry};
 use observed::metadata::EventDescription;
@@ -234,14 +236,14 @@ fn completed_result_survives_executor_drop() {
     assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
 }
 
-struct ShutdownDuringRemoteConversion(TaskSet);
+struct ShutdownDuringRemoteConversion(Shutdown);
 
 impl IntoFuture for ShutdownDuringRemoteConversion {
     type Output = usize;
     type IntoFuture = Ready<usize>;
 
     fn into_future(self) -> Self::IntoFuture {
-        self.0.shutdown().trigger(ShutdownCause::default());
+        self.0.trigger(ShutdownCause::default());
         ready(42)
     }
 }
@@ -250,13 +252,14 @@ impl IntoFuture for ShutdownDuringRemoteConversion {
 fn shutdown_during_remote_conversion_rejects_the_task() {
     let executor = Executor::builder().build();
     let tasks = executor.tasks();
+    let shutdown = executor.shutdown();
     let result_pool = RemotePool::new();
     let (result_tx, mut result) = result_pool.channel();
     let wake = Arc::new(PanickingRemoteJoinWake(AtomicBool::new(false)));
     let waker = Waker::from(Arc::clone(&wake));
     assert!(Pin::new(&mut result).poll(&mut Context::from_waker(&waker)).is_pending());
 
-    tasks.add_with_remote_result(ShutdownDuringRemoteConversion(tasks.clone()), TaskOptions::default(), result_tx);
+    tasks.add_with_remote_result(ShutdownDuringRemoteConversion(shutdown), TaskOptions::default(), result_tx);
 
     assert!(!executor.has_tasks());
     assert!(wake.0.load(Ordering::Acquire));
@@ -361,12 +364,13 @@ fn direct_executor_drop_cancels_tasks_safely() {
 }
 
 #[test]
-fn task_set_shutdown_cancels_tasks_without_executor_drop() {
+fn shutdown_handle_cancels_tasks_without_executor_drop() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
+    let shutdown = executor.shutdown();
     let mut handle = tasks.add(pending::<()>(), TaskOptions::default());
 
-    tasks.shutdown().trigger(ShutdownCause::default());
+    shutdown.trigger(ShutdownCause::default());
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
     assert!(!executor.has_tasks());
     drop(executor);
@@ -619,7 +623,7 @@ fn owner_drop_during_spawn_telemetry_cancels_task_and_rejects_nested_submission(
 }
 
 struct ShutdownDuringIntoFuture {
-    tasks: TaskSet,
+    shutdown: Shutdown,
 }
 
 impl IntoFuture for ShutdownDuringIntoFuture {
@@ -627,7 +631,7 @@ impl IntoFuture for ShutdownDuringIntoFuture {
     type IntoFuture = std::future::Ready<usize>;
 
     fn into_future(self) -> Self::IntoFuture {
-        self.tasks.shutdown().trigger(ShutdownCause::default());
+        self.shutdown.trigger(ShutdownCause::default());
         std::future::ready(42)
     }
 }
@@ -636,7 +640,12 @@ impl IntoFuture for ShutdownDuringIntoFuture {
 fn shutdown_during_into_future_conversion_rejects_the_outer_task() {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
-    let mut handle = tasks.add(ShutdownDuringIntoFuture { tasks: tasks.clone() }, TaskOptions::default());
+    let mut handle = tasks.add(
+        ShutdownDuringIntoFuture {
+            shutdown: executor.shutdown(),
+        },
+        TaskOptions::default(),
+    );
 
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
     assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);

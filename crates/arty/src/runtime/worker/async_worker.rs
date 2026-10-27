@@ -125,9 +125,10 @@ impl AsyncWorker {
             .thread(thread.clone())
             .build();
         let tasks = executor.tasks();
+        let executor_shutdown = executor.shutdown();
 
         let builtins = Builtins::new(dispatcher, clock, io, thread, sink);
-        Scheduler::register_current(builtins.clone(), tasks.clone());
+        Scheduler::register_current(builtins.clone(), tasks.clone(), executor_shutdown);
 
         Self {
             command_rx: Some(command_rx),
