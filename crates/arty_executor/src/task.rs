@@ -266,6 +266,7 @@ where
         let result_target = payload.result_target.take().expect("a polled task retains its result target");
 
         wake_signal.retire();
+        // SAFETY: The future remains pinned with its task and is destroyed in place.
         if let Err(disposal) = unsafe { Pin::new_unchecked(&mut payload.future) }.destroy_pinned() {
             discard_task_panic_payload(disposal);
         }

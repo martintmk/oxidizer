@@ -7,7 +7,20 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::thread;
 
-use arty_executor::{CycleOutcome, Executor, TaskOptions};
+use arty_executor::{CycleOutcome, Executor, ShutdownCause, TaskCompletion, TaskOptions, TaskPanicPayload, discard_task_panic_payload};
+
+#[derive(Debug)]
+struct DiscardCompletion;
+
+impl TaskCompletion<()> for DiscardCompletion {
+    fn completed(self, _result: ()) {}
+
+    fn panicked(self, panic: TaskPanicPayload) {
+        discard_task_panic_payload(panic);
+    }
+
+    fn cancelled(self, _cause: ShutdownCause) {}
+}
 
 fn main() {
     let mut executor = Executor::builder().build();
@@ -28,6 +41,7 @@ fn main() {
             }
         },
         TaskOptions::default(),
+        DiscardCompletion,
     );
 
     let mut shutdown_started = false;

@@ -125,7 +125,7 @@ impl DispatcherCore {
             worker_endpoints.len(),
             "each runtime worker must have a distinct thread ID"
         );
-        let panic_shutdown_cause = panic_policy.executor_policy().starts_shutdown().then(ShutdownCause::panic);
+        let panic_shutdown_cause = panic_policy.into_executor_policy().starts_shutdown().then(ShutdownCause::panic);
         Arc::new_cyclic(move |weak| {
             if panic_shutdown_cause.is_some() {
                 shutdown.initialize_panic_notifier(Waker::from(StdArc::new(PanicShutdownWake(weak.clone()))));

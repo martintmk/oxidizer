@@ -4,8 +4,6 @@
 //! Public runtime panic-policy contracts.
 
 #![cfg(feature = "rt")]
-#![expect(clippy::panic, reason = "these tests inject task panics to verify panic-policy behavior")]
-#![expect(clippy::unwrap_used, reason = "test failures use unwrap for concise backtraces")]
 
 use std::error::Error as _;
 use std::future::{Ready, pending};

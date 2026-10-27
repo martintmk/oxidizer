@@ -307,6 +307,7 @@ impl Future for ReadyDropPanic {
 }
 
 impl Drop for ReadyDropPanic {
+    #[expect(clippy::panic, reason = "this test injects a completed-future destructor panic")]
     fn drop(&mut self) {
         panic!("ready future destructor");
     }
@@ -329,12 +330,14 @@ struct PollAndDropPanic;
 impl Future for PollAndDropPanic {
     type Output = ();
 
+    #[expect(clippy::panic, reason = "this test injects a task poll panic")]
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         panic!("poll panic");
     }
 }
 
 impl Drop for PollAndDropPanic {
+    #[expect(clippy::panic, reason = "this test injects a secondary destructor panic")]
     fn drop(&mut self) {
         panic!("secondary destructor panic");
     }
@@ -365,6 +368,7 @@ impl Future for CancellationDropPanic {
 }
 
 impl Drop for CancellationDropPanic {
+    #[expect(clippy::panic, reason = "this test injects a cancellation destructor panic")]
     fn drop(&mut self) {
         assert!(!self.dropped.replace(true));
         panic!("cancellation destructor");

@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(builder.processor_config.stack_size, NonZeroUsize::new(1024 * 1024).unwrap());
         assert_eq!(builder.processor_config.blocking_pool_policy, BlockingPoolPolicy::shared().max(1));
         assert!(builder.processor_config.monitor_options.policy().is_enabled());
-        assert!(builder.processor_config.panic_policy.executor_policy().starts_shutdown());
+        assert!(builder.processor_config.panic_policy.into_executor_policy().starts_shutdown());
     }
 
     #[test]
@@ -348,7 +348,7 @@ mod tests {
     fn panic_replaces_the_default() {
         let builder = Runtime::builder().panic(PanicPolicy::ignore());
 
-        assert!(!builder.processor_config.panic_policy.executor_policy().starts_shutdown());
+        assert!(!builder.processor_config.panic_policy.into_executor_policy().starts_shutdown());
     }
 
     #[test]

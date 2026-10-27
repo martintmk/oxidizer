@@ -52,8 +52,8 @@ impl PanicPolicy {
         }
     }
 
-    pub(crate) fn executor_policy(&self) -> arty_executor::PanicPolicy {
-        self.inner.clone()
+    pub(crate) fn into_executor_policy(self) -> arty_executor::PanicPolicy {
+        self.inner
     }
 }
 
@@ -70,11 +70,11 @@ mod tests {
 
     #[test]
     fn default_policy_starts_shutdown() {
-        assert!(PanicPolicy::default().executor_policy().starts_shutdown());
+        assert!(PanicPolicy::default().into_executor_policy().starts_shutdown());
     }
 
     #[test]
     fn ignore_policy_keeps_the_runtime_running() {
-        assert!(!PanicPolicy::ignore().executor_policy().starts_shutdown());
+        assert!(!PanicPolicy::ignore().into_executor_policy().starts_shutdown());
     }
 }

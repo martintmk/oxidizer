@@ -29,7 +29,7 @@ fn suspend_wait(deadline: Instant, now: Instant) -> Duration {
     deadline.saturating_duration_since(now)
 }
 
-fn can_suspend(cycle_outcome: CycleOutcome, batch_exhausted: bool) -> bool {
+fn can_suspend(cycle_outcome: &CycleOutcome, batch_exhausted: bool) -> bool {
     matches!(cycle_outcome, CycleOutcome::Suspend) && !batch_exhausted
 }
 
@@ -124,13 +124,13 @@ impl AsyncWorker {
             .owner_waker(worker_waker)
             .sink(blocking_worker.sink().clone())
             .thread(thread.clone())
-            .panic_policy(panic_policy.executor_policy())
+            .panic_policy(panic_policy.into_executor_policy())
             .build();
         let tasks = executor.tasks();
         let executor_shutdown = executor.shutdown();
 
         let builtins = Builtins::new(dispatcher, clock, io, thread, sink);
-        Scheduler::register_current(builtins.clone(), tasks.clone(), executor_shutdown.clone());
+        Scheduler::register_current(builtins.clone(), tasks.clone(), executor_shutdown);
 
         Self {
             command_rx: Some(command_rx),
@@ -200,7 +200,7 @@ impl AsyncWorker {
             _ = self.clock_driver.advance_timers(now);
             return ControlFlow::Break(());
         }
-        let should_suspend = can_suspend(cycle_outcome, batch_exhausted);
+        let should_suspend = can_suspend(&cycle_outcome, batch_exhausted);
         let has_primary = RuntimeDriverHost::has_primary_current();
         let max_wait = if should_suspend {
             if has_primary {
@@ -359,12 +359,12 @@ mod tests {
 
     #[test]
     fn suspend_budget_requires_suspend_outcome_and_non_exhausted_batch() {
-        assert!(can_suspend(CycleOutcome::Suspend, false));
-        assert!(!can_suspend(CycleOutcome::Suspend, true));
-        assert!(!can_suspend(CycleOutcome::Continue, false));
-        assert!(!can_suspend(CycleOutcome::Continue, true));
-        assert!(!can_suspend(CycleOutcome::Shutdown(ShutdownCause::default()), false));
-        assert!(!can_suspend(CycleOutcome::Shutdown(ShutdownCause::default()), true));
+        assert!(can_suspend(&CycleOutcome::Suspend, false));
+        assert!(!can_suspend(&CycleOutcome::Suspend, true));
+        assert!(!can_suspend(&CycleOutcome::Continue, false));
+        assert!(!can_suspend(&CycleOutcome::Continue, true));
+        assert!(!can_suspend(&CycleOutcome::Shutdown(ShutdownCause::default()), false));
+        assert!(!can_suspend(&CycleOutcome::Shutdown(ShutdownCause::default()), true));
     }
 
     #[test]

@@ -21,7 +21,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use arty_executor::{CycleOutcome, Executor, JoinHandle, TaskOptions, TaskSet};
+use arty_executor::{
+    CycleOutcome, Executor, ShutdownCause, TaskCompletion, TaskOptions, TaskPanicPayload, TaskSet, discard_task_panic_payload,
+};
 use criterion::{BatchSize, BenchmarkId, Criterion};
 use gungraun::{Callgrind, CallgrindMetrics, LibraryBenchmarkConfig};
 
@@ -29,6 +31,19 @@ const CYCLE: &str = "ae_basic_operations/execute_cycle";
 const TASK: &str = "ae_basic_operations/task";
 const WAKER: &str = "ae_basic_operations/waker";
 const SELF_WAKING_POLL_COUNT: usize = 4;
+
+#[derive(Debug)]
+struct DiscardCompletion;
+
+impl TaskCompletion<()> for DiscardCompletion {
+    fn completed(self, _result: ()) {}
+
+    fn panicked(self, panic: TaskPanicPayload) {
+        discard_task_panic_payload(panic);
+    }
+
+    fn cancelled(self, _cause: ShutdownCause) {}
+}
 
 struct ExecutorState {
     tasks: TaskSet,
@@ -45,19 +60,19 @@ fn executor_state() -> ExecutorState {
 }
 
 struct CycleState {
-    _handle: Option<JoinHandle<()>>,
     executor: Executor,
 }
 
 fn cycle_state(pending_task: bool) -> CycleState {
     let executor = Executor::builder().build();
-    let handle = pending_task.then(|| executor.tasks().add(pending::<()>(), TaskOptions::default()));
-    CycleState { _handle: handle, executor }
+    if pending_task {
+        executor.tasks().add(pending::<()>(), TaskOptions::default(), DiscardCompletion);
+    }
+    CycleState { executor }
 }
 
 struct CloneWakerState {
     _captured: Rc<RefCell<Option<Waker>>>,
-    _handle: JoinHandle<()>,
     executor: Executor,
 }
 
@@ -85,26 +100,26 @@ impl Future for SelfWakingFuture {
 }
 
 struct SelfWakingState {
-    _handle: JoinHandle<()>,
     executor: Executor,
 }
 
 fn self_waking_state(clone_waker: bool) -> SelfWakingState {
     let executor = Executor::builder().build();
-    let handle = executor.tasks().add(
+    executor.tasks().add(
         SelfWakingFuture {
             remaining_polls: SELF_WAKING_POLL_COUNT,
             clone_waker,
         },
         TaskOptions::default(),
+        DiscardCompletion,
     );
-    SelfWakingState { _handle: handle, executor }
+    SelfWakingState { executor }
 }
 
 fn clone_waker_state() -> CloneWakerState {
     let executor = Executor::builder().build();
     let captured = Rc::new(RefCell::new(None));
-    let handle = executor.tasks().add(
+    executor.tasks().add(
         {
             let captured = Rc::clone(&captured);
             poll_fn(move |cx| {
@@ -113,10 +128,10 @@ fn clone_waker_state() -> CloneWakerState {
             })
         },
         TaskOptions::default(),
+        DiscardCompletion,
     );
     CloneWakerState {
         _captured: captured,
-        _handle: handle,
         executor,
     }
 }
@@ -125,7 +140,7 @@ fn retained_waker_after_executor_drop() -> Waker {
     let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
     let captured = Rc::new(RefCell::new(None));
-    let handle = tasks.add(
+    tasks.add(
         {
             let captured = Rc::clone(&captured);
             poll_fn(move |cx| {
@@ -134,12 +149,12 @@ fn retained_waker_after_executor_drop() -> Waker {
             })
         },
         TaskOptions::default(),
+        DiscardCompletion,
     );
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = captured.borrow_mut().take().expect("the task captured its waker");
     drop(executor);
-    drop(handle);
     drop(tasks);
     retained
 }
@@ -153,8 +168,8 @@ fn execute_cycle(state: &mut CycleState) -> CycleOutcome {
 
 #[metabench::benchmark(ADD_TASK, TASK, "add_task")]
 #[bench::ready(&executor_state())]
-fn add_task(state: &ExecutorState) -> JoinHandle<()> {
-    black_box(&state.tasks).add(async {}, TaskOptions::default())
+fn add_task(state: &ExecutorState) {
+    black_box(&state.tasks).add(async {}, TaskOptions::default(), DiscardCompletion);
 }
 
 #[metabench::benchmark(SELF_WAKING_TASK, TASK, "self_waking_task")]

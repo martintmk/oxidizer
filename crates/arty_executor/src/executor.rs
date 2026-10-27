@@ -243,10 +243,8 @@ impl Executor {
                     }
                     self.shared.decrement_task_count(1);
                     completed_count = completed_count.saturating_add(1);
-                    if let TaskPoll::Panicked = outcome {
-                        if self.shared.panic_policy().starts_shutdown() {
-                            self.shared.shutdown().trigger(ShutdownCause::panic());
-                        }
+                    if matches!(outcome, TaskPoll::Panicked) && self.shared.panic_policy().starts_shutdown() {
+                        self.shared.shutdown().trigger(ShutdownCause::panic());
                     }
                 }
                 TaskPoll::Pending => {

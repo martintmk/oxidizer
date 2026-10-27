@@ -243,6 +243,46 @@ impl Deref for BorrowedWakerRef<'_> {
     }
 }
 
+static BORROWED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, borrowed_consume, waker_wake_by_ref, borrowed_drop);
+static OWNED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn borrowed_consume(_: *const ()) {
+    unreachable!("a borrowed polling waker cannot be consumed");
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn borrowed_drop(_: *const ()) {
+    unreachable!("a borrowed polling waker cannot be dropped");
+}
+
+fn waker_clone(ptr: *const ()) -> RawWaker {
+    let signal = signal_from_raw(ptr);
+    signal.add_owned_waker();
+    RawWaker::new(ptr, &OWNED_WAKER_VTABLE)
+}
+
+fn waker_wake(ptr: *const ()) {
+    // SAFETY: Consuming wake transfers this raw waker's ownership into the guard.
+    let _owner = unsafe { signal_from_raw(ptr).task_ptr.into_remote() };
+    signal_from_raw(ptr).wake();
+}
+
+fn waker_wake_by_ref(ptr: *const ()) {
+    signal_from_raw(ptr).wake();
+}
+
+fn waker_drop(ptr: *const ()) {
+    // SAFETY: Dropping transfers this raw waker's ownership into the guard.
+    drop(unsafe { signal_from_raw(ptr).task_ptr.into_remote() });
+}
+
+fn signal_from_raw(ptr: *const ()) -> &'static WakeSignal {
+    // SAFETY: Raw waker functions are called only with the pinned signal pointer used to create
+    // the waker. Borrowed calls are scoped to task polling; owned calls retain the enclosing task.
+    unsafe { ptr.cast::<WakeSignal>().as_ref().expect("raw waker signal pointer is never null") }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -328,44 +368,4 @@ mod tests {
         drop((remote, task));
         assert!(pool.is_empty());
     }
-}
-
-static BORROWED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, borrowed_consume, waker_wake_by_ref, borrowed_drop);
-static OWNED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn borrowed_consume(_: *const ()) {
-    unreachable!("a borrowed polling waker cannot be consumed");
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn borrowed_drop(_: *const ()) {
-    unreachable!("a borrowed polling waker cannot be dropped");
-}
-
-fn waker_clone(ptr: *const ()) -> RawWaker {
-    let signal = signal_from_raw(ptr);
-    signal.add_owned_waker();
-    RawWaker::new(ptr, &OWNED_WAKER_VTABLE)
-}
-
-fn waker_wake(ptr: *const ()) {
-    // SAFETY: Consuming wake transfers this raw waker's ownership into the guard.
-    let _owner = unsafe { signal_from_raw(ptr).task_ptr.into_remote() };
-    signal_from_raw(ptr).wake();
-}
-
-fn waker_wake_by_ref(ptr: *const ()) {
-    signal_from_raw(ptr).wake();
-}
-
-fn waker_drop(ptr: *const ()) {
-    // SAFETY: Dropping transfers this raw waker's ownership into the guard.
-    drop(unsafe { signal_from_raw(ptr).task_ptr.into_remote() });
-}
-
-fn signal_from_raw(ptr: *const ()) -> &'static WakeSignal {
-    // SAFETY: Raw waker functions are called only with the pinned signal pointer used to create
-    // the waker. Borrowed calls are scoped to task polling; owned calls retain the enclosing task.
-    unsafe { ptr.cast::<WakeSignal>().as_ref().expect("raw waker signal pointer is never null") }
 }
