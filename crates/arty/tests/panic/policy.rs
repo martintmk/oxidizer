@@ -7,8 +7,6 @@
 #![expect(clippy::panic, reason = "these tests inject task panics to verify panic-policy behavior")]
 #![expect(clippy::unwrap_used, reason = "test failures use unwrap for concise backtraces")]
 
-mod support;
-
 use std::error::Error as _;
 use std::future::{Ready, pending};
 use std::sync::{Arc, Barrier, mpsc};
@@ -16,9 +14,11 @@ use std::time::Instant;
 
 use arty::runtime::{BlockingPoolPolicy, PanicPolicy, Runtime, RuntimeBuilder, WorkersPolicy};
 use arty::task::Builtins;
-use support::JoinHandleExt as _;
 use testing_aids::TEST_TIMEOUT;
 use thread_aware::Unaware;
+
+use super::support;
+use super::support::JoinHandleExt as _;
 
 fn runtime_builder(workers: usize, policy: PanicPolicy) -> RuntimeBuilder {
     Runtime::builder()
