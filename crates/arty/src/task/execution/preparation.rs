@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use arty_executor::remote::{Pool as RemotePool, Sender as RemoteSender};
 use arty_executor::{TaskOptions, TaskPlacement, TaskSet, discard_task_panic_payload};
@@ -72,6 +72,77 @@ where
             .as_pin_mut()
             .expect("the deferred future is initialized above")
             .poll(cx)
+    }
+}
+
+#[pin_project]
+pub(crate) struct RemoteResultTask<F, R>
+where
+    R: Send + 'static,
+{
+    #[pin]
+    future: Option<F>,
+    result_tx: Option<RemoteSender<R>>,
+    panic_notifier: Waker,
+}
+
+impl<F, R> RemoteResultTask<F, R>
+where
+    F: Future<Output = R>,
+    R: Send + 'static,
+{
+    pub(crate) fn new(future: F, result_tx: RemoteSender<R>, panic_notifier: Waker) -> Self {
+        Self {
+            future: Some(future),
+            result_tx: Some(result_tx),
+            panic_notifier,
+        }
+    }
+}
+
+impl<F, R> Future for RemoteResultTask<F, R>
+where
+    F: Future<Output = R>,
+    R: Send + 'static,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let outcome = this
+                .future
+                .as_mut()
+                .as_pin_mut()
+                .expect("a pending result task retains its future")
+                .poll(cx);
+            if outcome.is_ready() {
+                this.future.set(None);
+            }
+            outcome
+        }));
+        match outcome {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(result)) => {
+                let result_tx = this.result_tx.take().expect("a completed result task retains its sender");
+                if let Err(panic) = result_tx.completed(result) {
+                    discard_task_panic_payload(panic);
+                }
+                Poll::Ready(())
+            }
+            Err(panic) => {
+                if let Err(disposal) = catch_unwind(AssertUnwindSafe(|| this.future.set(None))) {
+                    discard_task_panic_payload(disposal);
+                }
+                let result_tx = this.result_tx.take().expect("a panicked result task retains its sender");
+                let delivery = result_tx.panicked(panic);
+                this.panic_notifier.wake_by_ref();
+                if let Err(panic) = delivery {
+                    discard_task_panic_payload(panic);
+                }
+                Poll::Ready(())
+            }
+        }
     }
 }
 
@@ -203,8 +274,8 @@ where
         // The executor join handle is not used - the task delivers its result through the
         // channel above, which unlike the executor's join handle can cross thread boundaries.
         let options = TaskOptions::observed(parent_task_enrichment, placement);
-        let result_tx = result_tx.into_sender().with_panic_notifier(panic_notifier);
-        tasks.add_with_remote_result(inner, options, result_tx);
+        let inner = RemoteResultTask::new(inner, result_tx.into_sender(), panic_notifier);
+        drop(tasks.add(inner, options));
     });
     (future_factory, JoinHandle::new(result_rx))
 }

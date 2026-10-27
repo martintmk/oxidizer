@@ -54,13 +54,7 @@ impl Pool {
     #[must_use]
     pub fn channel<R: Send + 'static>(&self) -> (Sender<R>, JoinHandle<R>) {
         let (tx, rx) = self.events.rent();
-        (
-            Sender {
-                tx: Some(tx),
-                panic_notifier: task::Waker::noop().clone(),
-            },
-            JoinHandle { rx },
-        )
+        (Sender { tx: Some(tx) }, JoinHandle { rx })
     }
 }
 
@@ -102,24 +96,12 @@ impl<R: Send + 'static> Debug for JoinHandle<R> {
 /// The sending endpoint for a [`JoinHandle`].
 pub struct Sender<R: Send + 'static> {
     tx: Option<PooledSender<TaskResult<R>>>,
-    panic_notifier: task::Waker,
 }
 
 impl<R: Send + 'static> Sender<R> {
-    fn send(&mut self, result: TaskResult<R>) -> Result<(), TaskPanicPayload> {
+    fn send(mut self, result: TaskResult<R>) -> Result<(), TaskPanicPayload> {
         let tx = self.tx.take().expect("a remote task sender publishes at most one result");
         catch_unwind(AssertUnwindSafe(|| tx.send(result)))
-    }
-
-    /// Configures a runtime-integration notification for a captured task panic.
-    ///
-    /// The sender wakes the notifier after publishing the panic result.
-    /// Applications should use `arty` instead of this integration API.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_panic_notifier(mut self, notifier: task::Waker) -> Self {
-        self.panic_notifier = notifier;
-        self
     }
 
     /// Sends a successfully completed result.
@@ -127,7 +109,7 @@ impl<R: Send + 'static> Sender<R> {
     /// # Errors
     ///
     /// Returns a panic payload if notifying the result receiver panics.
-    pub fn completed(mut self, result: R) -> Result<(), TaskPanicPayload> {
+    pub fn completed(self, result: R) -> Result<(), TaskPanicPayload> {
         self.send(TaskResult::Completed(result))
     }
 
@@ -136,10 +118,8 @@ impl<R: Send + 'static> Sender<R> {
     /// # Errors
     ///
     /// Returns a panic payload if notifying the result receiver panics.
-    pub fn panicked(mut self, panic: TaskPanicPayload) -> Result<(), TaskPanicPayload> {
-        let delivery = self.send(TaskResult::Panicked(panic));
-        self.panic_notifier.wake_by_ref();
-        delivery
+    pub fn panicked(self, panic: TaskPanicPayload) -> Result<(), TaskPanicPayload> {
+        self.send(TaskResult::Panicked(panic))
     }
 }
 
