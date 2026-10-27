@@ -433,7 +433,6 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, atomic};
     use std::task::{Context, Poll, Waker};
-    use std::thread;
 
     use static_assertions::assert_not_impl_any;
     use testing_aids::YieldFuture;
@@ -886,18 +885,6 @@ mod tests {
             Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(crate::JoinError::Shutdown(_)))
         ));
-    }
-
-    #[test]
-    fn shutdown_handle_wakes_the_owner_from_another_thread() {
-        let owner_waker = Arc::new(TestWaker::new());
-        let mut executor = new_guarded_executor(Waker::from(Arc::clone(&owner_waker)));
-        let shutdown = executor.shutdown();
-
-        thread::spawn(move || shutdown.trigger(ShutdownCause::default())).join().unwrap();
-
-        assert!(owner_waker.awakened.load(atomic::Ordering::Relaxed));
-        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     }
 
     #[test]

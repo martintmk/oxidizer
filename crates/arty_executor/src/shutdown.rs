@@ -1,44 +1,38 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::cell::Cell;
+use std::cell::OnceCell;
 use std::error::Error;
 use std::fmt::{self, Debug};
-use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
 use std::task::Waker;
 
 use ohno::OhnoCore;
 
 /// A handle that requests executor shutdown.
 ///
-/// Clones share the first shutdown cause. The handle can move to another
-/// thread, but it cannot be shared between threads. Clone it before sending it
-/// to each thread that can request shutdown.
+/// Clones share the first shutdown cause on the executor owner thread.
 #[derive(Clone, derive_more::Debug)]
 pub struct Shutdown {
     #[debug(ignore)]
-    inner: Arc<ShutdownInner>,
-    #[debug(ignore)]
-    not_sync: PhantomData<Cell<()>>,
+    inner: Rc<ShutdownInner>,
 }
 
 impl std::panic::UnwindSafe for Shutdown {}
 impl std::panic::RefUnwindSafe for Shutdown {}
 
 struct ShutdownInner {
-    cause: OnceLock<ShutdownCause>,
+    cause: OnceCell<ShutdownCause>,
     owner_waker: Waker,
 }
 
 impl Shutdown {
     pub(crate) fn new(owner_waker: Waker) -> Self {
         Self {
-            inner: Arc::new(ShutdownInner {
-                cause: OnceLock::new(),
+            inner: Rc::new(ShutdownInner {
+                cause: OnceCell::new(),
                 owner_waker,
             }),
-            not_sync: PhantomData,
         }
     }
 
@@ -223,8 +217,8 @@ mod tests {
 
     #[test]
     fn shutdown_handle_is_cloneable_and_send_only() {
-        assert_impl_all!(Shutdown: Clone, Debug, Send);
-        assert_not_impl_any!(Shutdown: Sync);
+        assert_impl_all!(Shutdown: Clone, Debug);
+        assert_not_impl_any!(Shutdown: Send, Sync);
     }
 
     #[test]
