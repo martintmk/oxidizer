@@ -41,6 +41,7 @@
 pub(crate) mod builtins;
 pub(crate) mod execution;
 pub(crate) mod join;
+pub(crate) mod remote;
 mod runtime_scheduler;
 pub(crate) mod scheduler;
 

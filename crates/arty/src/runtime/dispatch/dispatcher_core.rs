@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Wake, Waker};
 use std::thread::ThreadId;
 
-use arty_executor::remote::Pool as RemotePool;
-use arty_executor::{ShutdownCause, ShutdownError, TaskPlacement};
+use arty_executor::{ShutdownCause, TaskPlacement};
 use foldhash::HashMap;
 use nonempty::NonEmpty;
 use observed::emit;
@@ -25,6 +24,7 @@ use crate::runtime::{Error, Workers};
 use crate::task::Builtins;
 use crate::task::execution::prepare_remote;
 use crate::task::join::JoinHandle;
+use crate::task::remote::Pool as RemotePool;
 
 #[derive(Debug)]
 pub(crate) struct WorkerEndpoint {
@@ -60,6 +60,7 @@ pub(crate) struct DispatcherCore {
     wait_for_shutdown: ThreadWaiter,
 
     shutdown: Shutdown,
+    shutdown_signaled: AtomicBool,
     stopped_reported: AtomicBool,
 
     worker_endpoints: NonEmpty<WorkerEndpoint>,
@@ -124,17 +125,15 @@ impl DispatcherCore {
             worker_endpoints.len(),
             "each runtime worker must have a distinct thread ID"
         );
-        let panic_shutdown_cause = panic_policy.starts_shutdown().then(ShutdownCause::panic);
+        let panic_shutdown_cause = panic_policy.executor_policy().starts_shutdown().then(ShutdownCause::panic);
         Arc::new_cyclic(move |weak| {
-            let notifier = if panic_shutdown_cause.is_some() {
-                Waker::from(StdArc::new(PanicShutdownWake(weak.clone())))
-            } else {
-                Waker::noop().clone()
-            };
-            shutdown.initialize_panic_notifier(notifier);
+            if panic_shutdown_cause.is_some() {
+                shutdown.initialize_panic_notifier(Waker::from(StdArc::new(PanicShutdownWake(weak.clone()))));
+            }
             Self {
                 wait_for_shutdown,
                 shutdown,
+                shutdown_signaled: AtomicBool::new(false),
                 stopped_reported: AtomicBool::new(false),
                 worker_endpoints,
                 workers,
@@ -153,28 +152,18 @@ impl DispatcherCore {
         }
     }
 
-    pub(crate) fn panic_notifier(&self) -> Waker {
-        self.shutdown.panic_notifier()
-    }
-
-    /// Stops the runtime. Safe to call multiple times.
-    #[cfg_attr(test, mutants::skip)] // Removing the public stop boundary strands runtime workers before tests can assert.
-    pub(crate) fn stop(&self) -> ShutdownCause {
-        self.stop_inner(ShutdownCause::default())
-    }
-
-    pub(crate) fn stop_with_error(&self, error: Error) -> ShutdownCause {
-        self.stop_inner(ShutdownError::new(error).into())
+    pub(crate) fn panic_starts_shutdown(&self) -> bool {
+        self.panic_shutdown_cause.is_some()
     }
 
     #[cfg_attr(test, mutants::skip)] // Tests hang if mutation removes the shutdown signal or worker notifications.
-    fn stop_inner(&self, cause: ShutdownCause) -> ShutdownCause {
-        let started = self.shutdown.begin(cause);
+    pub(crate) fn stop_inner(&self, cause: ShutdownCause) -> ShutdownCause {
+        self.shutdown.begin(cause);
         let cause = self
             .shutdown
             .cause()
             .expect("stop_inner begins shutdown before reading the authoritative cause");
-        if !started {
+        if self.shutdown_signaled.swap(true, Ordering::AcqRel) {
             return cause;
         }
 
@@ -362,6 +351,7 @@ mod tests {
     use std::task;
     use std::task::Poll;
 
+    use arty_executor::ShutdownError;
     use testing_aids::TEST_TIMEOUT;
 
     use super::*;
@@ -518,7 +508,7 @@ mod tests {
         let client = DispatcherClient::new(Arc::clone(&core));
         let shutdown = client.shutdown();
 
-        core.stop();
+        core.stop_inner(ShutdownCause::default());
 
         assert_eq!(shutdown.state(), ShutdownState::Started);
     }
@@ -534,7 +524,7 @@ mod tests {
             Shutdown::default(),
             PanicPolicy::default(),
         );
-        dispatcher.stop();
+        dispatcher.stop_inner(ShutdownCause::default());
         let invoked = Arc::new(AtomicBool::new(false));
 
         assert!(
@@ -565,7 +555,7 @@ mod tests {
             Shutdown::default(),
             PanicPolicy::default(),
         );
-        dispatcher.stop_with_error(Error::worker_panicked());
+        dispatcher.stop_inner(ShutdownError::new(Error::worker_panicked()).into());
 
         let mut join = pin!(dispatcher.spawn(|_| async {}));
         let Poll::Ready(Err(error)) = join.as_mut().poll(&mut task::Context::from_waker(Waker::noop())) else {
@@ -598,13 +588,13 @@ mod tests {
         assert_eq!(drain_rx(&worker1_rx).len(), 0);
         assert_eq!(drain_rx(&worker2_rx).len(), 0);
 
-        dispatcher.stop();
+        dispatcher.stop_inner(ShutdownCause::default());
 
         assert_eq!(drain_rx(&worker1_rx).len(), 1);
         assert_eq!(drain_rx(&worker2_rx).len(), 1);
 
         // Call for a stop twice - we expect no further stop commands to be sent.
-        dispatcher.stop();
+        dispatcher.stop_inner(ShutdownCause::default());
 
         assert_eq!(drain_rx(&worker1_rx).len(), 0);
         assert_eq!(drain_rx(&worker2_rx).len(), 0);
@@ -627,7 +617,7 @@ mod tests {
             PanicPolicy::default(),
         );
 
-        dispatcher.stop();
+        dispatcher.stop_inner(ShutdownCause::default());
 
         // Drain the shutdown command.
         _ = worker_rx.recv_timeout(TEST_TIMEOUT).unwrap();

@@ -11,7 +11,10 @@ use nm::{Event, Magnitude, MetricsPusher, Push};
 use observed::Sink;
 use tick::SimpleClock;
 
-use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskSet, executor_context};
+use crate::{
+    CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskPoll, TaskSet,
+    discard_task_panic_payload, executor_context,
+};
 
 /// The async task executor for a single thread.
 ///
@@ -65,8 +68,8 @@ use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCau
 ///
 /// # Process termination
 ///
-/// Plain executor tasks terminate the process if their futures panic. Runtime integrations can
-/// register a remote result target that receives captured panics without unwinding the worker.
+/// Task panics are contained. [`ExecutorBuilder::panic_policy`] selects
+/// whether a task panic starts executor shutdown.
 #[derive(Debug)]
 pub struct Executor {
     shared: ExecutorShared,
@@ -84,8 +87,8 @@ impl Executor {
     }
 
     #[must_use]
-    pub(crate) fn new(owner_waker: task::Waker, sink: Sink, thread_id: ThreadId) -> Self {
-        let shared = ExecutorShared::new(owner_waker, sink, thread_id);
+    pub(crate) fn new(owner_waker: task::Waker, sink: Sink, thread_id: ThreadId, panic_policy: crate::PanicPolicy) -> Self {
+        let shared = ExecutorShared::new(owner_waker, sink, thread_id, panic_policy);
         let clock = SimpleClock::new_system().with_fast_instant(true);
         // Register before creating an executor whose Drop would unregister this thread.
         executor_context::register(thread_id);
@@ -185,7 +188,7 @@ impl Executor {
 
     fn cycle_outcome(&self) -> CycleOutcome {
         if self.evaluate_shutdown_completion() {
-            CycleOutcome::Shutdown
+            CycleOutcome::Shutdown(self.shared.shutdown_cause())
         } else if self.has_work_to_do() {
             CYCLE_OUTCOME_CONTINUE.with(Event::observe_once);
             CycleOutcome::Continue
@@ -234,7 +237,7 @@ impl Executor {
             let outcome = task.poll();
             let task_handle = self.active.pop_front().expect("the task remains active until its poll returns");
             match outcome {
-                task::Poll::Ready(()) => {
+                outcome @ (TaskPoll::Ready | TaskPoll::Panicked(_)) => {
                     if linked {
                         // SAFETY: `linked` was read from the live active task, whose list ownership
                         // belongs to this executor and is accessed on the task owner thread.
@@ -242,8 +245,14 @@ impl Executor {
                     }
                     self.shared.decrement_task_count(1);
                     completed_count = completed_count.saturating_add(1);
+                    if let TaskPoll::Panicked(panic) = outcome {
+                        if self.shared.panic_policy().starts_shutdown() {
+                            self.shared.shutdown().trigger(ShutdownCause::panic());
+                        }
+                        discard_task_panic_payload(panic);
+                    }
                 }
-                task::Poll::Pending => {
+                TaskPoll::Pending => {
                     pending_count = pending_count.saturating_add(1);
                     if linked {
                         drop(task_handle);
@@ -552,7 +561,7 @@ mod tests {
         assert!(task_completed.get());
 
         // The executor must now believe it has no more work to do.
-        assert_eq!(outcome, CycleOutcome::Suspend);
+        assert!(matches!(outcome, CycleOutcome::Suspend));
 
         // Verify the join handle provides the result.
         let mut cx = Context::from_waker(Waker::noop());
@@ -568,7 +577,7 @@ mod tests {
 
         let mut executor = new_guarded_executor(Waker::noop().clone());
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     }
 
     #[test]
@@ -593,7 +602,7 @@ mod tests {
         let outcome = executor.execute_cycle();
 
         // The executor must now believe it has no more work to do.
-        assert_eq!(outcome, CycleOutcome::Suspend);
+        assert!(matches!(outcome, CycleOutcome::Suspend));
 
         // Verify the join handle provides the result.
         let mut cx = Context::from_waker(Waker::noop());
@@ -621,13 +630,13 @@ mod tests {
         wakes_self.set(true);
 
         // The first cycle should cause the task to awaken itself and request continue
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
 
         // Disable self-awakening for the next poll, so the executor will settle down.
         wakes_self.set(false);
 
         // The second cycle should inactivate the task (it will never complete in this test).
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     }
 
     #[test]
@@ -661,8 +670,8 @@ mod tests {
         _ = tasks.add_test(future1);
         _ = tasks.add_test(future2);
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     }
 
     #[test]
@@ -677,13 +686,13 @@ mod tests {
         let mut join_handle = tasks.add_test(future);
 
         // The future should inactivate, leading to a Suspend outcome.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         future_waker.borrow().as_ref().unwrap().wake_by_ref();
         future_complete.set(true);
 
         // The future should complete, leading to a Suspend outcome.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         let mut cx = Context::from_waker(Waker::noop());
         let result = Pin::new(&mut join_handle).poll(&mut cx);
@@ -717,7 +726,7 @@ mod tests {
         let mut inactive_join_handle = tasks.add_test(inactive_future);
 
         // The futures should all inactivate, leading to a Suspend outcome.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         for future_waker in future_wakers {
             future_waker.borrow().as_ref().unwrap().wake_by_ref();
@@ -728,7 +737,7 @@ mod tests {
         }
 
         // The futures should all complete, leading to a Suspend outcome.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         let mut cx = Context::from_waker(Waker::noop());
 
@@ -760,12 +769,12 @@ mod tests {
         _ = tasks.add_test(future);
 
         // Task gets polled and then inactivates.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         assert_eq!(poll_count.get(), 1);
 
         // Nothing to poll here, no task has awakened.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         // Note: there is no requirement to only poll a task after it has been awakened. It is fine
         // to poll even without any signal. We rely on white-box knowledge here to establish that
@@ -810,7 +819,7 @@ mod tests {
 
         assert!(!drop_signal.get());
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         assert!(drop_signal.get());
     }
 
@@ -820,7 +829,28 @@ mod tests {
 
         executor.shutdown().trigger(ShutdownCause::default());
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
+    }
+
+    #[test]
+    fn shutdown_panic_policy_returns_the_panic_cause() {
+        let mut executor = Executor::builder().panic_policy(crate::PanicPolicy::shutdown()).build();
+        let mut join = executor.tasks().add_test(std::future::poll_fn(|_| -> Poll<()> {
+            std::panic::panic_any("task panic");
+        }));
+
+        let CycleOutcome::Shutdown(cause) = executor.execute_cycle() else {
+            panic!("task panic must shut down the executor");
+        };
+
+        assert_eq!(
+            cause.as_error().unwrap().inner().to_string(),
+            "a contained runtime operation panicked"
+        );
+        assert!(matches!(
+            Pin::new(&mut join).poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(crate::JoinError::Shutdown(_)))
+        ));
     }
 
     #[test]
@@ -833,7 +863,7 @@ mod tests {
 
         shutdown.trigger(ShutdownCause::default());
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         assert!(dropped.get());
         assert!(matches!(
             Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop())),
@@ -851,7 +881,7 @@ mod tests {
             Poll::Pending::<()>
         }));
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         assert!(matches!(
             Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(crate::JoinError::Shutdown(_)))
@@ -867,7 +897,7 @@ mod tests {
         thread::spawn(move || shutdown.trigger(ShutdownCause::default())).join().unwrap();
 
         assert!(owner_waker.awakened.load(atomic::Ordering::Relaxed));
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     }
 
     #[test]
@@ -891,7 +921,7 @@ mod tests {
 
         executor.shutdown().trigger(ShutdownCause::default());
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     }
 
     #[test]
@@ -903,7 +933,7 @@ mod tests {
 
         executor.shutdown().trigger(ShutdownCause::default());
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         let mut cx = Context::from_waker(Waker::noop());
         let result = Pin::new(&mut join_handle).poll(&mut cx);
 
@@ -946,7 +976,7 @@ mod tests {
                 Poll::<()>::Pending
             }
         }));
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         let waker = retained.borrow_mut().take().unwrap();
         std::thread::spawn(move || waker.wake()).join().unwrap();
@@ -964,7 +994,7 @@ mod tests {
         let retained = future.waker();
         let mut handle = executor.tasks().add_test(future);
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
         retained.borrow().as_ref().unwrap().wake_by_ref();
         executor.activate_awakened_tasks();
         drop(executor);
@@ -988,7 +1018,7 @@ mod tests {
         tasks.add_test(future);
 
         // It just inactivates immediately after storing the waker, so nothing else to do.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         // It should not have been triggered yet, nothing has poked a waker.
         assert!(!owner_waker.awakened.load(atomic::Ordering::Relaxed));
@@ -1014,10 +1044,10 @@ mod tests {
         _ = tasks.add_test(future);
 
         // The task is polled, which suspends due to the inner future's `Pending`.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
 
         // The inner future triggered the waker, so the task activates again and runs to completion.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     }
 
     #[test]
@@ -1044,12 +1074,12 @@ mod tests {
 
         // The outer task spawns a new task and completes. We get `Continue` because
         // the executor can see it has a new task enqueued, which it wants to process.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Continue);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
 
         assert!(!inner_task_completed.get());
 
         // The inner task now runs to completion.
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         assert!(inner_task_completed.get());
     }
@@ -1078,15 +1108,23 @@ mod tests {
             cycles.push((executor.execute_cycle(), polls.borrow().clone()));
         }
 
-        assert_eq!(
-            cycles,
-            [
-                (CycleOutcome::Continue, vec![0, 1]),
-                (CycleOutcome::Suspend, vec![0, 1, 2, 3]),
-                (CycleOutcome::Continue, vec![0, 1, 2, 3, 4, 5]),
-                (CycleOutcome::Suspend, vec![0, 1, 2, 3, 4, 5, 6, 7]),
-            ]
-        );
+        let [
+            (first, first_polls),
+            (second, second_polls),
+            (third, third_polls),
+            (fourth, fourth_polls),
+        ] = cycles.as_slice()
+        else {
+            panic!("two registration batches must produce four cycles");
+        };
+        assert!(matches!(first, CycleOutcome::Continue));
+        assert_eq!(first_polls, &[0, 1]);
+        assert!(matches!(second, CycleOutcome::Suspend));
+        assert_eq!(second_polls, &[0, 1, 2, 3]);
+        assert!(matches!(third, CycleOutcome::Continue));
+        assert_eq!(third_polls, &[0, 1, 2, 3, 4, 5]);
+        assert!(matches!(fourth, CycleOutcome::Suspend));
+        assert_eq!(fourth_polls, &[0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -1103,7 +1141,7 @@ mod tests {
             move |_| polls.borrow_mut().push(2)
         });
         tasks.add_test(future);
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
         polls.borrow_mut().clear();
 
         future_waker.borrow().as_ref().unwrap().wake_by_ref();
@@ -1115,10 +1153,8 @@ mod tests {
             });
         }
 
-        assert_eq!(
-            (executor.execute_cycle(), polls.borrow().clone()),
-            (CycleOutcome::Suspend, vec![0, 1, 2])
-        );
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+        assert_eq!(*polls.borrow(), [0, 1, 2]);
     }
 
     #[test]
@@ -1136,9 +1172,9 @@ mod tests {
             }
         }));
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
         executor.shutdown().trigger(ShutdownCause::default());
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         drop(executor);
 
         waker.borrow().as_ref().unwrap().wake_by_ref();
@@ -1159,7 +1195,7 @@ mod tests {
             });
             executor.tasks().add_test(future);
         }
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         // Recheck first-notification order after each cycle clears and reuses the awakened queue.
         for _ in 0..3 {
@@ -1167,10 +1203,8 @@ mod tests {
             for index in [2, 0, 2, 1] {
                 wakers[index].borrow().as_ref().unwrap().wake_by_ref();
             }
-            assert_eq!(
-                (executor.execute_cycle(), polls.borrow().clone()),
-                (CycleOutcome::Suspend, vec![2, 0, 1])
-            );
+            assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+            assert_eq!(*polls.borrow(), [2, 0, 1]);
         }
     }
 
@@ -1181,7 +1215,7 @@ mod tests {
         let future_waker = future.waker();
         let completes = future.completes_on_next_poll();
         let mut handle = executor.tasks().add_test(future);
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
         let waker = future_waker.borrow().as_ref().unwrap().clone();
         std::thread::spawn(move || {
@@ -1195,7 +1229,8 @@ mod tests {
 
         let outcome = executor.execute_cycle();
         let result = Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop()));
-        assert_eq!((outcome, result), (CycleOutcome::Suspend, Poll::Ready(Ok(()))));
+        assert!(matches!(outcome, CycleOutcome::Suspend));
+        assert_eq!(result, Poll::Ready(Ok(())));
     }
 
     #[test]
@@ -1214,11 +1249,11 @@ mod tests {
             })
         });
 
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
         let retained_waiter = retained_waiter.borrow_mut().take().unwrap();
         drop(task);
         executor.shutdown().trigger(ShutdownCause::default());
-        assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         drop(executor);
 
         retained_waiter.wake_by_ref();

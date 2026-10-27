@@ -47,7 +47,8 @@ Cloned task wakers may outlive their tasks. After completion or cancellation, an
 remains callable but becomes an inert no-op and cannot delay executor shutdown.
 
 Join handles may outlive the executor and report shutdown cancellation through [`JoinError`][__link2].
-A panic in a directly registered executor task remains fail-fast.
+Task panics are contained. [`ExecutorBuilder::panic_policy`][__link3] selects
+whether they start executor shutdown.
 
 
 <hr/>
@@ -55,7 +56,8 @@ A panic in a directly registered executor task remains fail-fast.
 This crate was developed as part of <a href="https://github.com/microsoft/oxidizer">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/oxidizer/tree/main/crates/arty_executor">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQb0ssyKW-xaUMbwa94lbEFLS8b7HHmDeDdLXQbs87lzXXXrvxhZIKCaUpvaW5FcnJvcvaCbWFydHlfZXhlY3V0b3JlMC41LjA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQborR2_k_xJd4bTcf2krrNPIcbP72Pw1UdRjkbim_eMDe2BBthYvRhcoQbNW9eDFnVg_IbC11uMS5gERkb4Ao1PQqwIy4b7v4OM-R-DRhhZIOCb0V4ZWN1dG9yQnVpbGRlcvaCaUpvaW5FcnJvcvaCZnJlbW90ZfY
  [__link0]: https://docs.rs/arty
- [__link1]: https://docs.rs/arty_executor/0.5.0/arty_executor/remote/index.html
+ [__link1]: https://crates.io/crates/remote
  [__link2]: https://crates.io/crates/JoinError
+ [__link3]: https://docs.rs/ExecutorBuilder/latest/ExecutorBuilder/?search=panic_policy

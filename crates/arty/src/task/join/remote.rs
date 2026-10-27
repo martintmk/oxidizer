@@ -5,7 +5,6 @@ use std::pin::Pin;
 use std::task::{self, Poll};
 
 use arty_executor::ShutdownCause;
-use arty_executor::remote::JoinHandle as RemoteJoinHandle;
 use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
 
@@ -13,6 +12,7 @@ use super::JoinError;
 use crate::runtime::Shutdown;
 use crate::runtime::blocking_worker::is_current_blocking_pool;
 use crate::task::Scheduler;
+use crate::task::remote::{ReceiveError, Receiver as RemoteJoinHandle};
 
 /// A handle for receiving an async or blocking task's result.
 ///
@@ -58,6 +58,7 @@ where
     #[debug(ignore)]
     state: State<R>,
     shutdown: Shutdown,
+    panic_starts_shutdown: bool,
     blocking_pool: Option<Arc<()>>,
     #[debug(ignore)]
     relocation: Option<ResultRelocation<R>>,
@@ -99,10 +100,11 @@ impl<R> JoinHandle<R>
 where
     R: Send + 'static,
 {
-    pub(crate) fn new(inner: RemoteJoinHandle<R>, shutdown: Shutdown) -> Self {
+    pub(crate) fn new(inner: RemoteJoinHandle<R>, shutdown: Shutdown, panic_starts_shutdown: bool) -> Self {
         Self {
             state: State::Pending(inner),
             shutdown,
+            panic_starts_shutdown,
             blocking_pool: None,
             relocation: None,
         }
@@ -112,6 +114,7 @@ where
         Self {
             state: State::Error(Some(ImmediateError::Shutdown(cause))),
             shutdown: Shutdown::default(),
+            panic_starts_shutdown: false,
             blocking_pool: None,
             relocation: None,
         }
@@ -125,6 +128,7 @@ where
         Self {
             state: State::Error(Some(ImmediateError::InvalidDestination)),
             shutdown: Shutdown::default(),
+            panic_starts_shutdown: false,
             blocking_pool: None,
             relocation: None,
         }
@@ -170,13 +174,26 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         assert_not_current_blocking_pool(this.blocking_pool.as_ref());
-        if let Some(cause) = this.shutdown.cause() {
-            this.state = State::Completed;
-            return Poll::Ready(Err(JoinError::shutdown(cause.into_error())));
-        }
+        let shutdown_cause = this.shutdown.cause();
+        let blocking = this.blocking_pool.is_some();
         let mut result = match &mut this.state {
             State::Pending(inner) => match Pin::new(inner).poll(cx) {
-                Poll::Ready(result) => Poll::Ready(result.map_err(JoinError::from_executor)),
+                Poll::Ready(Ok(_)) if shutdown_cause.is_some() && !blocking => {
+                    Poll::Ready(Err(JoinError::shutdown(shutdown_cause.and_then(ShutdownCause::into_error))))
+                }
+                Poll::Ready(Ok(result)) => Poll::Ready(Ok(result)),
+                Poll::Ready(Err(ReceiveError::Panicked(panic))) => {
+                    if this.panic_starts_shutdown {
+                        this.shutdown.begin(ShutdownCause::panic());
+                    }
+                    Poll::Ready(Err(JoinError::panicked(panic)))
+                }
+                Poll::Ready(Err(ReceiveError::Disconnected)) => {
+                    Poll::Ready(Err(JoinError::shutdown(shutdown_cause.and_then(ShutdownCause::into_error))))
+                }
+                Poll::Pending if shutdown_cause.is_some() && !blocking => {
+                    Poll::Ready(Err(JoinError::shutdown(shutdown_cause.and_then(ShutdownCause::into_error))))
+                }
                 Poll::Pending => Poll::Pending,
             },
             State::Error(error) => Poll::Ready(Err(error

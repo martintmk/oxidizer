@@ -39,7 +39,8 @@
 //! remains callable but becomes an inert no-op and cannot delay executor shutdown.
 //!
 //! Join handles may outlive the executor and report shutdown cancellation through [`JoinError`].
-//! A panic in a directly registered executor task remains fail-fast.
+//! Task panics are contained. [`ExecutorBuilder::panic_policy`] selects
+//! whether they start executor shutdown.
 
 mod builder;
 #[cfg(all(debug_assertions, test))]
@@ -50,7 +51,7 @@ mod executor_context;
 mod executor_shared;
 mod join_handle;
 mod panic;
-pub mod remote;
+mod panic_policy;
 mod shutdown;
 mod task;
 mod task_handle;
@@ -68,6 +69,7 @@ pub use executor::*;
 pub(crate) use executor_shared::*;
 pub use join_handle::*;
 pub use panic::*;
+pub use panic_policy::*;
 pub use shutdown::*;
 pub(crate) use task::*;
 pub(crate) use task_handle::*;

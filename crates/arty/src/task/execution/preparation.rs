@@ -4,9 +4,8 @@
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
-use arty_executor::remote::{Pool as RemotePool, Sender as RemoteSender};
 use arty_executor::{TaskOptions, TaskPlacement, TaskSet, discard_task_panic_payload};
 use observed::context::Transfer;
 use pin_project::pin_project;
@@ -15,6 +14,7 @@ use plurality::{Box as PoolBox, MultiPool, coerce};
 use crate::runtime::{Shutdown, ShutdownState};
 use crate::task::Builtins;
 use crate::task::join::JoinHandle;
+use crate::task::remote::{Pool as RemotePool, Sender as RemoteSender};
 
 thread_local! {
     static FUTURE_FACTORIES: MultiPool = MultiPool::new();
@@ -83,7 +83,6 @@ where
     #[pin]
     future: Option<F>,
     result_tx: Option<RemoteSender<R>>,
-    panic_notifier: Waker,
 }
 
 impl<F, R> RemoteResultTask<F, R>
@@ -91,11 +90,10 @@ where
     F: Future<Output = R>,
     R: Send + 'static,
 {
-    pub(crate) fn new(future: F, result_tx: RemoteSender<R>, panic_notifier: Waker) -> Self {
+    pub(crate) fn new(future: F, result_tx: RemoteSender<R>) -> Self {
         Self {
             future: Some(future),
             result_tx: Some(result_tx),
-            panic_notifier,
         }
     }
 }
@@ -136,7 +134,6 @@ where
                 }
                 let result_tx = this.result_tx.take().expect("a panicked result task retains its sender");
                 let delivery = result_tx.panicked(panic);
-                this.panic_notifier.wake_by_ref();
                 if let Err(panic) = delivery {
                     discard_task_panic_payload(panic);
                 }
@@ -264,22 +261,20 @@ where
 {
     let (result_tx, result_rx) = result_pool.channel();
     let result_tx = PendingResult::new(result_tx, shutdown.clone());
-    let (terminal_tx, terminal_rx) = result_pool.channel();
-    drop(terminal_rx);
     let future_factory = TaskFactory::new(future_factory, parent_task_enrichment);
     let future_factory = RemoteFutureFactory::new(move |cx, tasks| {
         // Factory invocation belongs inside the same panic boundary as polling.
         let (future_factory, parent_task_enrichment) = future_factory.into_parts();
-        let panic_notifier = cx.dispatcher().panic_notifier();
         let inner = DeferredTask::new(future_factory, cx);
 
         // The executor join handle is not used - the task delivers its result through the
         // channel above, which unlike the executor's join handle can cross thread boundaries.
         let options = TaskOptions::observed(parent_task_enrichment, placement);
-        let inner = RemoteResultTask::new(inner, result_tx.into_sender(), panic_notifier);
-        tasks.add_with_remote_result(inner, options, terminal_tx);
+        let inner = RemoteResultTask::new(inner, result_tx.into_sender());
+        drop(tasks.add(inner, options));
     });
-    (future_factory, JoinHandle::new(result_rx, shutdown))
+    let panic_starts_shutdown = shutdown.panic_starts_shutdown();
+    (future_factory, JoinHandle::new(result_rx, shutdown, panic_starts_shutdown))
 }
 
 pub(crate) fn prepare_blocking<F, R>(
@@ -296,7 +291,8 @@ where
         pending: Some((body, result_tx)),
         shutdown: shutdown.clone(),
     };
-    (move || task.run(), JoinHandle::new(result_rx, shutdown))
+    let panic_starts_shutdown = shutdown.panic_starts_shutdown();
+    (move || task.run(), JoinHandle::new(result_rx, shutdown, panic_starts_shutdown))
 }
 
 struct BlockingTask<F, R: Send + 'static> {
@@ -344,7 +340,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
-    use std::task::Wake;
+    use std::task::{Wake, Waker};
 
     use arty_executor::{CycleOutcome, Executor};
     use futures::executor::block_on;
@@ -457,7 +453,7 @@ mod tests {
 
     /// Drives the executor until it reports that no further progress can be made.
     fn run_to_completion(executor: &mut Executor) {
-        while executor.execute_cycle() == CycleOutcome::Continue {}
+        while matches!(executor.execute_cycle(), CycleOutcome::Continue) {}
     }
 
     struct PanicWake;

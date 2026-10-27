@@ -40,7 +40,7 @@ fn remote_notifications_preserve_first_wake_order_and_task_ownership() {
             TaskOptions::default(),
         )
     });
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     polls.borrow_mut().clear();
     ready.set(true);
     let wakers = retained.take();
@@ -55,7 +55,7 @@ fn remote_notifications_preserve_first_wake_order_and_task_ownership() {
     .join()
     .unwrap();
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(*polls.borrow(), [2, 0, 1]);
     for (index, handle) in handles.iter_mut().enumerate() {
         assert_eq!(
@@ -106,7 +106,7 @@ fn remote_consuming_wake_keeps_payload_on_owner_when_notification_panics() {
         }),
         TaskOptions::default(),
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let waker = retained.borrow_mut().take().unwrap();
 
     std::thread::spawn(move || {
@@ -135,11 +135,11 @@ fn retained_waker_is_noop_after_shutdown() {
         TaskOptions::default(),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = retained.borrow_mut().take().unwrap();
     drop(task);
     executor.shutdown().trigger(arty_executor::ShutdownCause::default());
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     drop(executor);
 
     std::thread::spawn(move || {
@@ -176,7 +176,7 @@ fn owner_waker_panic_does_not_prevent_shutdown() {
         }),
         TaskOptions::default(),
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = retained.borrow_mut().take().unwrap();
 
     assert!(catch_unwind(AssertUnwindSafe(|| retained.wake())).is_err());
@@ -187,7 +187,7 @@ fn owner_waker_panic_does_not_prevent_shutdown() {
         }))
         .is_err()
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 }
 
 #[test]

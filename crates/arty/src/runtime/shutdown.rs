@@ -42,6 +42,10 @@ impl Shutdown {
         self.inner.panic_notifier.get().cloned().unwrap_or_else(|| Waker::noop().clone())
     }
 
+    pub(crate) fn panic_starts_shutdown(&self) -> bool {
+        self.inner.panic_notifier.get().is_some()
+    }
+
     #[must_use]
     pub(crate) fn state(&self) -> ShutdownState {
         if self.inner.cause.get().is_some() {

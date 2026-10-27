@@ -12,7 +12,6 @@ use std::thread::ThreadId;
 use std::{fmt, thread};
 
 use arty_executor::discard_task_panic_payload;
-use arty_executor::remote::Pool as RemotePool;
 use observed::{Sink, emit};
 use performables::arc::Arc;
 use performables::sync::channel;
@@ -22,6 +21,7 @@ use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::telemetry::events::{BlockingWorkerPoolMode, BlockingWorkerPoolSaturated, SystemMetricCount};
 use crate::task::execution::prepare_blocking;
 use crate::task::join::JoinHandle;
+use crate::task::remote::Pool as RemotePool;
 
 const ERR_POISONED_LOCK: &str = "poisoned lock - cannot continue execution because security and privacy guarantees can no longer be upheld";
 

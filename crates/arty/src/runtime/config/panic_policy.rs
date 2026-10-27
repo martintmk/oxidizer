@@ -26,7 +26,7 @@
 #[repr(transparent)]
 #[derive(Debug, Clone)]
 pub struct PanicPolicy {
-    shutdown: bool,
+    inner: arty_executor::PanicPolicy,
 }
 
 impl PanicPolicy {
@@ -34,7 +34,9 @@ impl PanicPolicy {
     /// contained panic.
     #[must_use]
     pub const fn shutdown() -> Self {
-        Self { shutdown: true }
+        Self {
+            inner: arty_executor::PanicPolicy::shutdown(),
+        }
     }
 
     /// Creates a policy that contains the panic and keeps the runtime running.
@@ -45,11 +47,13 @@ impl PanicPolicy {
     /// can leave shared user state corrupted.
     #[must_use]
     pub const fn ignore() -> Self {
-        Self { shutdown: false }
+        Self {
+            inner: arty_executor::PanicPolicy::ignore(),
+        }
     }
 
-    pub(crate) const fn starts_shutdown(self) -> bool {
-        self.shutdown
+    pub(crate) fn executor_policy(&self) -> arty_executor::PanicPolicy {
+        self.inner.clone()
     }
 }
 
@@ -66,11 +70,11 @@ mod tests {
 
     #[test]
     fn default_policy_starts_shutdown() {
-        assert!(PanicPolicy::default().starts_shutdown());
+        assert!(PanicPolicy::default().executor_policy().starts_shutdown());
     }
 
     #[test]
     fn ignore_policy_keeps_the_runtime_running() {
-        assert!(!PanicPolicy::ignore().starts_shutdown());
+        assert!(!PanicPolicy::ignore().executor_policy().starts_shutdown());
     }
 }

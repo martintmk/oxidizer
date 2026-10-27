@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::remote::Sender as RemoteSender;
 use crate::{ExecutorShared, JoinHandle, TaskOptions};
 
 /// Represents the set of tasks currently registered with an executor and allows new tasks
@@ -33,21 +32,6 @@ impl TaskSet {
         R: 'static,
     {
         self.shared.add_task(future, options)
-    }
-
-    /// Registers a task whose result is delivered to a cross-thread receiver.
-    ///
-    /// Arty uses this integration boundary to create a non-[`Send`] future on its destination
-    /// worker while returning a `Send` result handle to the submitting thread. Keeping the
-    /// concrete future at this call site lets the executor store it inline instead of behind a
-    /// `Pin<Box<dyn Future>>`. Obtain `result_tx` from
-    /// [`remote::Pool::channel`](crate::remote::Pool::channel).
-    pub fn add_with_remote_result<F, R>(&self, future: F, options: TaskOptions, result_tx: RemoteSender<R>)
-    where
-        F: IntoFuture<Output = R> + 'static,
-        R: Send + 'static,
-    {
-        self.shared.add_remote_task(future, options, result_tx);
     }
 
     #[cfg(test)]

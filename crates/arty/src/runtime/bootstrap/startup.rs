@@ -18,7 +18,7 @@ use tick::runtime::InactiveClock;
 use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::bootstrap::pools::BlockingPools;
-use crate::runtime::config::{MonitorOptions, RuntimeConfig};
+use crate::runtime::config::{MonitorOptions, PanicPolicy, RuntimeConfig};
 use crate::runtime::dispatch::{DispatcherClient, DispatcherCore, WorkerEndpoint};
 use crate::runtime::error::Error;
 use crate::runtime::handle::Runtime;
@@ -109,6 +109,7 @@ fn build_with_processors(
                 io_runtime: io_runtime.clone(),
                 sink: sink.clone(),
                 monitor_options: monitor_options.for_worker(),
+                panic_policy: panic_policy.clone(),
             }
             .start(),
         );
@@ -180,6 +181,7 @@ struct AsyncWorkerStartInfo {
     io_runtime: IoRuntime,
     sink: Sink,
     monitor_options: MonitorOptions,
+    panic_policy: PanicPolicy,
 }
 
 impl AsyncWorkerStartInfo {
@@ -209,6 +211,7 @@ impl AsyncWorkerStartInfo {
             io_runtime,
             sink,
             monitor_options,
+            panic_policy,
         } = self;
 
         let worker_sink = sink.clone();
@@ -252,6 +255,7 @@ impl AsyncWorkerStartInfo {
             clock,
             signal,
             monitor_options,
+            panic_policy,
         );
 
         emit!(
@@ -289,7 +293,7 @@ impl AsyncWorkerStartInfo {
 
 fn report_worker_failure(outcome: &std::thread::Result<()>, dispatcher: &DispatcherClient) {
     if outcome.is_err() {
-        _ = dispatcher.stop_with_error(Error::worker_panicked());
+        _ = dispatcher.stop(arty_executor::ShutdownError::new(Error::worker_panicked()).into());
     }
 }
 
@@ -347,7 +351,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::blocking_worker::BlockingPool;
-    use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, PanicPolicy, WorkersPolicy};
+    use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, WorkersPolicy};
 
     thread_local! {
         static WORKER_LOCAL_CALLS: AtomicUsize = const { AtomicUsize::new(0) };

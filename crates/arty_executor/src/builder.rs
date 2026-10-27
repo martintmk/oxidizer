@@ -6,7 +6,7 @@ use std::task::Waker;
 use observed::Sink;
 use thread_aware_core::Thread;
 
-use crate::Executor;
+use crate::{Executor, PanicPolicy};
 
 /// Builds an instance of [`Executor`].
 #[derive(Debug)]
@@ -15,6 +15,7 @@ pub struct ExecutorBuilder {
     owner_waker: Waker,
     sink: Sink,
     thread: Option<Thread>,
+    panic_policy: PanicPolicy,
 }
 
 impl ExecutorBuilder {
@@ -24,6 +25,7 @@ impl ExecutorBuilder {
             owner_waker: Waker::noop().clone(),
             sink: Sink::noop(),
             thread: None,
+            panic_policy: PanicPolicy::default(),
         }
     }
 
@@ -56,6 +58,12 @@ impl ExecutorBuilder {
         self
     }
 
+    /// Configures how the executor responds to a contained task panic.
+    pub fn panic_policy(mut self, policy: PanicPolicy) -> Self {
+        self.panic_policy = policy;
+        self
+    }
+
     /// Builds the executor with the configured settings.
     ///
     /// # Panics
@@ -73,7 +81,7 @@ impl ExecutorBuilder {
             );
             thread.id()
         });
-        Executor::new(self.owner_waker, self.sink, thread_id)
+        Executor::new(self.owner_waker, self.sink, thread_id, self.panic_policy)
     }
 }
 
@@ -90,6 +98,17 @@ mod tests {
     #[test]
     fn default_builder() {
         _ = ExecutorBuilder::default();
+    }
+
+    #[test]
+    fn panic_policy_is_configurable() {
+        assert!(!ExecutorBuilder::new().panic_policy.starts_shutdown());
+        assert!(
+            ExecutorBuilder::new()
+                .panic_policy(PanicPolicy::shutdown())
+                .panic_policy
+                .starts_shutdown()
+        );
     }
 
     #[test]

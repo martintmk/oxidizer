@@ -3,7 +3,6 @@
 
 use std::cell::{Cell, RefCell};
 
-use arty_executor::remote::Pool as RemotePool;
 use arty_executor::{Shutdown as ExecutorShutdown, ShutdownCause, TaskOptions, TaskPlacement, TaskSet};
 use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
@@ -13,6 +12,7 @@ use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
 use crate::task::Builtins;
 use crate::task::execution::{DeferredTask, RemoteResultTask};
 use crate::task::join::JoinHandle;
+use crate::task::remote::Pool as RemotePool;
 
 thread_local! {
     // Remains set while executor shutdown destroys user futures, even after the
@@ -225,15 +225,16 @@ impl Scheduler {
             let parent_task_enrichment = sink.transfer_context();
             let builtins = current.builtins.clone();
             let (result_tx, result_rx) = current.results.channel();
-            let panic_notifier = builtins.dispatcher().panic_notifier();
             let inner = DeferredTask::new(future_factory, builtins);
-            let inner = RemoteResultTask::new(inner, result_tx, panic_notifier);
+            let inner = RemoteResultTask::new(inner, result_tx);
             let options = TaskOptions::observed(parent_task_enrichment, TaskPlacement::SameThread);
-            let (terminal_tx, terminal_rx) = current.results.channel();
-            drop(terminal_rx);
-            current.tasks.add_with_remote_result(inner, options, terminal_tx);
+            drop(current.tasks.add(inner, options));
             self.dispatcher.wake_worker(self.binding.worker_index);
-            Ok(JoinHandle::new(result_rx, self.dispatcher.shutdown().clone()))
+            Ok(JoinHandle::new(
+                result_rx,
+                self.dispatcher.shutdown().clone(),
+                self.dispatcher.panic_starts_shutdown(),
+            ))
         })
     }
 

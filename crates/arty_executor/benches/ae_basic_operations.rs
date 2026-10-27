@@ -136,7 +136,7 @@ fn retained_waker_after_executor_drop() -> Waker {
         TaskOptions::default(),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = captured.borrow_mut().take().expect("the task captured its waker");
     drop(executor);
     drop(handle);

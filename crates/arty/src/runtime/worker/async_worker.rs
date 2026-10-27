@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use arty_executor::{CycleOutcome, Executor, Shutdown as ExecutorShutdown, TaskSet};
+use arty_executor::{CycleOutcome, Executor, TaskSet};
 use observed::Sink;
 use performables::arc::Arc;
 use performables::sync::channel;
@@ -81,7 +81,6 @@ pub(crate) struct AsyncWorker {
 
     // Becomes None during shutdown when the executor is dropped to cancel and release its tasks.
     executor: Option<Executor>,
-    executor_shutdown: ExecutorShutdown,
 
     // Connected to the `executor`. Submissions after shutdown resolve to an executor-shutdown
     // JoinError rather than registering a task.
@@ -114,6 +113,7 @@ impl AsyncWorker {
         clock: InactiveClock,
         signal: Arc<WorkerSignal>,
         monitor_options: MonitorOptions,
+        panic_policy: crate::runtime::PanicPolicy,
     ) -> Self {
         let worker_waker = WorkerSignal::waker(&signal);
         let shutdown = dispatcher.shutdown().clone();
@@ -124,6 +124,7 @@ impl AsyncWorker {
             .owner_waker(worker_waker)
             .sink(blocking_worker.sink().clone())
             .thread(thread.clone())
+            .panic_policy(panic_policy.executor_policy())
             .build();
         let tasks = executor.tasks();
         let executor_shutdown = executor.shutdown();
@@ -136,7 +137,6 @@ impl AsyncWorker {
             builtins: Some(builtins),
             shutdown,
             executor: Some(executor),
-            executor_shutdown,
             tasks,
             clock_driver,
             time,
@@ -179,10 +179,13 @@ impl AsyncWorker {
 
         let cycle_outcome = executor.execute_cycle();
 
-        if matches!(cycle_outcome, CycleOutcome::Shutdown) {
+        if let CycleOutcome::Shutdown(cause) = cycle_outcome {
             // An alternate low-level owner initiated executor shutdown. Complete the surrounding
             // worker shutdown before final timer callbacks run.
-            self.shutdown.begin(self.executor_shutdown.cause());
+            if let Some(builtins) = &self.builtins {
+                builtins.dispatcher().stop(cause.clone());
+            }
+            self.shutdown.begin(cause);
             self.begin_shutdown();
             let now = self.timer_now();
             _ = self.clock_driver.advance_timers(now);
@@ -359,8 +362,8 @@ mod tests {
         assert!(!can_suspend(CycleOutcome::Suspend, true));
         assert!(!can_suspend(CycleOutcome::Continue, false));
         assert!(!can_suspend(CycleOutcome::Continue, true));
-        assert!(!can_suspend(CycleOutcome::Shutdown, false));
-        assert!(!can_suspend(CycleOutcome::Shutdown, true));
+        assert!(!can_suspend(CycleOutcome::Shutdown(ShutdownCause::default()), false));
+        assert!(!can_suspend(CycleOutcome::Shutdown(ShutdownCause::default()), true));
     }
 
     #[test]
@@ -526,7 +529,7 @@ mod tests {
                 let task_ran = Arc::clone(&self.task_ran);
                 drop(self.scheduler.spawn(move |builtins| async move {
                     task_ran.store(true, Ordering::Relaxed);
-                    builtins.scheduler().dispatcher.stop();
+                    builtins.scheduler().dispatcher.stop(ShutdownCause::default());
                 }));
             }
         }
@@ -692,6 +695,7 @@ mod tests {
             clock,
             signal,
             monitor_options,
+            crate::runtime::PanicPolicy::default(),
         )
     }
 

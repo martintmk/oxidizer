@@ -17,7 +17,6 @@ use observed::Sink;
 use pin_project::{pin_project, pinned_drop};
 use plurality::MultiPool;
 
-use crate::remote::Sender as RemoteSender;
 #[cfg(all(debug_assertions, test))]
 use crate::{DiagnosticWaker, DiagnosticWakerRegistry};
 use crate::{
@@ -123,16 +122,6 @@ where
     }
 }
 
-impl<F, R> Task<F, R, RemoteSender<R>>
-where
-    F: Future<Output = R> + 'static,
-    R: Send + 'static,
-{
-    fn new_remote(future: F, options: TaskOptions, sink: Sink, remote_result_tx: RemoteSender<R>) -> Self {
-        Self::new_with_target(future, remote_result_tx, options, sink)
-    }
-}
-
 impl<F, R, T> Task<F, R, T>
 where
     F: Future<Output = R> + 'static,
@@ -172,20 +161,6 @@ where
     TaskHandle::new(pool.alloc_arc_pin(Task::new_with_options(future, result_tx, options, sink)))
 }
 
-pub(crate) fn allocate_remote_task<F, R>(
-    pool: &MultiPool,
-    future: F,
-    options: TaskOptions,
-    sink: Sink,
-    remote_result_tx: RemoteSender<R>,
-) -> TaskHandle
-where
-    F: Future<Output = R> + 'static,
-    R: Send + 'static,
-{
-    TaskHandle::new(pool.alloc_arc_pin(Task::new_remote(future, options, sink, remote_result_tx)))
-}
-
 #[cfg(test)]
 pub(crate) fn allocate_test_task_in(pool: &MultiPool) -> TaskHandle {
     let events = events_once::LocalEventPool::<()>::new();
@@ -204,7 +179,7 @@ where
     R: 'static,
     T: TaskResultTarget<R>,
 {
-    fn poll(self: Pin<&Self>) -> task::Poll<()> {
+    fn poll(self: Pin<&Self>) -> TaskPoll {
         self.poll_count.set(self.poll_count.get().saturating_add(1));
         self.options.with_context(|| self.poll_in_context())
     }
@@ -272,7 +247,7 @@ where
         unsafe { Pin::new_unchecked(signal) }
     }
 
-    fn poll_in_context(self: Pin<&Self>) -> task::Poll<()> {
+    fn poll_in_context(self: Pin<&Self>) -> TaskPoll {
         // SAFETY: The `Task` is single-threaded and we only ever create temporary references
         // to `payload` that do not escape `Task` methods, so we know there cannot be a conflicting
         // reference to this field.
@@ -300,8 +275,7 @@ where
 
             let mut cx = task::Context::from_waker(&waker);
 
-            // Runtime integrations can provide a remote result target that receives captured
-            // panics. Plain executor tasks retain the fail-fast behavior.
+            // Report the panic to the executor after retiring the task payload.
             match catch_unwind(AssertUnwindSafe(|| future_as_mut_pinned.poll(&mut cx))) {
                 Ok(x) => x,
                 Err(panic) => return self.finish_panicked(maybe_payload, wake_signal, panic),
@@ -312,9 +286,9 @@ where
             task::Poll::Ready(result) => {
                 wake_signal.retire();
                 self.finish_terminal(maybe_payload, TerminalOutcome::Succeeded(result));
-                task::Poll::Ready(())
+                TaskPoll::Ready
             }
-            task::Poll::Pending => task::Poll::Pending,
+            task::Poll::Pending => TaskPoll::Pending,
         }
     }
 
@@ -323,22 +297,20 @@ where
         maybe_payload: &mut Option<Payload<F, R, T>>,
         wake_signal: Pin<&WakeSignal>,
         panic: TaskPanicPayload,
-    ) -> task::Poll<()> {
+    ) -> TaskPoll {
         let payload = maybe_payload.as_mut().expect("a polled task retains its payload");
-        let result_is_remote = payload
-            .result_target
-            .as_ref()
-            .expect("a polled task retains its result target")
-            .is_remote();
-        if !result_is_remote {
-            // Keep the local sender on the fail-fast unwind path so its receiver disconnects.
-            let _result_target = payload.result_target.take().expect("a polled task retains its result target");
-            on_unhandled_task_panic(panic);
-        }
+        let result_target = payload.result_target.take().expect("a polled task retains its result target");
 
         wake_signal.retire();
-        self.finish_terminal(maybe_payload, TerminalOutcome::Panicked(panic));
-        task::Poll::Ready(())
+        if let Err(disposal) = unsafe { Pin::new_unchecked(&mut payload.future) }.destroy_pinned() {
+            discard_task_panic_payload(disposal);
+        }
+        *maybe_payload = None;
+        if let Err(disposal) = catch_unwind(AssertUnwindSafe(|| drop(result_target))) {
+            discard_task_panic_payload(disposal);
+        }
+        self.options.report_panicked(&self.sink, self.poll_count.get());
+        TaskPoll::Panicked(panic)
     }
 
     fn finish_terminal(self: Pin<&Self>, maybe_payload: &mut Option<Payload<F, R, T>>, outcome: TerminalOutcome<R>) {
@@ -350,8 +322,6 @@ where
             .result_target
             .take()
             .expect("the result target is present until the task enters a terminal state");
-        let remote = result_target.is_remote();
-
         let future_panic = if matches!(&outcome, TerminalOutcome::Succeeded(_)) {
             // FutureStorage retires the future before returning Ready.
             None
@@ -365,24 +335,10 @@ where
         match outcome {
             TerminalOutcome::Succeeded(result) => {
                 if let Err(panic) = result_target.complete(result) {
-                    if remote {
-                        discard_task_panic_payload(panic);
-                    } else {
-                        self.options.report_panicked(&self.sink, self.poll_count.get());
-                        on_unhandled_task_panic(panic);
-                    }
+                    self.options.report_panicked(&self.sink, self.poll_count.get());
+                    on_unhandled_task_panic(panic);
                 }
                 self.options.report_succeeded(&self.sink, self.poll_count.get());
-            }
-            TerminalOutcome::Panicked(panic) => {
-                debug_assert!(remote, "plain task panics must follow the fail-fast path");
-                if let Some(disposal) = future_panic {
-                    discard_task_panic_payload(disposal);
-                }
-                if let Err(disposal) = result_target.panicked(panic) {
-                    discard_task_panic_payload(disposal);
-                }
-                self.options.report_panicked(&self.sink, self.poll_count.get());
             }
             TerminalOutcome::Cancelled(cause) => {
                 if future_panic.is_some() {
@@ -390,11 +346,7 @@ where
                 }
                 let result_panic = result_target.cancelled(cause).err();
                 for panic in [future_panic, result_panic].into_iter().flatten() {
-                    if remote {
-                        discard_task_panic_payload(panic);
-                    } else {
-                        on_unhandled_task_panic(panic);
-                    }
+                    on_unhandled_task_panic(panic);
                 }
             }
         }
@@ -407,7 +359,7 @@ where
 )]
 #[cfg_attr(test, mutants::skip)] // Impractical to unit test process termination.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn on_unhandled_task_panic(panic: TaskPanicPayload) -> ! {
+pub(crate) fn on_unhandled_task_panic(panic: TaskPanicPayload) -> ! {
     #[cfg(test)]
     std::panic::resume_unwind(panic);
 
@@ -439,63 +391,43 @@ where
 
 enum TerminalOutcome<R> {
     Succeeded(R),
-    Panicked(TaskPanicPayload),
     Cancelled(ShutdownCause),
 }
 
-/// Inline result-delivery policy owned by a task.
-///
-/// Local targets keep raw executor task panics fail-fast. Remote targets transport captured task
-/// panics to another thread and contain panics raised while notifying or disposing that endpoint.
-/// Publishing consumes the target. A returned panic payload comes from delivery or disposal and
-/// does not imply that the task outcome was not already published.
-pub(crate) trait TaskResultTarget<R>: Debug + 'static {
-    /// Returns whether this target transports captured task panics instead of terminating.
-    fn is_remote(&self) -> bool;
+pub(crate) enum TaskPoll {
+    Pending,
+    Ready,
+    Panicked(TaskPanicPayload),
+}
 
+impl TaskPoll {
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+
+    #[cfg(test)]
+    fn is_ready(&self) -> bool {
+        !self.is_pending()
+    }
+}
+
+/// Inline result delivery owned by a task. Publishing consumes the target. A
+/// returned panic payload comes from delivery or disposal.
+pub(crate) trait TaskResultTarget<R>: Debug + 'static {
     /// Publishes a successful task result, returning any panic raised by delivery.
     fn complete(self, result: R) -> Result<(), TaskPanicPayload>;
-
-    /// Publishes a captured task panic, returning a distinct panic raised by delivery.
-    fn panicked(self, panic: TaskPanicPayload) -> Result<(), TaskPanicPayload>;
 
     /// Publishes task cancellation caused by executor shutdown.
     fn cancelled(self, cause: ShutdownCause) -> Result<(), TaskPanicPayload>;
 }
 
 impl<R: 'static> TaskResultTarget<R> for PooledLocalSender<R> {
-    fn is_remote(&self) -> bool {
-        false
-    }
-
     fn complete(self, result: R) -> Result<(), TaskPanicPayload> {
         catch_unwind(AssertUnwindSafe(|| self.send(result)))
     }
 
-    fn panicked(self, _panic: TaskPanicPayload) -> Result<(), TaskPanicPayload> {
-        unreachable!("local task panics terminate the process")
-    }
-
     fn cancelled(self, _cause: ShutdownCause) -> Result<(), TaskPanicPayload> {
-        catch_unwind(AssertUnwindSafe(|| drop(self)))
-    }
-}
-
-impl<R: Send + 'static> TaskResultTarget<R> for RemoteSender<R> {
-    fn is_remote(&self) -> bool {
-        true
-    }
-
-    fn complete(self, result: R) -> Result<(), TaskPanicPayload> {
-        self.completed(result)
-    }
-
-    fn panicked(self, panic: TaskPanicPayload) -> Result<(), TaskPanicPayload> {
-        self.panicked(panic)
-    }
-
-    fn cancelled(self, cause: ShutdownCause) -> Result<(), TaskPanicPayload> {
-        drop(cause);
         catch_unwind(AssertUnwindSafe(|| drop(self)))
     }
 }
@@ -565,7 +497,7 @@ pub(crate) trait TypeErasedTask: Send + Sync {
     /// Panics if the task has not been initialized.
     ///
     /// Panics if the task has already been completed.
-    fn poll(self: Pin<&Self>) -> task::Poll<()>;
+    fn poll(self: Pin<&Self>) -> TaskPoll;
 
     /// Captures independently owned data for task-created telemetry.
     fn created_reporter(&self) -> Option<TaskCreatedReporter>;
@@ -607,7 +539,6 @@ mod tests {
     use std::future::{Ready, pending};
     use std::pin::pin;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
 
@@ -617,7 +548,6 @@ mod tests {
     use testing_aids::assert_panic;
 
     use super::*;
-    use crate::remote::Pool as RemotePool;
     use crate::testing::TestSubjectFuture;
 
     fn fake_wake_owner() -> TaskHandle {
@@ -841,22 +771,6 @@ mod tests {
         }
     }
 
-    struct PanicOnPollAndDropFuture;
-
-    impl Future for PanicOnPollAndDropFuture {
-        type Output = u64;
-
-        fn poll(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
-            panic!("panic from future poll");
-        }
-    }
-
-    impl Drop for PanicOnPollAndDropFuture {
-        fn drop(&mut self) {
-            panic!("panic from future destructor");
-        }
-    }
-
     #[test]
     fn smoke_test() {
         let wake_owner = fake_wake_owner();
@@ -875,7 +789,7 @@ mod tests {
         // The future is a trivial one that completes on the first poll.
         let task_result = task.poll();
 
-        assert!(matches!(task_result, task::Poll::Ready(())));
+        assert!(matches!(task_result, TaskPoll::Ready));
 
         // The result should now be available via the result channel.
         let mut cx = task::Context::from_waker(Waker::noop());
@@ -923,48 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn observed_remote_panic_reports_aggregate_poll_count() {
-        let wake_owner = fake_wake_owner();
-        let (result_tx, mut result_rx) = RemotePool::new().channel::<u64>();
-        let (sink, processor) = test_emitter(TEST_ID);
-        let polls = Rc::new(Cell::new(0));
-        let task = pin!(Task::new_remote(
-            std::future::poll_fn({
-                let polls = Rc::clone(&polls);
-                move |_| {
-                    polls.set(polls.get() + 1);
-                    assert_ne!(polls.get(), 2, "captured task panic");
-                    task::Poll::Pending
-                }
-            }),
-            TaskOptions::observed(sink.transfer_context(), crate::TaskPlacement::Any),
-            sink,
-            result_tx,
-        ));
-        let task = task.as_ref();
-        task.initialize(fake_wake_signal(&wake_owner));
-        task.created_reporter().unwrap().report();
-
-        assert!(task.poll().is_pending());
-        assert!(task.poll().is_ready());
-
-        let mut cx = task::Context::from_waker(Waker::noop());
-        let task::Poll::Ready(Err(error)) = Pin::new(&mut result_rx).poll(&mut cx) else {
-            panic!("captured panic must be published to the remote join handle");
-        };
-        let crate::JoinError::Panicked(panic) = error else {
-            panic!("remote join must contain the captured panic");
-        };
-        discard_task_panic_payload(panic);
-
-        let events = processor.events();
-        let panicked = events.iter().find(|event| event.name() == "arty.rt.task.panicked").unwrap();
-        assert_eq!(panicked.field_metrics()[0].field_key(), "polls");
-        assert!((panicked.field_metrics()[0].value() - 2.0).abs() < f64::EPSILON);
-        assert!(!events.iter().any(|event| event.name() == "arty.rt.task.succeeded"));
-    }
-
-    #[test]
     fn cancellation_emits_no_terminal_task_event() {
         let wake_owner = fake_wake_owner();
         let event_pool = LocalEventPool::<u64>::new();
@@ -1001,25 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_join_notification_panic_is_not_reported_as_a_task_panic() {
-        let wake_owner = fake_wake_owner();
-        let (result_tx, mut result_rx) = RemotePool::new().channel::<u64>();
-        let (sink, processor) = test_emitter(TEST_ID);
-        let waker = Waker::from(Arc::new(PanickingJoinWake));
-        assert!(Pin::new(&mut result_rx).poll(&mut task::Context::from_waker(&waker)).is_pending());
-        let task = pin!(Task::new_remote(pending::<u64>(), TaskOptions::default(), sink, result_tx));
-        let task = task.as_ref();
-        task.initialize(fake_wake_signal(&wake_owner));
-        task.created_reporter().unwrap().report();
-
-        task.abort(ShutdownCause::default());
-
-        let events = processor.events();
-        assert!(events.iter().any(|event| event.name() == "arty.rt.task.spawned"));
-        assert!(!events.iter().any(|event| event.name() == "arty.rt.task.panicked"));
-    }
-
-    #[test]
     fn local_completion_notification_panic_follows_fail_fast_path() {
         let wake_owner = fake_wake_owner();
         let event_pool = LocalEventPool::<u64>::new();
@@ -1034,32 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_poll_and_destructor_panics_are_both_contained() {
-        let wake_owner = fake_wake_owner();
-        let (result_tx, mut result_rx) = RemotePool::new().channel::<u64>();
-        let task = pin!(Task::new_remote(
-            PanicOnPollAndDropFuture,
-            TaskOptions::default(),
-            Sink::noop(),
-            result_tx,
-        ));
-        let task = task.as_ref();
-        task.initialize(fake_wake_signal(&wake_owner));
-
-        assert!(task.poll().is_ready());
-
-        let mut cx = task::Context::from_waker(Waker::noop());
-        let task::Poll::Ready(Err(error)) = Pin::new(&mut result_rx).poll(&mut cx) else {
-            panic!("captured poll panic must reach the remote join");
-        };
-        let crate::JoinError::Panicked(panic) = error else {
-            panic!("remote join must contain the captured panic");
-        };
-        discard_task_panic_payload(panic);
-    }
-
-    #[test]
-    fn plain_task_panic_remains_unhandled() {
+    fn plain_task_panic_is_contained() {
         let wake_owner = fake_wake_owner();
         let event_pool = LocalEventPool::<()>::new();
         let (tx, mut rx) = event_pool.rent();
@@ -1072,21 +900,13 @@ mod tests {
         let task = task.as_ref();
         task.initialize(fake_wake_signal(&wake_owner));
 
-        assert_panic!(task.poll());
-        assert!(task.has_payload());
+        let TaskPoll::Panicked(panic) = task.poll() else {
+            panic!("task panic must be reported to the executor");
+        };
+        discard_task_panic_payload(panic);
+        assert!(!task.has_payload());
         let mut cx = task::Context::from_waker(Waker::noop());
         assert_eq!(Pin::new(&mut rx).poll(&mut cx), task::Poll::Ready(Err(Disconnected)));
-    }
-
-    #[test]
-    fn local_result_target_rejects_panic_reporting() {
-        let event_pool = LocalEventPool::<u64>::new();
-        let (sender, _receiver) = event_pool.rent();
-
-        assert_panic!(<PooledLocalSender<u64> as TaskResultTarget<u64>>::panicked(
-            sender,
-            Box::new("local task panic"),
-        ));
     }
 
     #[test]
@@ -1208,7 +1028,7 @@ mod tests {
         task.initialize(fake_wake_signal(&wake_owner));
 
         let result = task.poll();
-        assert!(matches!(result, task::Poll::Ready(())));
+        assert!(matches!(result, TaskPoll::Ready));
 
         // The state held by the task must have been dropped.
         assert!(shared_state_weak.upgrade().is_none());
@@ -1266,7 +1086,7 @@ mod tests {
         // The future is a trivial one that completes on the first poll.
         let task_result = task.poll();
 
-        assert!(matches!(task_result, task::Poll::Ready(())));
+        assert!(matches!(task_result, TaskPoll::Ready));
 
         // A poll after completion is not legal.
         assert_panic!(task.poll());

@@ -8,26 +8,20 @@ use std::task;
 
 use events_once::{LocalEventLake, PooledLocalReceiver};
 
-use crate::{Shutdown, ShutdownCause, TaskPanicPayload};
+use crate::{Shutdown, ShutdownCause};
 
 /// A task failed to return its result.
 ///
 /// A shutdown error is available through [`Error::source`] when shutdown started
-/// because of an error. A panic payload need not implement [`Error`].
+/// because of an error.
 pub enum JoinError {
-    /// The task panicked.
-    Panicked(TaskPanicPayload),
-
     /// Executor shutdown cancelled the task or rejected its submission.
     Shutdown(ShutdownCause),
 }
 
 impl PartialEq for JoinError {
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Panicked(_), Self::Panicked(_)) | (Self::Shutdown(_), Self::Shutdown(_))
-        )
+        matches!((self, other), (Self::Shutdown(_), Self::Shutdown(_)))
     }
 }
 
@@ -38,41 +32,26 @@ impl JoinError {
     pub(crate) fn shutdown(cause: ShutdownCause) -> Self {
         Self::Shutdown(cause)
     }
-
-    pub(crate) fn panicked(panic: TaskPanicPayload) -> Self {
-        Self::Panicked(panic)
-    }
 }
 
 impl Display for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Panicked(_) => "task panicked",
-            Self::Shutdown(_) => "runtime is shutting down",
-        })
+        f.write_str("runtime is shutting down")
     }
 }
 
 impl Debug for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct(std::any::type_name::<Self>())
-            .field(
-                "kind",
-                &match self {
-                    Self::Panicked(_) => "panicked",
-                    Self::Shutdown(_) => "shutdown",
-                },
-            )
+            .field("kind", &"shutdown")
             .finish_non_exhaustive()
     }
 }
 
 impl Error for JoinError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Shutdown(cause) => cause.as_error().map(|error| error as &(dyn Error + 'static)),
-            Self::Panicked(_) => None,
-        }
+        let Self::Shutdown(cause) = self;
+        cause.as_error().map(|error| error as &(dyn Error + 'static))
     }
 }
 
@@ -135,8 +114,7 @@ mod tests {
 
     #[test]
     fn shutdown_error_contract() {
-        assert_impl_all!(JoinError: Error, Send);
-        assert_not_impl_any!(JoinError: Sync, UnwindSafe, RefUnwindSafe);
+        assert_impl_all!(JoinError: Error, Send, Sync, UnwindSafe, RefUnwindSafe);
 
         let error = JoinError::shutdown(ShutdownCause::default());
 
@@ -147,27 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn panic_error_exposes_its_payload() {
-        let error = JoinError::panicked(Box::new(42_u64));
-
-        assert_eq!(error.to_string(), "task panicked");
-        assert!(error.source().is_none());
-        assert!(matches!(&error, JoinError::Panicked(_)));
-        let JoinError::Panicked(payload) = error else {
-            return;
-        };
-        assert_eq!(*payload.downcast::<u64>().unwrap(), 42);
-    }
-
-    #[test]
-    fn join_errors_compare_by_failure_kind() {
+    fn join_errors_compare_as_shutdown_failures() {
         let shutdown = JoinError::shutdown(ShutdownCause::default());
         let another_shutdown = JoinError::shutdown(ShutdownCause::default());
-        let panic = JoinError::panicked(Box::new("first panic"));
-        let another_panic = JoinError::panicked(Box::new("different panic"));
 
         assert_eq!(shutdown, another_shutdown);
-        assert_eq!(panic, another_panic);
-        assert_ne!(shutdown, panic);
     }
 }

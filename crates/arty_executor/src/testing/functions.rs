@@ -20,7 +20,7 @@ pub(crate) fn new_guarded_executor(owner_waker: Waker) -> ScopeGuard<Executor, f
         executor.shutdown().trigger(ShutdownCause::default());
 
         for _ in 0..16 {
-            if executor.execute_cycle() == CycleOutcome::Shutdown {
+            if matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)) {
                 return;
             }
             thread::yield_now();

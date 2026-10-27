@@ -11,9 +11,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
-use arty_executor::remote::Pool as RemotePool;
 use arty_executor::{
     CycleOutcome, Executor, JoinError, JoinHandle, Shutdown, ShutdownCause, ShutdownError, TaskOptions, TaskPlacement, TaskSet,
 };
@@ -159,13 +158,6 @@ fn shutdown_cause_exposes_the_original_error() {
     assert_eq!(format!("{cause:?}"), "ShutdownCause { has_error: true }");
 }
 
-#[test]
-fn panicked_join_error_debug_identifies_its_kind() {
-    let error = JoinError::Panicked(Box::new("task panic"));
-
-    assert!(format!("{error:?}").contains("panicked"));
-}
-
 fn enrichment_keys(sink: &Sink) -> Vec<String> {
     sink.current_enrichments()
         .into_iter()
@@ -193,13 +185,13 @@ fn failed_construction_preserves_existing_executor_notifications() {
         }),
         TaskOptions::default(),
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     ready.set(true);
     retained.borrow().as_ref().unwrap().wake_by_ref();
 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Executor::builder().build())).unwrap_err();
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
 }
 
@@ -218,7 +210,7 @@ fn noop_executor_applies_task_context_and_restores_caller_context() {
         TaskOptions::observed(task_context, TaskPlacement::Any),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(vec![String::from("task.context")])));
     assert_eq!(enrichment_keys(&sink), ["caller.context"]);
 }
@@ -229,44 +221,11 @@ fn completed_result_reports_shutdown_if_executor_stops_before_join() {
     let mut handle = executor.tasks().add(async { 42 }, TaskOptions::default());
 
     assert!(executor.has_tasks());
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert!(!executor.has_tasks());
     drop(executor);
 
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
-}
-
-struct ShutdownDuringRemoteConversion(Shutdown);
-
-impl IntoFuture for ShutdownDuringRemoteConversion {
-    type Output = usize;
-    type IntoFuture = Ready<usize>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        self.0.trigger(ShutdownCause::default());
-        ready(42)
-    }
-}
-
-#[test]
-fn shutdown_during_remote_conversion_rejects_the_task() {
-    let executor = Executor::builder().build();
-    let tasks = executor.tasks();
-    let shutdown = executor.shutdown();
-    let result_pool = RemotePool::new();
-    let (result_tx, mut result) = result_pool.channel();
-    let wake = Arc::new(PanickingRemoteJoinWake(AtomicBool::new(false)));
-    let waker = Waker::from(Arc::clone(&wake));
-    assert!(Pin::new(&mut result).poll(&mut Context::from_waker(&waker)).is_pending());
-
-    tasks.add_with_remote_result(ShutdownDuringRemoteConversion(shutdown), TaskOptions::default(), result_tx);
-
-    assert!(!executor.has_tasks());
-    assert!(wake.0.load(Ordering::Acquire));
-    assert!(matches!(
-        Pin::new(&mut result).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JoinError::Shutdown(_)))
-    ));
 }
 
 #[test]
@@ -276,7 +235,7 @@ fn retained_handle_reports_shutdown_without_delaying_shutdown() {
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(!executor.has_tasks());
     drop(executor);
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
@@ -291,30 +250,11 @@ fn caused_shutdown_is_attached_to_cancelled_and_rejected_tasks() {
 
     executor.shutdown().trigger(cause);
     let mut rejected = tasks.add(async {}, TaskOptions::default());
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 
     for error in [poll_error(&mut pending), poll_error(&mut rejected)] {
         let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
         assert_same_shutdown_source(source, &expected);
-    }
-}
-
-#[test]
-fn remote_task_cancellation_reports_shutdown() {
-    let mut executor = Executor::builder().build();
-    let tasks = executor.tasks();
-    let (result_tx, remote_join) = RemotePool::new().channel::<usize>();
-    tasks.add_with_remote_result(pending::<usize>(), TaskOptions::default(), result_tx);
-    let cause = shutdown_cause("remote executor failed").0;
-
-    executor.shutdown().trigger(cause);
-    let (rejected_tx, rejected_join) = RemotePool::new().channel::<usize>();
-    tasks.add_with_remote_result(async { 42 }, TaskOptions::default(), rejected_tx);
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
-
-    for mut join in [remote_join, rejected_join] {
-        let error = ready_error(Pin::new(&mut join).poll(&mut Context::from_waker(Waker::noop())));
-        assert!(error.source().is_none());
     }
 }
 
@@ -340,16 +280,9 @@ fn retained_task_set_preserves_the_shutdown_cause_after_executor_drop() {
     drop(executor);
 
     let mut local = tasks.add(async {}, TaskOptions::default());
-    let (remote_tx, remote) = RemotePool::new().channel::<usize>();
-    tasks.add_with_remote_result(async { 42 }, TaskOptions::default(), remote_tx);
-
-    let local = poll_error(&mut local);
-    let mut remote = std::pin::pin!(remote);
-    let remote = ready_error(remote.as_mut().poll(&mut Context::from_waker(Waker::noop())));
-    for error in [local, remote] {
-        let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
-        assert_same_shutdown_source(source, &expected);
-    }
+    let error = poll_error(&mut local);
+    let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
+    assert_same_shutdown_source(source, &expected);
 }
 
 #[test]
@@ -370,7 +303,7 @@ fn shutdown_handle_cancels_tasks_without_executor_drop() {
     let mut handle = tasks.add(pending::<()>(), TaskOptions::default());
 
     shutdown.trigger(ShutdownCause::default());
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(!executor.has_tasks());
     drop(executor);
 
@@ -385,10 +318,10 @@ fn executor_drop_during_thread_local_teardown_is_safe() {
         });
         THREAD_LOCAL_EXECUTOR.with(|slot| {
             let mut executor = slot.borrow_mut();
-            assert_eq!(
+            assert!(matches!(
                 executor.as_mut().expect("thread-local executor is initialized").execute_cycle(),
                 CycleOutcome::Suspend
-            );
+            ));
         });
     })
     .join()
@@ -431,51 +364,6 @@ fn rejected_submission_does_not_convert_the_future() {
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
 }
 
-struct PanickingRemoteJoinWake(AtomicBool);
-
-impl Wake for PanickingRemoteJoinWake {
-    #[expect(clippy::panic, reason = "this test injects a wake panic to verify containment")]
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::Release);
-        panic!("remote join disconnect notification");
-    }
-}
-
-#[test]
-fn dropping_remote_sender_contains_panicking_join_notification() {
-    let (result_tx, mut remote_join) = RemotePool::new().channel::<usize>();
-    let wake = Arc::new(PanickingRemoteJoinWake(AtomicBool::new(false)));
-    let waker = Waker::from(Arc::clone(&wake));
-    assert!(Pin::new(&mut remote_join).poll(&mut Context::from_waker(&waker)).is_pending());
-
-    drop(result_tx);
-
-    assert!(wake.0.load(Ordering::Acquire));
-    assert!(matches!(
-        Pin::new(&mut remote_join).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JoinError::Shutdown(cause))) if cause.as_error().is_none()
-    ));
-}
-
-#[test]
-fn disconnected_remote_submission_contains_panicking_join_notification() {
-    let executor = Executor::builder().build();
-    let tasks = executor.tasks();
-    let (result_tx, mut remote_join) = RemotePool::new().channel::<usize>();
-    let wake = Arc::new(PanickingRemoteJoinWake(AtomicBool::new(false)));
-    let waker = Waker::from(Arc::clone(&wake));
-    assert!(Pin::new(&mut remote_join).poll(&mut Context::from_waker(&waker)).is_pending());
-    drop(executor);
-
-    tasks.add_with_remote_result(async { 42 }, TaskOptions::default(), result_tx);
-
-    assert!(wake.0.load(Ordering::Acquire));
-    assert!(matches!(
-        Pin::new(&mut remote_join).poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(Err(JoinError::Shutdown(_)))
-    ));
-}
-
 #[test]
 fn submission_during_shutdown_returns_shutdown_error() {
     let executor = Executor::builder().build();
@@ -500,7 +388,7 @@ fn task_created_processor_may_submit_a_nested_task() {
 
     let _outer = tasks.add(async {}, TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any));
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert!(nested_completed.get());
 }
 
@@ -510,7 +398,7 @@ fn default_options_emit_lifecycle_events_without_context_enrichment() {
     let mut executor = Executor::builder().sink(sink).build();
     let _handle = executor.tasks().add(async {}, TaskOptions::default());
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
     let events = processor.events();
     assert!(events.iter().any(|event| event.name() == "arty.rt.task.spawned"));
@@ -553,7 +441,7 @@ fn into_future_conversion_may_submit_a_nested_task() {
         TaskOptions::default(),
     );
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_once(&mut handle), Poll::Ready(Ok(42)));
     assert!(nested_completed.get());
 }
@@ -647,7 +535,7 @@ fn shutdown_during_into_future_conversion_rejects_the_outer_task() {
     );
 
     assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 }
 
 struct SubmitOnDrop {
@@ -682,11 +570,11 @@ fn cancelled_future_drop_can_submit_and_receive_shutdown_error() {
         },
         TaskOptions::default(),
     );
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     let mut submitted_handle = submitted.borrow_mut().take().expect("future destructor submitted a task");
     assert!(matches!(poll_once(&mut submitted_handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
 }
@@ -711,14 +599,14 @@ fn shutdown_retires_a_batch_of_queued_tasks() {
             TaskOptions::default(),
         ));
     }
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Suspend);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     for waker in wakers.borrow().iter() {
         waker.wake_by_ref();
     }
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert_eq!(executor.execute_cycle(), CycleOutcome::Shutdown);
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     for mut handle in handles {
         assert!(matches!(poll_once(&mut handle), Poll::Ready(Err(JoinError::Shutdown(_)))));
     }

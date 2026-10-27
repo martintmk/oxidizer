@@ -175,7 +175,7 @@ impl Runtime {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn stop(mut self) -> Result<(), Error> {
-        _ = self.scheduler.dispatcher.stop();
+        _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
         self.shutdown_on_drop = false;
         self.wait()
     }
@@ -208,7 +208,7 @@ impl Drop for Runtime {
             return;
         }
 
-        _ = self.scheduler.dispatcher.stop();
+        _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
         // `wait` rejects self-waits from async workers and blocking callbacks;
         // worker entry wrappers report any resulting failure.
         let _ = self.wait();
@@ -272,7 +272,7 @@ mod tests {
             crate::runtime::PanicPolicy::default(),
         ));
         let runtime = Runtime::with_dispatcher(dispatcher.clone());
-        dispatcher.stop_with_error(Error::new(std::io::Error::other("first runtime failure")));
+        dispatcher.stop(arty_executor::ShutdownError::new(Error::new(std::io::Error::other("first runtime failure"))).into());
 
         assert_eq!(runtime.stop().unwrap_err().to_string(), "first runtime failure");
     }

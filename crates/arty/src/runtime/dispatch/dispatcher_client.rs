@@ -3,7 +3,6 @@
 
 use std::any::type_name;
 use std::fmt::Debug;
-use std::task::Waker;
 use std::thread::ThreadId;
 
 use arty_executor::ShutdownCause;
@@ -123,21 +122,17 @@ impl DispatcherClient {
         self.core.spawn_at_worker_relocating(worker_index, future_factory)
     }
 
-    pub(crate) fn stop_with_error(&self, error: Error) -> ShutdownCause {
-        self.core.stop_with_error(error)
-    }
-
-    pub(crate) fn panic_notifier(&self) -> Waker {
-        self.core.panic_notifier()
-    }
-
     pub(crate) fn access_io(&self, worker_index: WorkerIndex, access: Box<dyn FnOnce(&Builtins) + Send>) -> Result<(), Error> {
         self.core.access_io(worker_index, access)
     }
 
     #[cfg_attr(test, mutants::skip)] // Will cause tests to hang due to runtime never stopping.
-    pub(crate) fn stop(&self) -> ShutdownCause {
-        self.core.stop()
+    pub(crate) fn stop(&self, cause: ShutdownCause) -> ShutdownCause {
+        self.core.stop_inner(cause)
+    }
+
+    pub(crate) fn panic_starts_shutdown(&self) -> bool {
+        self.core.panic_starts_shutdown()
     }
 
     // Impractical to test real waiting at this API layer. We test the real waiter implementation
@@ -159,6 +154,8 @@ impl Debug for DispatcherClient {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))] // Test scaffolding is not runtime behavior.
 mod tests {
+    use std::task::Waker;
+
     use arty_io_core::{Cycle, Driver, DriverError, DriverOptions, IoContext};
     use observed::Sink;
     use performables::sync::channel;
@@ -189,9 +186,7 @@ mod tests {
         let clone = client.clone();
         assert_eq!(client.shutdown().state(), crate::runtime::ShutdownState::Running);
         assert_eq!(clone.shutdown().state(), crate::runtime::ShutdownState::Running);
-        assert!(client.panic_notifier().will_wake(&clone.panic_notifier()));
-
-        client.stop();
+        client.stop(ShutdownCause::default());
         assert_eq!(client.shutdown().state(), crate::runtime::ShutdownState::Started);
         assert_eq!(clone.shutdown().state(), crate::runtime::ShutdownState::Started);
     }
