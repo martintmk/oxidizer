@@ -8,13 +8,12 @@ use std::rc::Rc;
 use std::task::Waker;
 use std::thread::ThreadId;
 
-use events_once::LocalEventLake;
 use observed::Sink;
 use performables::sync::channel;
 use plurality::MultiPool;
 
 use crate::wake::RemoteWake;
-use crate::{JoinHandle, PanicPolicy, Shutdown, ShutdownCause, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_task};
+use crate::{PanicPolicy, Shutdown, ShutdownCause, TaskCompletion, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_task};
 
 /// Cloneable handle to state used by reentrant task submissions.
 #[derive(Clone, Debug)]
@@ -27,7 +26,6 @@ struct ExecutorSharedInner {
     new_tasks: RefCell<VecDeque<TaskHandle>>,
     task_storage: MultiPool,
     task_count: Cell<usize>,
-    join_events: LocalEventLake,
     shutdown: Shutdown,
     wake: WakeShared,
     // Owner-only reception breaks the wake queue -> task -> shared wake state ownership cycle.
@@ -45,7 +43,6 @@ impl ExecutorShared {
                 new_tasks: RefCell::new(VecDeque::new()),
                 task_storage: MultiPool::new(),
                 task_count: Cell::new(0),
-                join_events: LocalEventLake::new(),
                 shutdown,
                 wake,
                 remote_wakes,
@@ -118,32 +115,28 @@ impl ExecutorShared {
         self.is_shutting_down() && self.inner.task_count.get() == 0
     }
 
-    pub(crate) fn add_task<F, R>(&self, future: F, options: TaskOptions) -> JoinHandle<R>
+    pub(crate) fn add_task<F, R, T>(&self, future: F, options: TaskOptions, completion: T)
     where
         F: IntoFuture<Output = R> + 'static,
         R: 'static,
+        T: TaskCompletion<R>,
     {
-        if let Some(join_handle) = self.rejected_submission() {
-            return join_handle;
+        if self.is_shutting_down() {
+            completion.cancelled(self.shutdown_cause());
+            return;
         }
         let future = future.into_future();
-        if let Some(join_handle) = self.rejected_submission() {
-            return join_handle;
+        if self.is_shutting_down() {
+            completion.cancelled(self.shutdown_cause());
+            return;
         }
-        let (result_tx, result_rx) = self.inner.join_events.rent();
         self.register_task(allocate_task(
             &self.inner.task_storage,
             future,
-            result_tx,
             options,
             self.inner.sink.clone(),
+            completion,
         ));
-        JoinHandle::new(result_rx, self.shutdown())
-    }
-
-    fn rejected_submission<R: 'static>(&self) -> Option<JoinHandle<R>> {
-        self.is_shutting_down()
-            .then(|| JoinHandle::disconnected(&self.inner.join_events, self.shutdown()))
     }
 
     fn register_task(&self, task_handle: TaskHandle) {
@@ -169,11 +162,6 @@ impl ExecutorShared {
 
     pub(crate) fn panic_policy(&self) -> &PanicPolicy {
         &self.inner.panic_policy
-    }
-
-    #[cfg(test)]
-    pub(crate) fn task_storage_is_empty(&self) -> bool {
-        self.inner.task_storage.is_empty()
     }
 }
 

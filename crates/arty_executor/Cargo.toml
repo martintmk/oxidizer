@@ -29,7 +29,6 @@ allowed_external_types = [
 [dependencies]
 data_privacy = { workspace = true }
 derive_more = { workspace = true, features = ["debug"] }
-events_once = { workspace = true }
 nm = { workspace = true }
 observed = { workspace = true }
 ohno = { workspace = true }

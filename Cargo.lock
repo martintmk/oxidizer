@@ -293,7 +293,6 @@ dependencies = [
  "criterion",
  "data_privacy",
  "derive_more",
- "events_once",
  "foldhash 0.2.0",
  "gungraun",
  "metabench",

@@ -10,7 +10,7 @@ use thread_aware::{Thread, ThreadAware};
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
 use crate::task::Builtins;
-use crate::task::execution::{DeferredTask, RemoteResultTask};
+use crate::task::execution::DeferredTask;
 use crate::task::join::JoinHandle;
 use crate::task::remote::Pool as RemotePool;
 
@@ -226,9 +226,8 @@ impl Scheduler {
             let builtins = current.builtins.clone();
             let (result_tx, result_rx) = current.results.channel();
             let inner = DeferredTask::new(future_factory, builtins);
-            let inner = RemoteResultTask::new(inner, result_tx);
             let options = TaskOptions::observed(parent_task_enrichment, TaskPlacement::SameThread);
-            drop(current.tasks.add(inner, options));
+            current.tasks.add(inner, options, result_tx);
             self.dispatcher.wake_worker(self.binding.worker_index);
             Ok(JoinHandle::new(
                 result_rx,

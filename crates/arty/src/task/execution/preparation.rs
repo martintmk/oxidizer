@@ -6,7 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arty_executor::{TaskOptions, TaskPlacement, TaskSet, discard_task_panic_payload};
+use arty_executor::{TaskCompletion, TaskOptions, TaskPlacement, TaskSet, discard_task_panic_payload};
 use observed::context::Transfer;
 use pin_project::pin_project;
 use plurality::{Box as PoolBox, MultiPool, coerce};
@@ -75,74 +75,6 @@ where
     }
 }
 
-#[pin_project]
-pub(crate) struct RemoteResultTask<F, R>
-where
-    R: Send + 'static,
-{
-    #[pin]
-    future: Option<F>,
-    result_tx: Option<RemoteSender<R>>,
-}
-
-impl<F, R> RemoteResultTask<F, R>
-where
-    F: Future<Output = R>,
-    R: Send + 'static,
-{
-    pub(crate) fn new(future: F, result_tx: RemoteSender<R>) -> Self {
-        Self {
-            future: Some(future),
-            result_tx: Some(result_tx),
-        }
-    }
-}
-
-impl<F, R> Future for RemoteResultTask<F, R>
-where
-    F: Future<Output = R>,
-    R: Send + 'static,
-{
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let outcome = this
-                .future
-                .as_mut()
-                .as_pin_mut()
-                .expect("a pending result task retains its future")
-                .poll(cx);
-            if outcome.is_ready() {
-                this.future.set(None);
-            }
-            outcome
-        }));
-        match outcome {
-            Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(result)) => {
-                let result_tx = this.result_tx.take().expect("a completed result task retains its sender");
-                if let Err(panic) = result_tx.completed(result) {
-                    discard_task_panic_payload(panic);
-                }
-                Poll::Ready(())
-            }
-            Err(panic) => {
-                if let Err(disposal) = catch_unwind(AssertUnwindSafe(|| this.future.set(None))) {
-                    discard_task_panic_payload(disposal);
-                }
-                let result_tx = this.result_tx.take().expect("a panicked result task retains its sender");
-                let delivery = result_tx.panicked(panic);
-                if let Err(panic) = delivery {
-                    discard_task_panic_payload(panic);
-                }
-                std::panic::resume_unwind(Box::new("remote task panic reported by Arty"))
-            }
-        }
-    }
-}
-
 struct TaskFactory<F> {
     pending: Option<(F, Transfer)>,
 }
@@ -192,30 +124,6 @@ pub(crate) struct RemoteFutureFactory {
     inner: PoolBox<ErasedRemoteFutureFactory>,
 }
 
-struct PendingResult<R: Send + 'static> {
-    sender: Option<RemoteSender<R>>,
-}
-
-impl<R: Send + 'static> PendingResult<R> {
-    fn new(sender: RemoteSender<R>, shutdown: Shutdown) -> Self {
-        drop(shutdown);
-        Self { sender: Some(sender) }
-    }
-
-    fn into_sender(mut self) -> RemoteSender<R> {
-        self.sender.take().expect("a pending result sender is consumed exactly once")
-    }
-}
-
-impl<R: Send + 'static> Drop for PendingResult<R> {
-    fn drop(&mut self) {
-        let Some(sender) = self.sender.take() else {
-            return;
-        };
-        drop(sender);
-    }
-}
-
 #[must_use]
 pub(crate) struct RegisteredRemoteTask;
 
@@ -260,18 +168,12 @@ where
     R: Send + 'static,
 {
     let (result_tx, result_rx) = result_pool.channel();
-    let result_tx = PendingResult::new(result_tx, shutdown.clone());
     let future_factory = TaskFactory::new(future_factory, parent_task_enrichment);
     let future_factory = RemoteFutureFactory::new(move |cx, tasks| {
-        // Factory invocation belongs inside the same panic boundary as polling.
         let (future_factory, parent_task_enrichment) = future_factory.into_parts();
         let inner = DeferredTask::new(future_factory, cx);
-
-        // The executor join handle is not used - the task delivers its result through the
-        // channel above, which unlike the executor's join handle can cross thread boundaries.
         let options = TaskOptions::observed(parent_task_enrichment, placement);
-        let inner = RemoteResultTask::new(inner, result_tx.into_sender());
-        drop(tasks.add(inner, options));
+        tasks.add(inner, options, result_tx);
     });
     let panic_starts_shutdown = shutdown.panic_starts_shutdown();
     (future_factory, JoinHandle::new(result_rx, shutdown, panic_starts_shutdown))
@@ -307,15 +209,18 @@ where
 {
     fn run(mut self) {
         let (body, result_tx) = self.pending.take().expect("a blocking task is consumed exactly once");
-        let (delivery, panicked) = match catch_unwind(AssertUnwindSafe(body)) {
-            Ok(result) => (result_tx.completed(result), false),
-            Err(panic) => (result_tx.panicked(panic), true),
+        let panicked = match catch_unwind(AssertUnwindSafe(body)) {
+            Ok(result) => {
+                result_tx.completed(result);
+                false
+            }
+            Err(panic) => {
+                result_tx.panicked(panic);
+                true
+            }
         };
         if panicked {
             self.shutdown.panic_notifier().wake_by_ref();
-        }
-        if let Err(panic) = delivery {
-            discard_task_panic_payload(panic);
         }
     }
 }

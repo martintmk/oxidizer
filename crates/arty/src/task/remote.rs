@@ -6,7 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task;
 
-use arty_executor::{TaskPanicPayload, discard_task_panic_payload};
+use arty_executor::{ShutdownCause, TaskCompletion, TaskPanicPayload, discard_task_panic_payload};
 use events_once::{EventLake, PooledReceiver, PooledSender};
 
 enum TaskResult<R> {
@@ -71,17 +71,9 @@ pub(crate) struct Sender<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> Sender<R> {
-    fn send(mut self, result: TaskResult<R>) -> Result<(), TaskPanicPayload> {
+    fn publish(mut self, result: TaskResult<R>) {
         let tx = self.tx.take().expect("an Arty result sender publishes at most one result");
-        catch_unwind(AssertUnwindSafe(|| tx.send(result)))
-    }
-
-    pub(crate) fn completed(self, result: R) -> Result<(), TaskPanicPayload> {
-        self.send(TaskResult::Completed(result))
-    }
-
-    pub(crate) fn panicked(self, panic: TaskPanicPayload) -> Result<(), TaskPanicPayload> {
-        self.send(TaskResult::Panicked(panic))
+        discard_unwind(|| tx.send(result));
     }
 }
 
@@ -91,13 +83,31 @@ impl<R: Send + 'static> Debug for Sender<R> {
     }
 }
 
+impl<R: Send + 'static> TaskCompletion<R> for Sender<R> {
+    fn completed(self, result: R) {
+        self.publish(TaskResult::Completed(result));
+    }
+
+    fn panicked(self, panic: TaskPanicPayload) {
+        self.publish(TaskResult::Panicked(panic));
+    }
+
+    fn cancelled(self, _cause: ShutdownCause) {
+        drop(self);
+    }
+}
+
 impl<R: Send + 'static> Drop for Sender<R> {
     fn drop(&mut self) {
         let Some(tx) = self.tx.take() else {
             return;
         };
-        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(tx))) {
-            discard_task_panic_payload(panic);
-        }
+        discard_unwind(|| drop(tx));
+    }
+}
+
+fn discard_unwind(action: impl FnOnce()) {
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(action)) {
+        discard_task_panic_payload(panic);
     }
 }
