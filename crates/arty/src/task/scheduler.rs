@@ -223,6 +223,7 @@ impl Scheduler {
             let parent_task_enrichment = sink.transfer_context();
             let builtins = current.builtins.clone();
             let (result_tx, result_rx) = current.results.channel();
+            let result_tx = result_tx.with_panic_notifier(builtins.dispatcher().panic_notifier());
             let inner = DeferredTask::new(future_factory, builtins);
             let options = TaskOptions::observed(parent_task_enrichment, TaskPlacement::SameThread);
             current.tasks.add_with_remote_result(inner, options, result_tx);

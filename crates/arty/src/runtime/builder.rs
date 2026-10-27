@@ -20,8 +20,8 @@ use crate::runtime::handle::Runtime;
 ///
 /// The defaults are [`WorkersPolicy::default`], 2 MiB async-worker stacks,
 /// a shared blocking pool, a real-time clock, a no-op telemetry sink, and
-/// [`MonitorPolicy::enabled`]. The default panic policy is
-/// [`PanicPolicy::shutdown`].
+/// [`MonitorPolicy::enabled`]. A contained runtime-owned panic starts
+/// coordinated shutdown by default.
 ///
 /// # Examples
 ///
@@ -43,11 +43,12 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
-    /// Sets the panic policy for this runtime.
+    /// Sets how the runtime responds to a contained task panic.
     ///
-    /// The default is [`PanicPolicy::shutdown`]. This release stores the
-    /// policy in the runtime configuration. It does not yet change panic
-    /// behavior. A follow-up change will enforce the selected policy.
+    /// The default is [`PanicPolicy::shutdown`]. Use
+    /// [`PanicPolicy::ignore`] to keep the runtime available after a panic.
+    /// The panicking task or blocking callback still fails through its join
+    /// handle under either policy.
     ///
     /// # Examples
     ///
@@ -344,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn panic_policy_replaces_the_default() {
+    fn panic_replaces_the_default() {
         let builder = Runtime::builder().panic(PanicPolicy::ignore());
 
         assert!(!builder.processor_config.panic_policy.starts_shutdown());

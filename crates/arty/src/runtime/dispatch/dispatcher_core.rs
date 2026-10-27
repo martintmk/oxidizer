@@ -1,8 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::Waker;
+use std::task::{Wake, Waker};
 use std::thread::ThreadId;
 
 use arty_executor::remote::Pool as RemotePool;
@@ -10,11 +11,12 @@ use arty_executor::{ShutdownCause, ShutdownError, TaskPlacement};
 use foldhash::HashMap;
 use nonempty::NonEmpty;
 use observed::emit;
-use performables::arc::Arc;
+use performables::arc::{Arc, Weak};
 use performables::sync::channel;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::blocking_worker::BlockingWorker;
+use crate::runtime::config::PanicPolicy;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::telemetry::events::{RuntimeStopped, RuntimeStopping};
 use crate::runtime::thread::waiter::ThreadWaiter;
@@ -75,6 +77,21 @@ pub(crate) struct DispatcherCore {
     sink: observed::Sink,
 
     remote_results: RemotePool,
+    panic_shutdown_cause: Option<ShutdownCause>,
+}
+
+struct PanicShutdownWake(Weak<DispatcherCore>);
+
+impl Wake for PanicShutdownWake {
+    fn wake(self: StdArc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+        if let Some(core) = self.0.upgrade() {
+            core.record_panic();
+        }
+    }
 }
 
 impl DispatcherCore {
@@ -83,7 +100,8 @@ impl DispatcherCore {
         worker_endpoints: NonEmpty<WorkerEndpoint>,
         sink: observed::Sink,
         shutdown: Shutdown,
-    ) -> Self {
+        panic_policy: PanicPolicy,
+    ) -> Arc<Self> {
         let owner = worker_endpoints.first().thread.owner();
         assert!(
             worker_endpoints.iter().all(|endpoint| endpoint.thread.owner() == owner),
@@ -106,17 +124,37 @@ impl DispatcherCore {
             worker_endpoints.len(),
             "each runtime worker must have a distinct thread ID"
         );
-        Self {
-            wait_for_shutdown,
-            shutdown,
-            stopped_reported: AtomicBool::new(false),
-            worker_endpoints,
-            workers,
-            worker_indices,
-            next_async_worker_index: AtomicUsize::new(0),
-            sink,
-            remote_results: RemotePool::new(),
+        let panic_shutdown_cause = panic_policy.starts_shutdown().then(ShutdownCause::panic);
+        Arc::new_cyclic(move |weak| {
+            let notifier = if panic_shutdown_cause.is_some() {
+                Waker::from(StdArc::new(PanicShutdownWake(weak.clone())))
+            } else {
+                Waker::noop().clone()
+            };
+            shutdown.initialize_panic_notifier(notifier);
+            Self {
+                wait_for_shutdown,
+                shutdown,
+                stopped_reported: AtomicBool::new(false),
+                worker_endpoints,
+                workers,
+                worker_indices,
+                next_async_worker_index: AtomicUsize::new(0),
+                sink,
+                remote_results: RemotePool::new(),
+                panic_shutdown_cause,
+            }
+        })
+    }
+
+    pub(crate) fn record_panic(&self) {
+        if let Some(cause) = &self.panic_shutdown_cause {
+            _ = self.stop_inner(cause.clone());
         }
+    }
+
+    pub(crate) fn panic_notifier(&self) -> Waker {
+        self.shutdown.panic_notifier()
     }
 
     /// Stops the runtime. Safe to call multiple times.
@@ -353,6 +391,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(first_tx, &first), endpoint(second_tx, &second)]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
     }
 
@@ -369,6 +408,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker_tx, &threads[0])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         dispatcher.spawn(|_| async move { unreachable!("we do not expect the task to be executed") });
@@ -396,6 +436,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker1_tx, &threads[0]), endpoint(worker2_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         dispatcher.spawn(|_| async move { unreachable!("we do not expect the task to be executed") });
@@ -418,6 +459,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker1_tx, &threads[0]), endpoint(worker2_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         for _ in 0..4 {
@@ -438,6 +480,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(first_tx, &threads[0]), endpoint(second_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         let index = dispatcher.worker_index(threads[1].id()).unwrap();
@@ -455,6 +498,7 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         assert!(dispatcher.worker_index(threads[1].id()).is_none());
@@ -464,12 +508,13 @@ mod tests {
     fn shutdown_state_is_shared_with_dispatcher_client() {
         let (tx, _rx) = channel::unbounded();
         let threads = test_threads(1);
-        let core = Arc::new(DispatcherCore::new(
+        let core = DispatcherCore::new(
             ThreadWaiter::new(Vec::new()),
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
-        ));
+            PanicPolicy::default(),
+        );
         let client = DispatcherClient::new(Arc::clone(&core));
         let shutdown = client.shutdown();
 
@@ -487,6 +532,7 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
         dispatcher.stop();
         let invoked = Arc::new(AtomicBool::new(false));
@@ -517,6 +563,7 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
         dispatcher.stop_with_error(Error::worker_panicked());
 
@@ -545,6 +592,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker1_tx, &threads[0]), endpoint(worker2_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         assert_eq!(drain_rx(&worker1_rx).len(), 0);
@@ -576,6 +624,7 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker_tx, &threads[0])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
+            PanicPolicy::default(),
         );
 
         dispatcher.stop();

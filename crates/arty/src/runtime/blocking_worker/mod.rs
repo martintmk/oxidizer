@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Waker;
 use std::thread::ThreadId;
 use std::{fmt, thread};
 
@@ -184,6 +185,10 @@ impl BlockingWorker {
         &self.sink
     }
 
+    fn panic_notifier(&self) -> Waker {
+        self.runtime_shutdown.panic_notifier()
+    }
+
     /// Submits a blocking task to the worker. If the worker is shutting down, the task will be ignored.
     pub(crate) fn spawn_blocking<F, R>(&self, body: F) -> JoinHandle<R>
     where
@@ -202,7 +207,7 @@ impl BlockingWorker {
         let identity = Arc::clone(&self.pool.identity);
         let pool = self.pool.clone();
         let runtime_shutdown = self.runtime_shutdown.clone();
-        let (task, join_handle) = prepare_blocking(&self.remote_results, runtime_shutdown.clone(), body);
+        let (task, join_handle) = prepare_blocking(&self.remote_results, runtime_shutdown.clone(), self.panic_notifier(), body);
         if matches!(runtime_shutdown.state(), ShutdownState::Started) {
             drop(task);
             return join_handle;

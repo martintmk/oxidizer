@@ -1,24 +1,27 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-/// Selects how an Arty runtime will respond to a contained task panic.
+/// Selects how an Arty runtime responds to a contained task panic.
 ///
 /// Pass a policy to
 /// [`RuntimeBuilder::panic`](crate::runtime::RuntimeBuilder::panic).
 /// The shutdown policy is the default.
 ///
-/// This release stores the policy in the runtime configuration. It does not
-/// yet change panic behavior. A follow-up change will enforce the policy at
-/// the documented panic boundaries.
+/// Arty applies this policy when it catches a panic while it creates or polls
+/// an async task, or while it runs a blocking callback. See
+/// [the panic guide](crate::documentation::panics) for the exact boundaries and
+/// limitations.
 ///
 /// # Examples
 ///
-/// Select the ignore policy:
+/// Keep the runtime available after a contained task panic:
 ///
 /// ```
 /// use arty::runtime::{PanicPolicy, Runtime};
 ///
-/// let builder = Runtime::builder().panic(PanicPolicy::ignore());
+/// let runtime = Runtime::builder().panic(PanicPolicy::ignore()).build()?;
+/// runtime.stop()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[repr(transparent)]
 #[derive(Debug, Clone)]
@@ -27,15 +30,19 @@ pub struct PanicPolicy {
 }
 
 impl PanicPolicy {
-    /// Creates a policy that selects coordinated runtime shutdown after a
+    /// Creates a policy that starts coordinated runtime shutdown after a
     /// contained panic.
     #[must_use]
     pub const fn shutdown() -> Self {
         Self { shutdown: true }
     }
 
-    /// Creates a policy that selects continued runtime operation after a
-    /// contained panic.
+    /// Creates a policy that contains the panic and keeps the runtime running.
+    ///
+    /// The panicking task or blocking callback still fails through its join
+    /// handle. Arty isolates most task panics from runtime internals, but it
+    /// cannot repair user state. If user code is not panic-safe, this policy
+    /// can leave shared user state corrupted.
     #[must_use]
     pub const fn ignore() -> Self {
         Self { shutdown: false }
@@ -58,12 +65,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_policy_selects_shutdown() {
+    fn default_policy_starts_shutdown() {
         assert!(PanicPolicy::default().starts_shutdown());
     }
 
     #[test]
-    fn ignore_policy_does_not_select_shutdown() {
+    fn ignore_policy_keeps_the_runtime_running() {
         assert!(!PanicPolicy::ignore().starts_shutdown());
     }
 }

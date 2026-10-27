@@ -72,9 +72,7 @@ fn build_with_processors(
         .get()
         .max(std::env::var("RUST_MIN_STACK").unwrap_or_default().parse().unwrap_or(0));
     let monitor_options = processor_config.monitor_options;
-    // Keep the selected policy at the bootstrap boundary until panic handling
-    // consumes it in the follow-up implementation.
-    let _panic_starts_shutdown = processor_config.panic_policy.starts_shutdown();
+    let panic_policy = processor_config.panic_policy;
 
     let shutdown = Shutdown::default();
     let io_runtime = IoRuntime::new(sink.clone());
@@ -128,13 +126,14 @@ fn build_with_processors(
     }
 
     let runtime_sink = sink.clone();
-    let dispatcher = Arc::new(DispatcherCore::new(
+    let dispatcher = DispatcherCore::new(
         ThreadWaiter::new(async_worker_join_handles),
         NonEmpty::from_vec(async_worker_command_txs)
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown,
-    ));
+        panic_policy,
+    );
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
 
@@ -348,7 +347,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::blocking_worker::BlockingPool;
-    use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, WorkersPolicy};
+    use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, PanicPolicy, WorkersPolicy};
 
     thread_local! {
         static WORKER_LOCAL_CALLS: AtomicUsize = const { AtomicUsize::new(0) };
@@ -392,12 +391,13 @@ mod tests {
             thread: current,
             blocking_worker,
         };
-        let dispatcher = DispatcherClient::new(Arc::new(DispatcherCore::new(
+        let dispatcher = DispatcherClient::new(DispatcherCore::new(
             ThreadWaiter::new(Vec::new()),
             NonEmpty::new(endpoint),
             Sink::noop(),
             shutdown.clone(),
-        )));
+            PanicPolicy::default(),
+        ));
 
         report_worker_failure(&Err(Box::new("worker panic")), &dispatcher);
 
@@ -416,12 +416,13 @@ mod tests {
             thread: current,
             blocking_worker,
         };
-        let dispatcher = DispatcherClient::new(Arc::new(DispatcherCore::new(
+        let dispatcher = DispatcherClient::new(DispatcherCore::new(
             ThreadWaiter::new(Vec::new()),
             NonEmpty::new(endpoint),
             Sink::noop(),
             shutdown.clone(),
-        )));
+            PanicPolicy::default(),
+        ));
 
         report_worker_failure(&Ok(()), &dispatcher);
 
@@ -638,7 +639,7 @@ mod tests {
                 stack_size: NonZero::new(2 * 1024 * 1024).unwrap(),
                 blocking_pool_policy: BlockingPoolPolicy::shared(),
                 monitor_options,
-                panic_policy: crate::runtime::PanicPolicy::default(),
+                panic_policy: PanicPolicy::default(),
             },
             &InactiveClock::default(),
             sink,

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::sync::{Arc, OnceLock};
+use std::task::Waker;
 
 use arty_executor::{ShutdownCause, ShutdownError};
 
@@ -9,7 +10,13 @@ use arty_executor::{ShutdownCause, ShutdownError};
 #[derive(Clone, Default, derive_more::Debug)]
 pub(crate) struct Shutdown {
     #[debug(ignore)]
-    cause: Arc<OnceLock<ShutdownCause>>,
+    inner: Arc<ShutdownInner>,
+}
+
+#[derive(Default)]
+struct ShutdownInner {
+    cause: OnceLock<ShutdownCause>,
+    panic_notifier: OnceLock<Waker>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,12 +31,20 @@ impl Shutdown {
     /// The first published cause is authoritative. Later requests do not
     /// replace it, including a default cause without an error.
     pub(crate) fn begin(&self, cause: ShutdownCause) -> bool {
-        self.cause.set(cause).is_ok()
+        self.inner.cause.set(cause).is_ok()
+    }
+
+    pub(crate) fn initialize_panic_notifier(&self, notifier: Waker) {
+        _ = self.inner.panic_notifier.set(notifier);
+    }
+
+    pub(crate) fn panic_notifier(&self) -> Waker {
+        self.inner.panic_notifier.get().cloned().unwrap_or_else(|| Waker::noop().clone())
     }
 
     #[must_use]
     pub(crate) fn state(&self) -> ShutdownState {
-        if self.cause.get().is_some() {
+        if self.inner.cause.get().is_some() {
             ShutdownState::Started
         } else {
             ShutdownState::Running
@@ -38,7 +53,7 @@ impl Shutdown {
 
     #[must_use]
     pub(crate) fn cause(&self) -> Option<ShutdownCause> {
-        self.cause.get().cloned()
+        self.inner.cause.get().cloned()
     }
 
     #[must_use]
