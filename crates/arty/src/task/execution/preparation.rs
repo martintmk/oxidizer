@@ -140,7 +140,7 @@ where
                 if let Err(panic) = delivery {
                     discard_task_panic_payload(panic);
                 }
-                Poll::Ready(())
+                std::panic::resume_unwind(Box::new("remote task panic reported by Arty"))
             }
         }
     }
@@ -263,7 +263,9 @@ where
     R: Send + 'static,
 {
     let (result_tx, result_rx) = result_pool.channel();
-    let result_tx = PendingResult::new(result_tx, shutdown);
+    let result_tx = PendingResult::new(result_tx, shutdown.clone());
+    let (terminal_tx, terminal_rx) = result_pool.channel();
+    drop(terminal_rx);
     let future_factory = TaskFactory::new(future_factory, parent_task_enrichment);
     let future_factory = RemoteFutureFactory::new(move |cx, tasks| {
         // Factory invocation belongs inside the same panic boundary as polling.
@@ -275,9 +277,9 @@ where
         // channel above, which unlike the executor's join handle can cross thread boundaries.
         let options = TaskOptions::observed(parent_task_enrichment, placement);
         let inner = RemoteResultTask::new(inner, result_tx.into_sender(), panic_notifier);
-        drop(tasks.add(inner, options));
+        tasks.add_with_remote_result(inner, options, terminal_tx);
     });
-    (future_factory, JoinHandle::new(result_rx))
+    (future_factory, JoinHandle::new(result_rx, shutdown))
 }
 
 pub(crate) fn prepare_blocking<F, R>(
@@ -292,9 +294,9 @@ where
     let (result_tx, result_rx) = result_pool.channel();
     let task = BlockingTask {
         pending: Some((body, result_tx)),
-        shutdown,
+        shutdown: shutdown.clone(),
     };
-    (move || task.run(), JoinHandle::new(result_rx))
+    (move || task.run(), JoinHandle::new(result_rx, shutdown))
 }
 
 struct BlockingTask<F, R: Send + 'static> {
@@ -342,7 +344,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
-    use std::task::{Wake, Waker};
+    use std::task::Wake;
 
     use arty_executor::{CycleOutcome, Executor};
     use futures::executor::block_on;

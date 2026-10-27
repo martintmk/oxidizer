@@ -57,6 +57,7 @@ where
 {
     #[debug(ignore)]
     state: State<R>,
+    shutdown: Shutdown,
     blocking_pool: Option<Arc<()>>,
     #[debug(ignore)]
     relocation: Option<ResultRelocation<R>>,
@@ -98,9 +99,10 @@ impl<R> JoinHandle<R>
 where
     R: Send + 'static,
 {
-    pub(crate) fn new(inner: RemoteJoinHandle<R>) -> Self {
+    pub(crate) fn new(inner: RemoteJoinHandle<R>, shutdown: Shutdown) -> Self {
         Self {
             state: State::Pending(inner),
+            shutdown,
             blocking_pool: None,
             relocation: None,
         }
@@ -109,6 +111,7 @@ where
     pub(crate) fn shutdown(cause: ShutdownCause) -> Self {
         Self {
             state: State::Error(Some(ImmediateError::Shutdown(cause))),
+            shutdown: Shutdown::default(),
             blocking_pool: None,
             relocation: None,
         }
@@ -121,6 +124,7 @@ where
     pub(crate) fn invalid_destination() -> Self {
         Self {
             state: State::Error(Some(ImmediateError::InvalidDestination)),
+            shutdown: Shutdown::default(),
             blocking_pool: None,
             relocation: None,
         }
@@ -166,6 +170,10 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         assert_not_current_blocking_pool(this.blocking_pool.as_ref());
+        if let Some(cause) = this.shutdown.cause() {
+            this.state = State::Completed;
+            return Poll::Ready(Err(JoinError::shutdown(cause.into_error())));
+        }
         let mut result = match &mut this.state {
             State::Pending(inner) => match Pin::new(inner).poll(cx) {
                 Poll::Ready(result) => Poll::Ready(result.map_err(JoinError::from_executor)),

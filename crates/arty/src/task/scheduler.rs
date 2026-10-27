@@ -229,9 +229,11 @@ impl Scheduler {
             let inner = DeferredTask::new(future_factory, builtins);
             let inner = RemoteResultTask::new(inner, result_tx, panic_notifier);
             let options = TaskOptions::observed(parent_task_enrichment, TaskPlacement::SameThread);
-            drop(current.tasks.add(inner, options));
+            let (terminal_tx, terminal_rx) = current.results.channel();
+            drop(terminal_rx);
+            current.tasks.add_with_remote_result(inner, options, terminal_tx);
             self.dispatcher.wake_worker(self.binding.worker_index);
-            Ok(JoinHandle::new(result_rx))
+            Ok(JoinHandle::new(result_rx, self.dispatcher.shutdown().clone()))
         })
     }
 
