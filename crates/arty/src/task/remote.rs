@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::fmt::{self, Debug};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task;
@@ -17,15 +16,6 @@ enum TaskResult<R> {
 pub(crate) enum ReceiveError {
     Panicked(TaskPanicPayload),
     Disconnected,
-}
-
-impl<R> Debug for TaskResult<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Completed(_) => f.write_str("Completed(..)"),
-            Self::Panicked(_) => f.write_str("Panicked(..)"),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -60,13 +50,9 @@ impl<R: Send + 'static> Future for Receiver<R> {
     }
 }
 
-impl<R: Send + 'static> Debug for Receiver<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Receiver").finish_non_exhaustive()
-    }
-}
-
+#[derive(derive_more::Debug)]
 pub(crate) struct Sender<R: Send + 'static> {
+    #[debug(ignore)]
     tx: Option<PooledSender<TaskResult<R>>>,
 }
 
@@ -74,12 +60,6 @@ impl<R: Send + 'static> Sender<R> {
     fn publish(mut self, result: TaskResult<R>) {
         let tx = self.tx.take().expect("an Arty result sender publishes at most one result");
         discard_unwind(|| tx.send(result));
-    }
-}
-
-impl<R: Send + 'static> Debug for Sender<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(std::any::type_name::<Self>()).finish_non_exhaustive()
     }
 }
 
@@ -92,9 +72,7 @@ impl<R: Send + 'static> TaskCompletion<R> for Sender<R> {
         self.publish(TaskResult::Panicked(panic));
     }
 
-    fn cancelled(self, _cause: ShutdownCause) {
-        drop(self);
-    }
+    fn cancelled(self, _cause: ShutdownCause) {}
 }
 
 impl<R: Send + 'static> Drop for Sender<R> {
@@ -109,5 +87,26 @@ impl<R: Send + 'static> Drop for Sender<R> {
 fn discard_unwind(action: impl FnOnce()) {
     if let Err(panic) = catch_unwind(AssertUnwindSafe(action)) {
         discard_task_panic_payload(panic);
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    #[test]
+    fn cancellation_disconnects_the_receiver() {
+        let pool = Pool::new();
+        let (sender, mut receiver) = pool.channel::<u32>();
+
+        sender.cancelled(ShutdownCause::default());
+
+        assert!(matches!(
+            Pin::new(&mut receiver).poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(ReceiveError::Disconnected))
+        ));
     }
 }

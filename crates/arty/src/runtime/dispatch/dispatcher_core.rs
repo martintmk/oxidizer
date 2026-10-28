@@ -85,10 +85,6 @@ struct PanicShutdownWake(Weak<DispatcherCore>);
 
 impl Wake for PanicShutdownWake {
     fn wake(self: StdArc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &StdArc<Self>) {
         if let Some(core) = self.0.upgrade() {
             core.record_panic();
         }
@@ -633,6 +629,63 @@ mod tests {
             panic!("a disconnected join must report shutdown");
         };
         assert!(error.is_shutdown());
+    }
+
+    fn panic_dispatcher(policy: PanicPolicy) -> (Arc<DispatcherCore>, DispatcherClient, Shutdown) {
+        let (tx, _rx) = channel::unbounded();
+        let thread = test_threads(1).remove(0);
+        let shutdown = Shutdown::default();
+        let core = DispatcherCore::new(
+            ThreadWaiter::new(Vec::new()),
+            NonEmpty::new(endpoint(tx, &thread)),
+            observed::Sink::noop(),
+            shutdown.clone(),
+            policy,
+        );
+        let client = DispatcherClient::new(Arc::clone(&core));
+        (core, client, shutdown)
+    }
+
+    #[test]
+    fn panic_policy_is_visible_through_dispatcher_and_shutdown_handles() {
+        let (core, client, shutdown) = panic_dispatcher(PanicPolicy::default());
+        assert!(core.panic_starts_shutdown());
+        assert!(client.panic_starts_shutdown());
+        assert!(shutdown.panic_starts_shutdown());
+
+        let (core, client, shutdown) = panic_dispatcher(PanicPolicy::ignore());
+        assert!(!core.panic_starts_shutdown());
+        assert!(!client.panic_starts_shutdown());
+        assert!(!shutdown.panic_starts_shutdown());
+    }
+
+    #[test]
+    fn direct_panic_recording_starts_shutdown() {
+        let (core, _client, shutdown) = panic_dispatcher(PanicPolicy::default());
+
+        core.record_panic();
+
+        assert_eq!(shutdown.state(), ShutdownState::Started);
+    }
+
+    #[test]
+    fn panic_notifier_wake_by_ref_starts_shutdown() {
+        let (core, _client, shutdown) = panic_dispatcher(PanicPolicy::default());
+        let notifier = StdArc::new(PanicShutdownWake(Arc::downgrade(&core)));
+
+        notifier.wake_by_ref();
+
+        assert_eq!(shutdown.state(), ShutdownState::Started);
+    }
+
+    #[test]
+    fn consuming_panic_notifier_wake_starts_shutdown() {
+        let (core, _client, shutdown) = panic_dispatcher(PanicPolicy::default());
+        let notifier = StdArc::new(PanicShutdownWake(Arc::downgrade(&core)));
+
+        notifier.wake();
+
+        assert_eq!(shutdown.state(), ShutdownState::Started);
     }
 
     #[cfg_attr(test, mutants::skip)]
