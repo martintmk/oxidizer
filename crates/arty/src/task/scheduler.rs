@@ -378,7 +378,7 @@ impl Scheduler {
     /// Use this for synchronous I/O or library calls that would otherwise prevent
     /// an async worker from polling tasks and advancing timers. The callback
     /// runs on a separate pool thread. A callback panic fails its join handle
-    /// but does not start runtime shutdown.
+    /// and follows the configured [`PanicPolicy`](crate::runtime::PanicPolicy).
     ///
     /// Uses the associated worker's pool. Configure sharing and limits with
     /// [`BlockingPoolPolicy`](crate::runtime::BlockingPoolPolicy).

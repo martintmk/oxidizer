@@ -311,7 +311,7 @@ mod tests {
     use testing_aids::TEST_TIMEOUT;
 
     use super::*;
-    use crate::runtime::blocking_worker::BlockingPool;
+    use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingPool};
     use crate::runtime::dispatch::{DispatcherClient, test_threads};
 
     #[cfg_attr(test, mutants::skip)]
@@ -320,7 +320,12 @@ mod tests {
             command_tx: tx,
             waker: Waker::noop().clone(),
             thread: thread.clone(),
-            blocking_worker: BlockingWorker::new(BlockingPool::new(None), observed::Sink::noop(), Shutdown::default()),
+            blocking_worker: BlockingWorker::new(
+                BlockingPool::new(None),
+                observed::Sink::noop(),
+                Shutdown::default(),
+                BlockingPanicPolicy::Ignore,
+            ),
         }
     }
 

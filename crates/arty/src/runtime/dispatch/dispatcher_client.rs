@@ -27,30 +27,6 @@ impl DispatcherClient {
         Self { core }
     }
 
-    #[cfg(test)]
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    #[cfg_attr(test, mutants::skip)]
-    pub(crate) fn for_test(thread: &thread_aware::Thread) -> Self {
-        let (command_tx, _command_rx) = performables::sync::channel::unbounded();
-        let shutdown = Shutdown::default();
-        let endpoint = crate::runtime::dispatch::WorkerEndpoint {
-            command_tx,
-            waker: std::task::Waker::noop().clone(),
-            thread: thread.clone(),
-            blocking_worker: BlockingWorker::new(
-                crate::runtime::blocking_worker::BlockingPool::new(None),
-                observed::Sink::noop(),
-                shutdown.clone(),
-            ),
-        };
-        Self::new(DispatcherCore::new(
-            crate::runtime::thread::waiter::ThreadWaiter::new(Vec::new()),
-            nonempty::NonEmpty::new(endpoint),
-            observed::Sink::noop(),
-            shutdown,
-        ))
-    }
-
     pub(crate) fn worker_index(&self, thread_id: ThreadId) -> Option<WorkerIndex> {
         self.core.worker_index(thread_id)
     }
@@ -157,7 +133,7 @@ mod tests {
     use thread_aware::Thread;
 
     use super::*;
-    use crate::runtime::blocking_worker::BlockingPool;
+    use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingPool};
     use crate::runtime::dispatch::{WorkerEndpoint, test_threads};
     use crate::runtime::thread::waiter::ThreadWaiter;
     use crate::task::scheduler::Scheduler;
@@ -169,7 +145,7 @@ mod tests {
             command_tx,
             waker: Waker::noop().clone(),
             thread: test_threads(1).pop().unwrap(),
-            blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default()),
+            blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default(), BlockingPanicPolicy::Ignore),
         };
         let client = DispatcherClient::new(DispatcherCore::new(
             ThreadWaiter::new(vec![]),
@@ -192,7 +168,7 @@ mod tests {
         let (worker1_tx, worker1_rx) = channel::unbounded();
         let wfs = ThreadWaiter::new(vec![]);
         let threads = test_threads(2);
-        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default());
+        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default(), BlockingPanicPolicy::Ignore);
 
         let dispatcher = DispatcherCore::new(
             wfs,
@@ -236,9 +212,14 @@ mod tests {
     fn relocate_switches_blocking_worker() {
         let threads = test_threads(2);
 
-        let source_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default());
+        let source_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default(), BlockingPanicPolicy::Ignore);
         let destination_shutdown = Shutdown::default();
-        let destination_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), destination_shutdown.clone());
+        let destination_worker = BlockingWorker::new(
+            BlockingPool::new(None),
+            Sink::noop(),
+            destination_shutdown.clone(),
+            BlockingPanicPolicy::Ignore,
+        );
         destination_shutdown.begin(ShutdownCause::default());
 
         let dispatcher = DispatcherCore::new(
@@ -323,7 +304,7 @@ mod tests {
             command_tx,
             waker: Waker::noop().clone(),
             thread: threads[0].clone(),
-            blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default()),
+            blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop(), Shutdown::default(), BlockingPanicPolicy::Ignore),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
             ThreadWaiter::new(vec![]),

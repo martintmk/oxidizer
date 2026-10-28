@@ -231,7 +231,7 @@ mod tests {
     use thread_aware::{ThreadBuilder, Unaware};
 
     use super::*;
-    use crate::runtime::blocking_worker::{BlockingPool, BlockingWorker};
+    use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingPool, BlockingWorker};
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
     use crate::runtime::thread::waiter::ThreadWaiter;
 
@@ -242,7 +242,12 @@ mod tests {
             command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: ThreadBuilder::default().build(worker.thread().id()),
-            blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop(), crate::runtime::shutdown::Shutdown::default()),
+            blocking_worker: BlockingWorker::new(
+                BlockingPool::new(None),
+                Sink::noop(),
+                crate::runtime::shutdown::Shutdown::default(),
+                BlockingPanicPolicy::Ignore,
+            ),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
             ThreadWaiter::new(vec![worker]),
@@ -261,7 +266,12 @@ mod tests {
             command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: ThreadBuilder::default().build(worker.thread().id()),
-            blocking_worker: BlockingWorker::new(BlockingPool::new(None), Sink::noop(), crate::runtime::shutdown::Shutdown::default()),
+            blocking_worker: BlockingWorker::new(
+                BlockingPool::new(None),
+                Sink::noop(),
+                crate::runtime::shutdown::Shutdown::default(),
+                BlockingPanicPolicy::Ignore,
+            ),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
             ThreadWaiter::new(vec![worker]),

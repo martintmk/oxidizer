@@ -10,7 +10,10 @@
   the original panic.
 - Let the executor apply the configured `PanicPolicy` to async task factories
   and polls. Forward its `ShutdownCause` without another panic-policy decision.
-  Blocking callback panics fail their join handles but do not start shutdown.
+- For blocking callbacks, apply the policy at the blocking execution boundary.
+  Publish the cause before delivering the panic result. Wake the associated
+  async worker only when publication starts shutdown.
+- Keep panic policy and worker wakers out of shared shutdown state.
 - The shutdown policy starts coordinated runtime shutdown. The ignore policy
   leaves the scheduler usable.
 - Add cleanup containment only when needed for memory safety or exact-once

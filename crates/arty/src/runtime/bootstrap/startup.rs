@@ -16,7 +16,7 @@ use thread_aware::{Thread, ThreadAware, ThreadBuilder};
 use tick::runtime::InactiveClock;
 
 use crate::io::{Io, RuntimeDriverHost};
-use crate::runtime::blocking_worker::BlockingWorker;
+use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingWorker};
 use crate::runtime::bootstrap::pools::BlockingPools;
 use crate::runtime::config::{MonitorOptions, PanicPolicy, RuntimeConfig};
 use crate::runtime::dispatch::{DispatcherClient, DispatcherCore, WorkerEndpoint};
@@ -223,11 +223,13 @@ impl AsyncWorkerStartInfo {
         let mut clock = inactive_clock;
         clock.relocate(None, &current);
 
-        // Use shared blocking worker pool if shared, otherwise use a new one
-        let blocking_worker = BlockingWorker::new(blocking_pools.build_worker(), worker_sink.clone(), shutdown);
-
         let signal = Arc::new(WorkerSignal::default());
         let worker_waker = WorkerSignal::waker(&signal);
+        let blocking_panic_policy = match panic_policy.clone().into_executor_policy() {
+            arty_executor::PanicPolicy::Ignore => BlockingPanicPolicy::Ignore,
+            arty_executor::PanicPolicy::Shutdown => BlockingPanicPolicy::Shutdown(worker_waker.clone()),
+        };
+        let blocking_worker = BlockingWorker::new(blocking_pools.build_worker(), worker_sink.clone(), shutdown, blocking_panic_policy);
 
         worker_endpoint_tx
             .send((worker_waker, current.clone(), Arc::clone(&blocking_worker)))
@@ -387,7 +389,7 @@ mod tests {
         let (command_tx, _command_rx) = channel::unbounded();
         let shutdown = Shutdown::default();
         let current = ThreadBuilder::default().build(thread::current().id());
-        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone());
+        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone(), BlockingPanicPolicy::Ignore);
         let endpoint = WorkerEndpoint {
             command_tx,
             waker: Waker::noop().clone(),
@@ -411,7 +413,7 @@ mod tests {
         let (command_tx, _command_rx) = channel::unbounded();
         let shutdown = Shutdown::default();
         let current = ThreadBuilder::default().build(thread::current().id());
-        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone());
+        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone(), BlockingPanicPolicy::Ignore);
         let endpoint = WorkerEndpoint {
             command_tx,
             waker: Waker::noop().clone(),

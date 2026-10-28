@@ -332,7 +332,7 @@ mod tests {
     use tick::ClockControl;
 
     use super::*;
-    use crate::runtime::blocking_worker::BlockingPool;
+    use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingPool};
     use crate::runtime::blocking_worker::blocking_worker_tests::is_blocking_worker_shutting_down;
     use crate::runtime::config::MonitorPolicy;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
@@ -342,7 +342,7 @@ mod tests {
     fn test_blocking_worker() -> (Arc<BlockingWorker>, Shutdown) {
         let shutdown = Shutdown::default();
         (
-            BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone()),
+            BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone(), BlockingPanicPolicy::Ignore),
             shutdown,
         )
     }

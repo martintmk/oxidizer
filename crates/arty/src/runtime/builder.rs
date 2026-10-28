@@ -43,13 +43,12 @@ pub struct RuntimeBuilder {
 }
 
 impl RuntimeBuilder {
-    /// Sets how the runtime responds to a contained async task panic.
+    /// Sets how the runtime responds to a contained task or callback panic.
     ///
     /// The default is [`PanicPolicy::shutdown`]. Use
     /// [`PanicPolicy::ignore`] to keep the runtime available after a panic.
     /// The panicking task still fails through its join handle under either
-    /// policy. Blocking callback panics fail their join handles but do not
-    /// start shutdown.
+    /// policy. The policy also applies to blocking callbacks.
     ///
     /// # Examples
     ///
