@@ -11,9 +11,7 @@ use nm::{Event, Magnitude, MetricsPusher, Push};
 use observed::Sink;
 use tick::SimpleClock;
 
-use crate::{
-    CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskPoll, TaskSet, executor_context,
-};
+use crate::{CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskSet, executor_context};
 
 /// The async task executor for a single thread.
 ///
@@ -109,7 +107,7 @@ impl Executor {
     /// Returns a handle that can request executor shutdown.
     #[must_use]
     pub fn shutdown(&self) -> Shutdown {
-        self.shared.shutdown()
+        self.shared.shutdown().clone()
     }
 
     /// Returns whether the executor still owns any registered tasks.
@@ -177,8 +175,8 @@ impl Executor {
     }
 
     fn cancel_if_shutting_down(&mut self) {
-        if self.shared.is_shutting_down() {
-            let cause = self.shared.shutdown_cause();
+        if self.shared.shutdown().is_triggered() {
+            let cause = self.shared.shutdown().cause();
             let aborted_count = self.prepare_task_abort();
             self.abort_prepared_tasks(aborted_count, true, &cause);
         }
@@ -186,7 +184,7 @@ impl Executor {
 
     fn cycle_outcome(&self) -> CycleOutcome {
         if self.evaluate_shutdown_completion() {
-            CycleOutcome::Shutdown(self.shared.shutdown_cause())
+            CycleOutcome::Shutdown(self.shared.shutdown().cause())
         } else if self.has_work_to_do() {
             CYCLE_OUTCOME_CONTINUE.with(Event::observe_once);
             CycleOutcome::Continue
@@ -221,8 +219,8 @@ impl Executor {
             let pointer = task_handle.as_ptr();
             let linked = task.links().linked.get();
 
-            if self.shared.is_shutting_down() {
-                task.abort(self.shared.shutdown_cause());
+            if self.shared.shutdown().is_triggered() {
+                task.abort(self.shared.shutdown().cause());
                 self.shared.decrement_task_count(1);
                 // SAFETY: The active owner keeps `pointer` live; a linked active task belongs to
                 // this executor's pending list, and this code runs on the task owner thread.
@@ -232,10 +230,10 @@ impl Executor {
                 continue;
             }
 
-            let outcome = task.poll();
+            let outcome = task.poll(&self.shared);
             let task_handle = self.active.pop_front().expect("the task remains active until its poll returns");
             match outcome {
-                outcome @ (TaskPoll::Ready | TaskPoll::Panicked) => {
+                task::Poll::Ready(()) => {
                     if linked {
                         // SAFETY: `linked` was read from the live active task, whose list ownership
                         // belongs to this executor and is accessed on the task owner thread.
@@ -243,11 +241,8 @@ impl Executor {
                     }
                     self.shared.decrement_task_count(1);
                     completed_count = completed_count.saturating_add(1);
-                    if matches!(outcome, TaskPoll::Panicked) && self.shared.panic_policy().starts_shutdown() {
-                        self.shared.shutdown().trigger(ShutdownCause::panic());
-                    }
                 }
-                TaskPoll::Pending => {
+                task::Poll::Pending => {
                     pending_count = pending_count.saturating_add(1);
                     if linked {
                         drop(task_handle);
@@ -306,7 +301,7 @@ impl Executor {
     #[cfg_attr(test, mutants::skip)] // Mutation can lead to deadlocked executor as it never shuts down.
     #[must_use]
     fn evaluate_shutdown_completion(&self) -> bool {
-        if !self.shared.is_shutting_down() {
+        if !self.shared.shutdown().is_triggered() {
             return false;
         }
         debug_assert!(self.active.is_empty());
@@ -325,7 +320,7 @@ impl Drop for Executor {
             fn drop(&mut self) {
                 if std::thread::panicking() {
                     // Retire remaining payloads on their owner if cancellation unwinds.
-                    let cause = self.0.shared.shutdown_cause();
+                    let cause = self.0.shared.shutdown().cause();
                     let aborted_count = self.0.prepare_task_abort();
                     self.0.abort_prepared_tasks(aborted_count, false, &cause);
                 }
@@ -333,7 +328,8 @@ impl Drop for Executor {
             }
         }
 
-        let cause = self.shared.publish_shutdown(ShutdownCause::default());
+        _ = self.shared.shutdown().publish(ShutdownCause::default());
+        let cause = self.shared.shutdown().cause();
         let guard = FinishDrop(self);
         let aborted_count = guard.0.prepare_task_abort();
         guard.0.abort_prepared_tasks(aborted_count, false, &cause);

@@ -135,16 +135,20 @@ fn assert_panic_cause_precedes_join_notification(observe_panic: bool) {
     let runtime = runtime_builder(1, PanicPolicy::shutdown()).build().unwrap();
     let control = support::runtime_control(&runtime);
     let (started_tx, started_rx) = mpsc::channel();
-    let pending = runtime.scheduler().spawn_anywhere(Unaware(started_tx), |_, Unaware(started)| async move {
-        started.send(()).unwrap();
-        pending::<()>().await;
-    });
+    let pending = runtime
+        .scheduler()
+        .spawn_anywhere(Unaware(started_tx), |_, Unaware(started)| async move {
+            started.send(()).unwrap();
+            pending::<()>().await;
+        });
     started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
     let (release, released) = events_once::Event::<()>::boxed();
-    let panicking = runtime.scheduler().spawn_anywhere(Unaware(released), |_, Unaware(released)| async move {
-        released.await.unwrap();
-        panic!("panic before a join notification");
-    });
+    let panicking = runtime
+        .scheduler()
+        .spawn_anywhere(Unaware(released), |_, Unaware(released)| async move {
+            released.await.unwrap();
+            panic!("panic before a join notification");
+        });
     let mut observed = if observe_panic { panicking } else { pending };
     let (notified, notifications) = mpsc::channel();
     let waker = Waker::from(Arc::new(StopOnWake { control, notified }));
@@ -166,23 +170,27 @@ fn assert_panic_cause_precedes_join_notification(observe_panic: bool) {
 }
 
 #[test]
-fn default_blocking_panic_preserves_the_panic_join_and_starts_shutdown() {
-    let runtime = runtime_builder(1, PanicPolicy::shutdown()).build().unwrap();
-    let task = runtime.scheduler().spawn_blocking(|| panic!("blocking panic"));
-
-    assert!(task.join().unwrap_err().is_panic());
-    assert!(
-        runtime
+fn blocking_panics_only_fail_their_join_under_either_policy() {
+    for policy in [PanicPolicy::default(), PanicPolicy::ignore()] {
+        let runtime = runtime_builder(1, policy).build().unwrap();
+        let (release, released) = events_once::Event::<()>::boxed();
+        let pending = runtime
             .scheduler()
-            .spawn_anywhere(Unaware(42), return_value)
-            .join()
-            .unwrap_err()
-            .is_shutdown()
-    );
-    assert_eq!(
-        shutdown_cause(&runtime.stop().unwrap_err()).inner().to_string(),
-        "a contained runtime operation panicked"
-    );
+            .spawn_anywhere(Unaware(released), |_, Unaware(released)| async move {
+                released.await.unwrap();
+                7
+            });
+        let task: arty::task::JoinHandle<()> = runtime.scheduler().spawn_blocking(|| std::panic::panic_any(42_u32));
+
+        let panic = task.join().unwrap_err();
+        assert!(panic.is_panic());
+        assert_eq!(*panic.into_panic().unwrap().downcast::<u32>().unwrap(), 42);
+        assert_eq!(runtime.scheduler().spawn_anywhere(Unaware(43), return_value).join().unwrap(), 43);
+        assert_eq!(runtime.scheduler().spawn_blocking(|| 44).join().unwrap(), 44);
+        release.send(());
+        assert_eq!(pending.join().unwrap(), 7);
+        runtime.stop().unwrap();
+    }
 }
 
 #[test]
@@ -291,15 +299,6 @@ fn a_dropped_join_does_not_suppress_default_shutdown() {
 
 #[test]
 fn detached_async_panic_cascades_its_shutdown_cause_to_every_worker() {
-    assert_detached_panic_cascades_to_every_worker(false);
-}
-
-#[test]
-fn detached_blocking_panic_cascades_its_shutdown_cause_to_every_worker() {
-    assert_detached_panic_cascades_to_every_worker(true);
-}
-
-fn assert_detached_panic_cascades_to_every_worker(blocking: bool) {
     let runtime = runtime_builder(2, PanicPolicy::shutdown()).build().unwrap();
     let control = support::runtime_control(&runtime);
     let scheduler = runtime
@@ -322,11 +321,7 @@ fn assert_detached_panic_cascades_to_every_worker(blocking: bool) {
         started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
     }
 
-    if blocking {
-        drop(runtime.scheduler().spawn_blocking(|| panic!("detached blocking panic")));
-    } else {
-        drop(scheduler.spawn_at(control.workers().into_iter().next().unwrap(), Unaware(()), relocated_panic));
-    }
+    drop(scheduler.spawn_at(control.workers().into_iter().next().unwrap(), Unaware(()), relocated_panic));
 
     let cancellations: Vec<_> = pending.into_iter().map(|task| task.join().unwrap_err()).collect();
     let stop = runtime.stop().unwrap_err();
@@ -341,4 +336,48 @@ fn assert_detached_panic_cascades_to_every_worker(blocking: bool) {
             .unwrap();
         assert!(std::ptr::eq(source.inner(), expected.inner()));
     }
+}
+
+#[test]
+fn detached_blocking_panic_keeps_work_running_on_every_worker() {
+    let runtime = runtime_builder(2, PanicPolicy::shutdown())
+        .blocking_pool(BlockingPoolPolicy::shared().max(1))
+        .build()
+        .unwrap();
+    let control = support::runtime_control(&runtime);
+    let scheduler = runtime
+        .scheduler()
+        .spawn_anywhere((), |cx, ()| async move { cx.scheduler().clone() })
+        .join()
+        .unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let pending: Vec<_> = control
+        .workers()
+        .into_iter()
+        .map(|worker| {
+            let (release, released) = events_once::Event::<()>::boxed();
+            let task = scheduler.spawn_at(
+                worker,
+                Unaware((started_tx.clone(), released)),
+                |Unaware((started, released))| async move {
+                    started.send(()).unwrap();
+                    released.await.unwrap();
+                    42
+                },
+            );
+            (release, task)
+        })
+        .collect();
+    for _ in &pending {
+        started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    }
+
+    drop(scheduler.spawn_blocking(|| panic!("detached blocking panic")));
+    assert_eq!(scheduler.spawn_blocking(|| 7).join().unwrap(), 7);
+
+    for (release, task) in pending {
+        release.send(());
+        assert_eq!(task.join().unwrap(), 42);
+    }
+    runtime.stop().unwrap();
 }

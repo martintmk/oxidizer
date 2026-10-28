@@ -133,7 +133,6 @@ fn build_with_processors(
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown,
-        panic_policy,
     );
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
@@ -293,7 +292,7 @@ impl AsyncWorkerStartInfo {
 
 fn report_worker_failure(outcome: &std::thread::Result<()>, dispatcher: &DispatcherClient) {
     if outcome.is_err() {
-        _ = dispatcher.stop(arty_executor::ShutdownError::new(Error::worker_panicked()).into());
+        _ = dispatcher.stop(Error::worker_panicked().into_shutdown_cause());
     }
 }
 
@@ -400,7 +399,6 @@ mod tests {
             NonEmpty::new(endpoint),
             Sink::noop(),
             shutdown.clone(),
-            PanicPolicy::default(),
         ));
 
         report_worker_failure(&Err(Box::new("worker panic")), &dispatcher);
@@ -425,7 +423,6 @@ mod tests {
             NonEmpty::new(endpoint),
             Sink::noop(),
             shutdown.clone(),
-            PanicPolicy::default(),
         ));
 
         report_worker_failure(&Ok(()), &dispatcher);

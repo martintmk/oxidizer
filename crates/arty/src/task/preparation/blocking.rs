@@ -36,8 +36,7 @@ where
                 result_tx.completed(result);
             }
             Err(panic) => {
-                result_tx.panic_notifier().wake_by_ref();
-                result_tx.panicked(panic);
+                result_tx.panicked(panic, None);
             }
         }
     }

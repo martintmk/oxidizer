@@ -7,15 +7,20 @@ When unwinding is enabled, Arty catches panics raised while it:
 - runs a blocking callback.
 
 Arty reports these panics through `JoinError` when possible. By default, the
-first contained user-task panic shuts down the runtime.
+first contained async task panic shuts down the runtime.
 `PanicPolicy::ignore()` keeps the runtime running.
 
-Shutdown does not depend on joining the panicking task. It still starts if
-the caller drops the join handle. All runtime workers receive the same
-shutdown cause.
+A blocking callback panic fails its join handle but does not start shutdown
+under either policy.
 
-Arty records a panic shutdown cause before it publishes the panic result or
-notifies cancelled tasks. Later stop requests do not replace that cause.
+Shutdown after an async task panic does not depend on joining that task.
+It still starts if the caller drops the join handle. All runtime workers
+receive the same shutdown cause.
+
+The executor selects the shutdown cause before it publishes the panic result
+or notifies cancelled tasks. Arty preserves that cause across workers.
+Later stop requests do not replace that cause.
+An async worker then broadcasts shutdown to all workers.
 
 Arty does not guarantee recovery from panics raised by destructors, custom
 wakers, join notifications, telemetry processors, or other cleanup and

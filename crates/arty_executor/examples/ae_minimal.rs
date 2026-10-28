@@ -15,7 +15,7 @@ struct DiscardCompletion;
 impl TaskCompletion<()> for DiscardCompletion {
     fn completed(self, _result: ()) {}
 
-    fn panicked(self, panic: TaskPanicPayload) {
+    fn panicked(self, panic: TaskPanicPayload, _cause: Option<ShutdownCause>) {
         discard_task_panic_payload(panic);
     }
 

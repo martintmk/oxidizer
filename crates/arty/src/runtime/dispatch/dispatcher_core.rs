@@ -1,21 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Wake, Waker};
+use std::task::Waker;
 use std::thread::ThreadId;
 
 use arty_executor::{ShutdownCause, TaskPlacement};
 use foldhash::HashMap;
 use nonempty::NonEmpty;
 use observed::emit;
-use performables::arc::{Arc, Weak};
+use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::blocking_worker::BlockingWorker;
-use crate::runtime::config::PanicPolicy;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::telemetry::events::{RuntimeStopped, RuntimeStopping};
 use crate::runtime::thread::waiter::ThreadWaiter;
@@ -78,23 +76,12 @@ pub(crate) struct DispatcherCore {
     remote_results: JoinHandlePool,
 }
 
-struct PanicShutdownWake(Weak<DispatcherCore>);
-
-impl Wake for PanicShutdownWake {
-    fn wake(self: StdArc<Self>) {
-        if let Some(core) = self.0.upgrade() {
-            core.record_panic();
-        }
-    }
-}
-
 impl DispatcherCore {
     pub(crate) fn new(
         wait_for_shutdown: ThreadWaiter,
         worker_endpoints: NonEmpty<WorkerEndpoint>,
         sink: observed::Sink,
         shutdown: Shutdown,
-        panic_policy: PanicPolicy,
     ) -> Arc<Self> {
         let owner = worker_endpoints.first().thread.owner();
         assert!(
@@ -118,29 +105,17 @@ impl DispatcherCore {
             worker_endpoints.len(),
             "each runtime worker must have a distinct thread ID"
         );
-        let panic_starts_shutdown = panic_policy.into_executor_policy().starts_shutdown();
-        Arc::new_cyclic(move |weak| {
-            if panic_starts_shutdown {
-                shutdown.initialize_panic_notifier(Waker::from(StdArc::new(PanicShutdownWake(weak.clone()))));
-            }
-            Self {
-                wait_for_shutdown,
-                shutdown_signaled: AtomicBool::new(false),
-                stopped_reported: AtomicBool::new(false),
-                worker_endpoints,
-                workers,
-                worker_indices,
-                next_async_worker_index: AtomicUsize::new(0),
-                sink,
-                remote_results: JoinHandlePool::new(shutdown),
-            }
+        Arc::new(Self {
+            wait_for_shutdown,
+            shutdown_signaled: AtomicBool::new(false),
+            stopped_reported: AtomicBool::new(false),
+            worker_endpoints,
+            workers,
+            worker_indices,
+            next_async_worker_index: AtomicUsize::new(0),
+            sink,
+            remote_results: JoinHandlePool::new(shutdown),
         })
-    }
-
-    pub(crate) fn record_panic(&self) {
-        if let Some(cause) = self.shutdown().record_panic() {
-            _ = self.stop_inner(cause);
-        }
     }
 
     #[cfg_attr(test, mutants::skip)] // Tests hang if mutation removes the shutdown signal or worker notifications.
@@ -299,12 +274,7 @@ impl DispatcherCore {
             .expect("worker index must identify a registered runtime worker");
         // Capture enrichment context on the calling thread before sending to the worker.
         let parent_task_enrichment = self.sink.transfer_context();
-        let (future_factory, join_handle) = prepare_remote(
-            &self.remote_results,
-            future_factory,
-            parent_task_enrichment,
-            placement,
-        );
+        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, parent_task_enrichment, placement);
 
         // There is nothing we can really do if the worker is already gone and closed the channel.
         // That may be the case when we landed here when the runtime was already shutting down.
@@ -367,7 +337,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(first_tx, &first), endpoint(second_tx, &second)]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
     }
 
@@ -384,7 +353,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker_tx, &threads[0])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         dispatcher.spawn(|_| async move { unreachable!("we do not expect the task to be executed") });
@@ -412,7 +380,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker1_tx, &threads[0]), endpoint(worker2_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         dispatcher.spawn(|_| async move { unreachable!("we do not expect the task to be executed") });
@@ -435,7 +402,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker1_tx, &threads[0]), endpoint(worker2_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         for _ in 0..4 {
@@ -456,7 +422,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(first_tx, &threads[0]), endpoint(second_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         let index = dispatcher.worker_index(threads[1].id()).unwrap();
@@ -474,7 +439,6 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         assert!(dispatcher.worker_index(threads[1].id()).is_none());
@@ -489,7 +453,6 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
         let client = DispatcherClient::new(Arc::clone(&core));
         let shutdown = client.shutdown();
@@ -508,7 +471,6 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
         dispatcher.stop_inner(ShutdownCause::default());
         let invoked = Arc::new(AtomicBool::new(false));
@@ -539,7 +501,6 @@ mod tests {
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
         dispatcher.stop_inner(ShutdownError::new(Error::worker_panicked()).into());
 
@@ -568,7 +529,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker1_tx, &threads[0]), endpoint(worker2_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         assert_eq!(drain_rx(&worker1_rx).len(), 0);
@@ -600,7 +560,6 @@ mod tests {
             NonEmpty::from_vec(vec![endpoint(worker_tx, &threads[0])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
-            PanicPolicy::default(),
         );
 
         dispatcher.stop_inner(ShutdownCause::default());
@@ -621,7 +580,7 @@ mod tests {
         assert!(error.is_shutdown());
     }
 
-    fn panic_dispatcher(policy: PanicPolicy) -> (Arc<DispatcherCore>, DispatcherClient, Shutdown) {
+    fn shutdown_dispatcher() -> (Arc<DispatcherCore>, DispatcherClient, Shutdown) {
         let (tx, _rx) = channel::unbounded();
         let thread = test_threads(1).remove(0);
         let shutdown = Shutdown::default();
@@ -630,53 +589,30 @@ mod tests {
             NonEmpty::new(endpoint(tx, &thread)),
             observed::Sink::noop(),
             shutdown.clone(),
-            policy,
         );
         let client = DispatcherClient::new(Arc::clone(&core));
         (core, client, shutdown)
     }
 
     #[test]
-    fn panic_notifier_applies_policy_to_dispatcher_and_shutdown_handles() {
-        for (policy, expected) in [
-            (PanicPolicy::default(), ShutdownState::Started),
-            (PanicPolicy::ignore(), ShutdownState::Running),
-        ] {
-            let (core, client, shutdown) = panic_dispatcher(policy);
+    fn published_shutdown_cause_is_shared_with_dispatcher_and_client() {
+        let (core, client, shutdown) = shutdown_dispatcher();
+        let cause = ShutdownCause::panic();
+        let expected = cause.as_error().unwrap().clone();
 
-            shutdown.panic_notifier().wake_by_ref();
+        shutdown.begin(cause);
 
-            assert_eq!(core.shutdown().state(), expected);
-            assert_eq!(client.shutdown().state(), expected);
-            assert_eq!(shutdown.state(), expected);
+        for state in [core.shutdown(), client.shutdown(), &shutdown] {
+            assert_eq!(state.state(), ShutdownState::Started);
+            assert!(std::ptr::eq(state.error().unwrap().inner(), expected.inner()));
         }
     }
 
     #[test]
-    fn direct_panic_recording_starts_shutdown() {
-        let (core, _client, shutdown) = panic_dispatcher(PanicPolicy::default());
+    fn direct_shutdown_publication_starts_shutdown() {
+        let (core, _client, shutdown) = shutdown_dispatcher();
 
-        core.record_panic();
-
-        assert_eq!(shutdown.state(), ShutdownState::Started);
-    }
-
-    #[test]
-    fn panic_notifier_wake_by_ref_starts_shutdown() {
-        let (core, _client, shutdown) = panic_dispatcher(PanicPolicy::default());
-        let notifier = StdArc::new(PanicShutdownWake(Arc::downgrade(&core)));
-
-        notifier.wake_by_ref();
-
-        assert_eq!(shutdown.state(), ShutdownState::Started);
-    }
-
-    #[test]
-    fn consuming_panic_notifier_wake_starts_shutdown() {
-        let (core, _client, shutdown) = panic_dispatcher(PanicPolicy::default());
-        let notifier = StdArc::new(PanicShutdownWake(Arc::downgrade(&core)));
-
-        notifier.wake();
+        core.shutdown().begin(ShutdownCause::default());
 
         assert_eq!(shutdown.state(), ShutdownState::Started);
     }

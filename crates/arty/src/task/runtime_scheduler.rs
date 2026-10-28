@@ -198,7 +198,7 @@ impl RuntimeScheduler {
     ///
     /// Uses a pool chosen by the runtime for synchronous I/O or other work
     /// that would stall an async worker.
-    /// The callback's panic is reported through its join.
+    /// Arty reports a callback panic through its join handle without starting shutdown.
     ///
     /// Shutdown rejects new callbacks and cancels queued callbacks before they
     /// start. Already-running callbacks are allowed to finish.

@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-/// Selects how an Arty runtime responds to a contained task panic.
+/// Selects how an Arty runtime responds to a contained async task panic.
 ///
 /// Pass a policy to
 /// [`RuntimeBuilder::panic`](crate::runtime::RuntimeBuilder::panic).
 /// The shutdown policy is the default.
 ///
 /// Arty applies this policy when it catches a panic while it creates or polls
-/// an async task, or while it runs a blocking callback. See
-/// [the panic guide](crate::documentation::panics) for the exact boundaries and
-/// limitations.
+/// an async task. Blocking callback panics fail their join handles but do not
+/// start shutdown under either policy. See
+/// [the panic guide](crate::documentation::panics) for the exact boundaries and limitations.
 ///
 /// # Examples
 ///
@@ -31,7 +31,7 @@ pub struct PanicPolicy {
 
 impl PanicPolicy {
     /// Creates a policy that starts coordinated runtime shutdown after a
-    /// contained panic.
+    /// contained async task panic.
     #[must_use]
     pub const fn shutdown() -> Self {
         Self {
@@ -41,8 +41,8 @@ impl PanicPolicy {
 
     /// Creates a policy that contains the panic and keeps the runtime running.
     ///
-    /// The panicking task or blocking callback still fails through its join
-    /// handle. Arty isolates most task panics from runtime internals, but it
+    /// The panicking async task still fails through its join handle.
+    /// Arty isolates most task panics from runtime internals, but it
     /// cannot repair user state. If user code is not panic-safe, this policy
     /// can leave shared user state corrupted.
     #[must_use]

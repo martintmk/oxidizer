@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::task::Waker;
 
 use arty_executor::{ShutdownCause, TaskCompletion, TaskPanicPayload, discard_task_panic_payload};
 use events_once::{EventLake, PooledSender};
@@ -48,10 +47,6 @@ pub(crate) struct Sender<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> Sender<R> {
-    pub(crate) fn panic_notifier(&self) -> Waker {
-        self.shutdown.panic_notifier()
-    }
-
     fn publish(mut self, result: Result<R, JoinError>) {
         let tx = self.tx.take().expect("an Arty result sender publishes at most one result");
         discard_unwind(|| tx.send(result));
@@ -63,15 +58,17 @@ impl<R: Send + 'static> TaskCompletion<R> for Sender<R> {
         self.publish(Ok(result));
     }
 
-    fn panicked(self, panic: TaskPanicPayload) {
-        // A completion waker can request normal shutdown before the executor returns.
-        _ = self.shutdown.record_panic();
+    fn panicked(self, panic: TaskPanicPayload, cause: Option<ShutdownCause>) {
+        if let Some(cause) = cause {
+            self.shutdown.begin(cause);
+        }
         self.publish(Err(JoinError::panicked(panic)));
     }
 
     fn cancelled(self, cause: ShutdownCause) {
-        let cause = self.shutdown.cause().unwrap_or(cause);
-        self.publish(Err(JoinError::shutdown(cause.into_error())));
+        self.shutdown.begin(cause);
+        let error = JoinError::shutdown(self.shutdown.error());
+        self.publish(Err(error));
     }
 }
 
@@ -95,7 +92,7 @@ fn discard_unwind(action: impl FnOnce()) {
 mod tests {
     use std::error::Error as _;
     use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
 
     use super::*;
 
@@ -191,10 +188,24 @@ mod tests {
         let pool = JoinHandlePool::new(shutdown.clone());
         let (handle, sender) = pool.handle::<u32>();
 
-        sender.panicked(Box::new(42_u32));
+        sender.panicked(Box::new(42_u32), None);
         let error = handle.join().unwrap_err();
 
         assert_eq!(*error.into_panic().unwrap().downcast::<u32>().unwrap(), 42);
         assert_eq!(shutdown.state(), crate::runtime::ShutdownState::Running);
+    }
+
+    #[test]
+    fn panic_preserves_the_executor_shutdown_cause_before_joining() {
+        let shutdown = Shutdown::default();
+        let pool = JoinHandlePool::new(shutdown.clone());
+        let (handle, sender) = pool.handle::<u32>();
+        let cause = ShutdownCause::panic();
+        let expected = cause.as_error().unwrap().clone();
+
+        sender.panicked(Box::new(42_u32), Some(cause));
+
+        assert!(std::ptr::eq(shutdown.error().unwrap().inner(), expected.inner()));
+        assert_eq!(*handle.join().unwrap_err().into_panic().unwrap().downcast::<u32>().unwrap(), 42);
     }
 }

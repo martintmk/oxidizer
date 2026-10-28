@@ -58,7 +58,7 @@ impl<R: 'static> TaskCompletion<R> for CompletionTarget<R> {
         self.publish(TaskOutcome::Completed(result));
     }
 
-    fn panicked(self, panic: TaskPanicPayload) {
+    fn panicked(self, panic: TaskPanicPayload, _cause: Option<ShutdownCause>) {
         self.publish(TaskOutcome::Panicked(panic));
     }
 
@@ -117,7 +117,7 @@ impl<R: 'static> TaskCompletion<R> for DiscardCompletion {
         }
     }
 
-    fn panicked(self, panic: TaskPanicPayload) {
+    fn panicked(self, panic: TaskPanicPayload, _cause: Option<ShutdownCause>) {
         discard_task_panic_payload(panic);
     }
 

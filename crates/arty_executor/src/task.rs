@@ -13,7 +13,7 @@ use pin_project::{pin_project, pinned_drop};
 use plurality::MultiPool;
 
 use crate::{
-    ShutdownCause, TaskCreatedReporter, TaskHandle, TaskHandleSlot, TaskOptions, TaskPanicPayload, TaskPtr, WakeSignal,
+    ExecutorShared, ShutdownCause, TaskCreatedReporter, TaskHandle, TaskHandleSlot, TaskOptions, TaskPanicPayload, TaskPtr, WakeSignal,
     discard_task_panic_payload,
 };
 
@@ -127,7 +127,7 @@ struct TestCompletion;
 impl TaskCompletion<()> for TestCompletion {
     fn completed(self, _result: ()) {}
 
-    fn panicked(self, panic: TaskPanicPayload) {
+    fn panicked(self, panic: TaskPanicPayload, _cause: Option<ShutdownCause>) {
         discard_task_panic_payload(panic);
     }
 
@@ -152,9 +152,9 @@ where
     R: 'static,
     T: TaskCompletion<R>,
 {
-    fn poll(self: Pin<&Self>) -> TaskPoll {
+    fn poll(self: Pin<&Self>, shared: &ExecutorShared) -> task::Poll<()> {
         self.poll_count.set(self.poll_count.get().saturating_add(1));
-        self.options.with_context(|| self.poll_in_context())
+        self.options.with_context(|| self.poll_in_context(shared))
     }
 
     fn created_reporter(&self) -> Option<TaskCreatedReporter> {
@@ -215,7 +215,7 @@ where
         unsafe { Pin::new_unchecked(signal) }
     }
 
-    fn poll_in_context(self: Pin<&Self>) -> TaskPoll {
+    fn poll_in_context(self: Pin<&Self>, shared: &ExecutorShared) -> task::Poll<()> {
         // SAFETY: The `Task` is single-threaded and we only ever create temporary references
         // to `payload` that do not escape `Task` methods, so we know there cannot be a conflicting
         // reference to this field.
@@ -239,10 +239,9 @@ where
 
             let mut cx = task::Context::from_waker(&waker);
 
-            // Report the panic to the executor after retiring the task payload.
             match catch_unwind(AssertUnwindSafe(|| future_as_mut_pinned.poll(&mut cx))) {
                 Ok(x) => x,
-                Err(panic) => return self.finish_panicked(maybe_payload, wake_signal, panic),
+                Err(panic) => return self.finish_panicked(maybe_payload, wake_signal, panic, shared),
             }
         };
 
@@ -250,9 +249,9 @@ where
             task::Poll::Ready(result) => {
                 wake_signal.retire();
                 self.finish_terminal(maybe_payload, TerminalOutcome::Succeeded(result));
-                TaskPoll::Ready
+                task::Poll::Ready(())
             }
-            task::Poll::Pending => TaskPoll::Pending,
+            task::Poll::Pending => task::Poll::Pending,
         }
     }
 
@@ -261,7 +260,8 @@ where
         maybe_payload: &mut Option<Payload<F, R, T>>,
         wake_signal: Pin<&WakeSignal>,
         panic: TaskPanicPayload,
-    ) -> TaskPoll {
+        shared: &ExecutorShared,
+    ) -> task::Poll<()> {
         let payload = maybe_payload.as_mut().expect("a polled task retains its payload");
         let result_target = payload.result_target.take().expect("a polled task retains its result target");
 
@@ -271,9 +271,14 @@ where
             discard_task_panic_payload(disposal);
         }
         *maybe_payload = None;
-        result_target.panicked(panic);
+        let shutdown = shared.shutdown();
+        if shared.panic_policy().starts_shutdown() {
+            _ = shutdown.publish(ShutdownCause::panic());
+        }
+        let cause = shutdown.is_triggered().then(|| shutdown.cause());
+        result_target.panicked(panic, cause);
         self.options.report_panicked(&self.sink, self.poll_count.get());
-        TaskPoll::Panicked
+        task::Poll::Ready(())
     }
 
     fn finish_terminal(self: Pin<&Self>, maybe_payload: &mut Option<Payload<F, R, T>>, outcome: TerminalOutcome<R>) {
@@ -353,12 +358,6 @@ enum TerminalOutcome<R> {
     Cancelled(ShutdownCause),
 }
 
-pub(crate) enum TaskPoll {
-    Pending,
-    Ready,
-    Panicked,
-}
-
 /// Inline result delivery owned by a task. Publishing consumes the target.
 #[doc(hidden)]
 pub trait TaskCompletion<R>: Debug + 'static {
@@ -367,7 +366,11 @@ pub trait TaskCompletion<R>: Debug + 'static {
     fn completed(self, result: R);
 
     /// Publishes a captured task panic. Implementations must not panic.
-    fn panicked(self, panic: TaskPanicPayload);
+    ///
+    /// `cause` contains the executor's first shutdown cause, or `None` if the
+    /// executor continues running. The executor records the cause before this
+    /// notification.
+    fn panicked(self, panic: TaskPanicPayload, cause: Option<ShutdownCause>);
 
     /// Publishes task cancellation caused by executor shutdown. Implementations must not panic.
     fn cancelled(self, cause: ShutdownCause);
@@ -427,8 +430,8 @@ impl<F> PinnedDrop for FutureStorage<F> {
 pub(crate) trait TypeErasedTask: Send + Sync {
     /// Polls the task's future, enabling it to make progress.
     ///
-    /// There is no result type here - the expectation is that the task itself will deliver any
-    /// result out of band, with this poll existing merely to trigger progress.
+    /// The task delivers its result separately. Returns `Poll::Ready(())` when
+    /// the task completes or panics, and `Poll::Pending` otherwise.
     ///
     /// It is not valid to poll a task again once it has completed - the internal state is
     /// dropped to a minimal set after completion and polling is no longer valid.
@@ -438,7 +441,7 @@ pub(crate) trait TypeErasedTask: Send + Sync {
     /// Panics if the task has not been initialized.
     ///
     /// Panics if the task has already been completed.
-    fn poll(self: Pin<&Self>) -> TaskPoll;
+    fn poll(self: Pin<&Self>, shared: &ExecutorShared) -> task::Poll<()>;
 
     /// Captures independently owned data for task-created telemetry.
     fn created_reporter(&self) -> Option<TaskCreatedReporter>;
@@ -503,10 +506,16 @@ mod tests {
     fn polling_after_completion_panics() {
         let pool = MultiPool::new();
         let handle = initialized_task(&pool, std::future::ready(()));
+        let shared = ExecutorShared::new(
+            Waker::noop().clone(),
+            Sink::noop(),
+            std::thread::current().id(),
+            crate::PanicPolicy::ignore(),
+        );
         // SAFETY: The handle owns the task on its creating thread.
         let task = unsafe { handle.as_task() };
 
-        assert!(matches!(task.poll(), TaskPoll::Ready));
-        assert!(catch_unwind(AssertUnwindSafe(|| task.poll())).is_err());
+        assert!(task.poll(&shared).is_ready());
+        assert!(catch_unwind(AssertUnwindSafe(|| task.poll(&shared))).is_err());
     }
 }

@@ -150,12 +150,7 @@ fn discarded_remote_factory_reports_the_shutdown_cause() {
     let shutdown = Shutdown::default();
     shutdown.begin(arty_executor::ShutdownError::new(std::io::Error::other("queued shutdown")).into());
     let result_pool = JoinHandlePool::new(shutdown);
-    let (factory, handle) = prepare_remote(
-        &result_pool,
-        |_| async { 42 },
-        Sink::noop().transfer_context(),
-        TaskPlacement::Any,
-    );
+    let (factory, handle) = prepare_remote(&result_pool, |_| async { 42 }, Sink::noop().transfer_context(), TaskPlacement::Any);
 
     drop(factory);
 

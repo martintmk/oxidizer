@@ -48,7 +48,6 @@ impl DispatcherClient {
             nonempty::NonEmpty::new(endpoint),
             observed::Sink::noop(),
             shutdown,
-            crate::runtime::PanicPolicy::default(),
         ))
     }
 
@@ -127,8 +126,8 @@ impl DispatcherClient {
     }
 
     #[cfg_attr(test, mutants::skip)] // Will cause tests to hang due to runtime never stopping.
-    pub(crate) fn stop(&self, cause: ShutdownCause) -> ShutdownCause {
-        self.core.stop_inner(cause)
+    pub(crate) fn stop(&self, cause: impl Into<ShutdownCause>) -> ShutdownCause {
+        self.core.stop_inner(cause.into())
     }
 
     // Impractical to test real waiting at this API layer. We test the real waiter implementation
@@ -177,7 +176,6 @@ mod tests {
             nonempty::NonEmpty::new(worker),
             Sink::noop(),
             Shutdown::default(),
-            crate::runtime::PanicPolicy::default(),
         ));
         let clone = client.clone();
         assert_eq!(client.shutdown().state(), crate::runtime::ShutdownState::Running);
@@ -215,7 +213,6 @@ mod tests {
             .unwrap(),
             Sink::noop(),
             Shutdown::default(),
-            crate::runtime::PanicPolicy::default(),
         );
 
         let mut scheduler = Scheduler::new(DispatcherClient::new(dispatcher), threads[0].clone());
@@ -263,7 +260,6 @@ mod tests {
             .unwrap(),
             Sink::noop(),
             Shutdown::default(),
-            crate::runtime::PanicPolicy::default(),
         );
 
         let mut scheduler = Scheduler::new(DispatcherClient::new(dispatcher), threads[0].clone());
@@ -334,7 +330,6 @@ mod tests {
             nonempty::NonEmpty::new(worker),
             Sink::noop(),
             Shutdown::default(),
-            crate::runtime::PanicPolicy::default(),
         ));
         let thread = if registered { threads[0].clone() } else { threads[1].clone() };
         crate::io::Io::new(arty_io_host::IoRuntime::new(Sink::noop()), dispatcher, thread)

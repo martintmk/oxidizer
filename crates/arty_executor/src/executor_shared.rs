@@ -13,7 +13,7 @@ use performables::sync::channel;
 use plurality::MultiPool;
 
 use crate::wake::RemoteWake;
-use crate::{PanicPolicy, Shutdown, ShutdownCause, TaskCompletion, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_task};
+use crate::{PanicPolicy, Shutdown, TaskCompletion, TaskHandle, TaskOptions, WakeShared, WakeSignal, allocate_task};
 
 /// Cloneable handle to state used by reentrant task submissions.
 #[derive(Clone, Debug)]
@@ -64,21 +64,8 @@ impl ExecutorShared {
         self.inner.wake.close_remote_wakes(&self.inner.remote_wakes);
     }
 
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.inner.shutdown.is_triggered()
-    }
-
-    pub(crate) fn shutdown_cause(&self) -> ShutdownCause {
-        self.inner.shutdown.cause()
-    }
-
-    pub(crate) fn shutdown(&self) -> Shutdown {
-        self.inner.shutdown.clone()
-    }
-
-    pub(crate) fn publish_shutdown(&self, cause: ShutdownCause) -> ShutdownCause {
-        _ = self.inner.shutdown.publish(cause);
-        self.shutdown_cause()
+    pub(crate) fn shutdown(&self) -> &Shutdown {
+        &self.inner.shutdown
     }
 
     pub(crate) fn accept_new_tasks(&self, active: &mut VecDeque<TaskHandle>) -> usize {
@@ -112,7 +99,7 @@ impl ExecutorShared {
 
     pub(crate) fn shutdown_complete(&self) -> bool {
         debug_assert!(self.inner.new_tasks.borrow().is_empty());
-        self.is_shutting_down() && self.inner.task_count.get() == 0
+        self.shutdown().is_triggered() && self.inner.task_count.get() == 0
     }
 
     pub(crate) fn add_task<F, R, T>(&self, future: F, options: TaskOptions, completion: T)
@@ -121,13 +108,13 @@ impl ExecutorShared {
         R: 'static,
         T: TaskCompletion<R>,
     {
-        if self.is_shutting_down() {
-            completion.cancelled(self.shutdown_cause());
+        if self.shutdown().is_triggered() {
+            completion.cancelled(self.shutdown().cause());
             return;
         }
         let future = future.into_future();
-        if self.is_shutting_down() {
-            completion.cancelled(self.shutdown_cause());
+        if self.shutdown().is_triggered() {
+            completion.cancelled(self.shutdown().cause());
             return;
         }
         self.register_task(allocate_task(
@@ -168,6 +155,7 @@ impl ExecutorShared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ShutdownCause;
 
     #[test]
     fn shutdown_completion_requires_a_shutdown_request() {

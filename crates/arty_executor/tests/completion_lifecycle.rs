@@ -15,7 +15,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use arty_executor::{CycleOutcome, Executor, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskOptions, TaskPlacement, TaskSet};
+use arty_executor::{
+    CycleOutcome, Executor, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskCompletion, TaskOptions, TaskPanicPayload,
+    TaskPlacement, TaskSet,
+};
 use observed::Sink;
 use observed::enrichment::{Enrichment, EnrichmentEntry};
 use observed::metadata::EventDescription;
@@ -294,6 +297,101 @@ fn shutdown_panic_policy_publishes_the_payload_before_shutdown() {
         panic!("panicking task must publish its payload before shutdown");
     };
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"shutdown panic"));
+}
+
+#[derive(Debug)]
+struct PanicNotification {
+    cause: Option<ShutdownCause>,
+    executor_cause: Option<ShutdownCause>,
+    original_payload: bool,
+}
+
+#[derive(Debug)]
+struct CapturePanic {
+    shutdown: Shutdown,
+    notification: Rc<RefCell<Option<PanicNotification>>>,
+}
+
+impl TaskCompletion<()> for CapturePanic {
+    fn completed(self, _result: ()) {}
+
+    fn panicked(self, panic: TaskPanicPayload, cause: Option<ShutdownCause>) {
+        let executor_cause = self.shutdown.is_triggered().then(|| self.shutdown.cause());
+        if cause.is_some() {
+            self.shutdown.trigger(ShutdownCause::default());
+        }
+        self.notification.replace(Some(PanicNotification {
+            cause,
+            executor_cause,
+            original_payload: panic.downcast_ref::<&str>() == Some(&"panic notification"),
+        }));
+    }
+
+    fn cancelled(self, _cause: ShutdownCause) {}
+}
+
+#[test]
+fn panic_notification_carries_the_authoritative_shutdown_cause() {
+    fn assert_same_cause(actual: &ShutdownCause, expected: &ShutdownCause) {
+        match (actual.as_error(), expected.as_error()) {
+            (Some(actual), Some(expected)) => assert!(std::ptr::eq(actual.inner(), expected.inner())),
+            (None, None) => {}
+            _ => panic!("shutdown must preserve its first cause"),
+        }
+    }
+
+    for (policy, existing) in [
+        (PanicPolicy::ignore(), None),
+        (PanicPolicy::shutdown(), None),
+        (PanicPolicy::ignore(), Some(ShutdownCause::default())),
+        (
+            PanicPolicy::shutdown(),
+            Some(ShutdownError::new(std::io::Error::other("first shutdown cause")).into()),
+        ),
+    ] {
+        let expects_shutdown = policy.starts_shutdown() || existing.is_some();
+        let mut executor = Executor::builder().panic_policy(policy).build();
+        let shutdown = executor.shutdown();
+        let notification = Rc::new(RefCell::new(None));
+        executor.tasks().add(
+            poll_fn({
+                let shutdown = shutdown.clone();
+                let mut existing = existing.clone();
+                move |_| -> Poll<()> {
+                    if let Some(cause) = existing.take() {
+                        shutdown.trigger(cause);
+                    }
+                    panic!("panic notification");
+                }
+            }),
+            TaskOptions::default(),
+            CapturePanic {
+                shutdown,
+                notification: Rc::clone(&notification),
+            },
+        );
+
+        let outcome = executor.execute_cycle();
+        let notification = notification.take().unwrap();
+        assert!(notification.original_payload);
+        assert_eq!(notification.cause.is_some(), expects_shutdown);
+        assert_eq!(notification.executor_cause.is_some(), expects_shutdown);
+        if expects_shutdown {
+            let cause = notification.cause.unwrap();
+            assert_same_cause(&notification.executor_cause.unwrap(), &cause);
+            let CycleOutcome::Shutdown(final_cause) = outcome else {
+                panic!("a published shutdown cause must end the executor cycle");
+            };
+            assert_same_cause(&final_cause, &cause);
+            if let Some(existing) = existing {
+                assert_same_cause(&cause, &existing);
+            } else {
+                assert_eq!(cause.as_error().unwrap().inner().to_string(), "a contained runtime operation panicked");
+            }
+        } else {
+            assert!(matches!(outcome, CycleOutcome::Suspend));
+        }
+    }
 }
 
 struct ReadyDropPanic;

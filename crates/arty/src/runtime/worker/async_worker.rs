@@ -604,7 +604,7 @@ mod tests {
             }
         }
 
-        fn panicked(self, panic: TaskPanicPayload) {
+        fn panicked(self, panic: TaskPanicPayload, _cause: Option<ShutdownCause>) {
             discard_task_panic_payload(panic);
         }
 
@@ -686,7 +686,6 @@ mod tests {
             NonEmpty::new(endpoint),
             sink.clone(),
             shutdown,
-            crate::runtime::PanicPolicy::default(),
         ));
         let io_runtime = arty_io_host::IoRuntime::new(sink.clone());
         let io = crate::io::Io::new(io_runtime.clone(), dispatcher.clone(), thread.clone());

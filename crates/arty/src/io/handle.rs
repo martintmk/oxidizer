@@ -154,7 +154,7 @@ pub(super) fn runtime_error(dispatcher: &DispatcherClient) -> Option<Error> {
 
 pub(super) fn fail_runtime(dispatcher: &DispatcherClient, error: DriverError) -> Error {
     let error = Arc::new(error);
-    let cause = dispatcher.stop(arty_executor::ShutdownError::new(Error::io_failure(Arc::clone(&error))).into());
+    let cause = dispatcher.stop(Error::io_failure(Arc::clone(&error)).into_shutdown_cause());
     Scheduler::begin_current_executor_shutdown(dispatcher, cause);
     Error::io_failure(error)
 }
