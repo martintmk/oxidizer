@@ -10,6 +10,13 @@ Arty reports these panics through `JoinError` when possible. By default, the
 first contained user-task panic shuts down the runtime.
 `PanicPolicy::ignore()` keeps the runtime running.
 
+Shutdown does not depend on joining the panicking task. It still starts if
+the caller drops the join handle. All runtime workers receive the same
+shutdown cause.
+
+Arty records a panic shutdown cause before it publishes the panic result or
+notifies cancelled tasks. Later stop requests do not replace that cause.
+
 Arty does not guarantee recovery from panics raised by destructors, custom
 wakers, join notifications, telemetry processors, or other cleanup and
 notification hooks. Arty also does not recover poisoned state, failed

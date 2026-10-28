@@ -22,9 +22,8 @@ use crate::runtime::thread::waiter::ThreadWaiter;
 use crate::runtime::worker::protocol::{AsyncWorkerCommand, QueuedIoAccess, QueuedTaskFactory};
 use crate::runtime::{Error, Workers};
 use crate::task::Builtins;
-use crate::task::execution::prepare_remote;
-use crate::task::join::JoinHandle;
-use crate::task::remote::Pool as RemotePool;
+use crate::task::handle::{JoinHandle, JoinHandlePool};
+use crate::task::preparation::prepare_remote;
 
 #[derive(Debug)]
 pub(crate) struct WorkerEndpoint {
@@ -59,7 +58,6 @@ impl From<WorkerIndex> for usize {
 pub(crate) struct DispatcherCore {
     wait_for_shutdown: ThreadWaiter,
 
-    shutdown: Shutdown,
     shutdown_signaled: AtomicBool,
     stopped_reported: AtomicBool,
 
@@ -77,8 +75,7 @@ pub(crate) struct DispatcherCore {
     /// restored on every poll of spawned futures.
     sink: observed::Sink,
 
-    remote_results: RemotePool,
-    panic_shutdown_cause: Option<ShutdownCause>,
+    remote_results: JoinHandlePool,
 }
 
 struct PanicShutdownWake(Weak<DispatcherCore>);
@@ -121,14 +118,13 @@ impl DispatcherCore {
             worker_endpoints.len(),
             "each runtime worker must have a distinct thread ID"
         );
-        let panic_shutdown_cause = panic_policy.into_executor_policy().starts_shutdown().then(ShutdownCause::panic);
+        let panic_starts_shutdown = panic_policy.into_executor_policy().starts_shutdown();
         Arc::new_cyclic(move |weak| {
-            if panic_shutdown_cause.is_some() {
+            if panic_starts_shutdown {
                 shutdown.initialize_panic_notifier(Waker::from(StdArc::new(PanicShutdownWake(weak.clone()))));
             }
             Self {
                 wait_for_shutdown,
-                shutdown,
                 shutdown_signaled: AtomicBool::new(false),
                 stopped_reported: AtomicBool::new(false),
                 worker_endpoints,
@@ -136,27 +132,22 @@ impl DispatcherCore {
                 worker_indices,
                 next_async_worker_index: AtomicUsize::new(0),
                 sink,
-                remote_results: RemotePool::new(),
-                panic_shutdown_cause,
+                remote_results: JoinHandlePool::new(shutdown),
             }
         })
     }
 
     pub(crate) fn record_panic(&self) {
-        if let Some(cause) = &self.panic_shutdown_cause {
-            _ = self.stop_inner(cause.clone());
+        if let Some(cause) = self.shutdown().record_panic() {
+            _ = self.stop_inner(cause);
         }
-    }
-
-    pub(crate) fn panic_starts_shutdown(&self) -> bool {
-        self.panic_shutdown_cause.is_some()
     }
 
     #[cfg_attr(test, mutants::skip)] // Tests hang if mutation removes the shutdown signal or worker notifications.
     pub(crate) fn stop_inner(&self, cause: ShutdownCause) -> ShutdownCause {
-        self.shutdown.begin(cause);
+        self.shutdown().begin(cause);
         let cause = self
-            .shutdown
+            .shutdown()
             .cause()
             .expect("stop_inner begins shutdown before reading the authoritative cause");
         if self.shutdown_signaled.swap(true, Ordering::AcqRel) {
@@ -240,7 +231,7 @@ impl DispatcherCore {
     }
 
     pub(crate) const fn shutdown(&self) -> &Shutdown {
-        &self.shutdown
+        self.remote_results.shutdown()
     }
 
     #[cfg_attr(test, mutants::skip)] // Removing this wait guard deadlocks runtime-owner teardown.
@@ -313,7 +304,6 @@ impl DispatcherCore {
             future_factory,
             parent_task_enrichment,
             placement,
-            self.shutdown.clone(),
         );
 
         // There is nothing we can really do if the worker is already gone and closed the channel.
@@ -647,16 +637,19 @@ mod tests {
     }
 
     #[test]
-    fn panic_policy_is_visible_through_dispatcher_and_shutdown_handles() {
-        let (core, client, shutdown) = panic_dispatcher(PanicPolicy::default());
-        assert!(core.panic_starts_shutdown());
-        assert!(client.panic_starts_shutdown());
-        assert!(shutdown.panic_starts_shutdown());
+    fn panic_notifier_applies_policy_to_dispatcher_and_shutdown_handles() {
+        for (policy, expected) in [
+            (PanicPolicy::default(), ShutdownState::Started),
+            (PanicPolicy::ignore(), ShutdownState::Running),
+        ] {
+            let (core, client, shutdown) = panic_dispatcher(policy);
 
-        let (core, client, shutdown) = panic_dispatcher(PanicPolicy::ignore());
-        assert!(!core.panic_starts_shutdown());
-        assert!(!client.panic_starts_shutdown());
-        assert!(!shutdown.panic_starts_shutdown());
+            shutdown.panic_notifier().wake_by_ref();
+
+            assert_eq!(core.shutdown().state(), expected);
+            assert_eq!(client.shutdown().state(), expected);
+            assert_eq!(shutdown.state(), expected);
+        }
     }
 
     #[test]

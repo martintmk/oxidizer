@@ -166,10 +166,7 @@ impl AsyncWorker {
         let batch_exhausted = self.process_commands();
 
         if matches!(self.shutdown.state(), ShutdownState::Started) {
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
+            return self.finish_shutdown();
         }
 
         let executor = self
@@ -180,25 +177,14 @@ impl AsyncWorker {
         let cycle_outcome = executor.execute_cycle();
 
         if let CycleOutcome::Shutdown(cause) = cycle_outcome {
-            // An alternate low-level owner initiated executor shutdown. Complete the surrounding
-            // worker shutdown before final timer callbacks run.
-            if let Some(builtins) = &self.builtins {
-                builtins.dispatcher().stop(cause.clone());
-            }
             self.shutdown.begin(cause);
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
+            return self.finish_shutdown();
         }
 
         let advance_now = self.timer_now();
         let next_timer = self.clock_driver.advance_timers(advance_now).ok().flatten();
         if matches!(self.shutdown.state(), ShutdownState::Started) {
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
+            return self.finish_shutdown();
         }
         let should_suspend = can_suspend(&cycle_outcome, batch_exhausted);
         let has_primary = RuntimeDriverHost::has_primary_current();
@@ -216,10 +202,7 @@ impl AsyncWorker {
             Duration::ZERO
         };
         if RuntimeDriverHost::execute_cycle_current(max_wait).is_err() {
-            self.begin_shutdown();
-            let now = self.timer_now();
-            _ = self.clock_driver.advance_timers(now);
-            return ControlFlow::Break(());
+            return self.finish_shutdown();
         }
 
         if should_suspend && !has_primary {
@@ -230,6 +213,13 @@ impl AsyncWorker {
         }
 
         ControlFlow::Continue(())
+    }
+
+    fn finish_shutdown(&mut self) -> ControlFlow<()> {
+        self.begin_shutdown();
+        let now = self.timer_now();
+        _ = self.clock_driver.advance_timers(now);
+        ControlFlow::Break(())
     }
 
     fn timer_now(&self) -> Instant {
@@ -284,9 +274,16 @@ impl AsyncWorker {
 
     #[cfg_attr(test, mutants::skip)] // If mutated, shutdown process will never finish - will hang.
     fn begin_shutdown(&mut self) {
-        if self.executor.is_none() {
+        let Some(executor) = self.executor.take() else {
             return;
-        }
+        };
+
+        let cause = self
+            .builtins
+            .as_ref()
+            .expect("a running worker retains its builtins until shutdown")
+            .dispatcher()
+            .stop(self.shutdown.cause().unwrap_or_default());
 
         Scheduler::clear_current();
         // Drop worker-local services, as they may hold references to resources that
@@ -296,14 +293,9 @@ impl AsyncWorker {
         // The command channel is henceforth closed. We will not receive any more commands.
         self.command_rx = None;
 
-        let cause = self.shutdown.cause().unwrap_or_default();
-        self.shutdown.begin(cause.clone());
-
         // Safe executor shutdown synchronously cancels and releases all remaining task storage.
-        if let Some(executor) = self.executor.take() {
-            executor.shutdown().trigger(cause);
-            drop(executor);
-        }
+        executor.shutdown().trigger(cause);
+        drop(executor);
         let driver_host = RuntimeDriverHost::uninstall();
         drop(driver_host);
     }
@@ -311,9 +303,7 @@ impl AsyncWorker {
 
 impl Drop for AsyncWorker {
     fn drop(&mut self) {
-        if self.executor.is_some() {
-            self.begin_shutdown();
-        }
+        self.begin_shutdown();
         Scheduler::clear_worker_thread();
     }
 }
@@ -347,7 +337,7 @@ mod tests {
     use crate::runtime::config::MonitorPolicy;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
     use crate::runtime::thread::waiter::ThreadWaiter;
-    use crate::task::execution::RemoteFutureFactory;
+    use crate::task::preparation::RemoteFutureFactory;
 
     fn test_blocking_worker() -> (Arc<BlockingWorker>, Shutdown) {
         let shutdown = Shutdown::default();

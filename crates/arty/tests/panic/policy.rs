@@ -7,10 +7,12 @@
 
 use std::error::Error as _;
 use std::future::{Ready, pending};
+use std::pin::Pin;
 use std::sync::{Arc, Barrier, mpsc};
+use std::task::{Context, Wake, Waker};
 use std::time::Instant;
 
-use arty::runtime::{BlockingPoolPolicy, PanicPolicy, Runtime, RuntimeBuilder, WorkersPolicy};
+use arty::runtime::{BlockingPoolPolicy, PanicPolicy, Runtime, RuntimeBuilder, RuntimeControl, WorkersPolicy};
 use arty::task::Builtins;
 use testing_aids::TEST_TIMEOUT;
 use thread_aware::Unaware;
@@ -105,6 +107,62 @@ fn default_factory_panic_cancels_pending_work() {
         shutdown_cause(&runtime.stop().unwrap_err()).inner().to_string(),
         "a contained runtime operation panicked"
     );
+}
+
+#[test]
+fn panic_completion_records_its_cause_before_waking_the_joiner() {
+    assert_panic_cause_precedes_join_notification(true);
+}
+
+#[test]
+fn panic_cancellation_records_its_cause_before_waking_the_joiner() {
+    assert_panic_cause_precedes_join_notification(false);
+}
+
+fn assert_panic_cause_precedes_join_notification(observe_panic: bool) {
+    struct StopOnWake {
+        control: RuntimeControl,
+        notified: mpsc::Sender<()>,
+    }
+
+    impl Wake for StopOnWake {
+        fn wake(self: Arc<Self>) {
+            self.control.request_stop();
+            self.notified.send(()).unwrap();
+        }
+    }
+
+    let runtime = runtime_builder(1, PanicPolicy::shutdown()).build().unwrap();
+    let control = support::runtime_control(&runtime);
+    let (started_tx, started_rx) = mpsc::channel();
+    let pending = runtime.scheduler().spawn_anywhere(Unaware(started_tx), |_, Unaware(started)| async move {
+        started.send(()).unwrap();
+        pending::<()>().await;
+    });
+    started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    let (release, released) = events_once::Event::<()>::boxed();
+    let panicking = runtime.scheduler().spawn_anywhere(Unaware(released), |_, Unaware(released)| async move {
+        released.await.unwrap();
+        panic!("panic before a join notification");
+    });
+    let mut observed = if observe_panic { panicking } else { pending };
+    let (notified, notifications) = mpsc::channel();
+    let waker = Waker::from(Arc::new(StopOnWake { control, notified }));
+    assert!(Pin::new(&mut observed).poll(&mut Context::from_waker(&waker)).is_pending());
+
+    release.send(());
+    notifications.recv_timeout(TEST_TIMEOUT).unwrap();
+
+    let error = observed.join().unwrap_err();
+    assert_eq!(error.is_panic(), observe_panic);
+    assert_eq!(error.is_shutdown(), !observe_panic);
+    let stop = runtime.stop().unwrap_err();
+    let expected = shutdown_cause(&stop);
+    assert_eq!(expected.inner().to_string(), "a contained runtime operation panicked");
+    if !observe_panic {
+        let source = error.source().unwrap().downcast_ref::<arty_executor::ShutdownError>().unwrap();
+        assert!(std::ptr::eq(source.inner(), expected.inner()));
+    }
 }
 
 #[test]
@@ -229,4 +287,58 @@ fn a_dropped_join_does_not_suppress_default_shutdown() {
         shutdown_cause(&runtime.stop().unwrap_err()).inner().to_string(),
         "a contained runtime operation panicked"
     );
+}
+
+#[test]
+fn detached_async_panic_cascades_its_shutdown_cause_to_every_worker() {
+    assert_detached_panic_cascades_to_every_worker(false);
+}
+
+#[test]
+fn detached_blocking_panic_cascades_its_shutdown_cause_to_every_worker() {
+    assert_detached_panic_cascades_to_every_worker(true);
+}
+
+fn assert_detached_panic_cascades_to_every_worker(blocking: bool) {
+    let runtime = runtime_builder(2, PanicPolicy::shutdown()).build().unwrap();
+    let control = support::runtime_control(&runtime);
+    let scheduler = runtime
+        .scheduler()
+        .spawn_anywhere((), |cx, ()| async move { cx.scheduler().clone() })
+        .join()
+        .unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let pending: Vec<_> = control
+        .workers()
+        .into_iter()
+        .map(|worker| {
+            scheduler.spawn_at(worker, Unaware(started_tx.clone()), |Unaware(started)| async move {
+                started.send(()).unwrap();
+                pending::<()>().await;
+            })
+        })
+        .collect();
+    for _ in &pending {
+        started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    }
+
+    if blocking {
+        drop(runtime.scheduler().spawn_blocking(|| panic!("detached blocking panic")));
+    } else {
+        drop(scheduler.spawn_at(control.workers().into_iter().next().unwrap(), Unaware(()), relocated_panic));
+    }
+
+    let cancellations: Vec<_> = pending.into_iter().map(|task| task.join().unwrap_err()).collect();
+    let stop = runtime.stop().unwrap_err();
+    let expected = shutdown_cause(&stop);
+    assert_eq!(expected.inner().to_string(), "a contained runtime operation panicked");
+    for cancellation in cancellations {
+        assert!(cancellation.is_shutdown());
+        let source = cancellation
+            .source()
+            .unwrap()
+            .downcast_ref::<arty_executor::ShutdownError>()
+            .unwrap();
+        assert!(std::ptr::eq(source.inner(), expected.inner()));
+    }
 }

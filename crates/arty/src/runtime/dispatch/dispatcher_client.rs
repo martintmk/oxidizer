@@ -14,7 +14,7 @@ use crate::runtime::dispatch::{DispatcherCore, WorkerIndex};
 use crate::runtime::shutdown::Shutdown;
 use crate::runtime::{Error, Workers};
 use crate::task::Builtins;
-use crate::task::join::JoinHandle;
+use crate::task::handle::JoinHandle;
 
 /// Cheap shared access to one runtime's routing and shutdown state.
 #[derive(Clone)]
@@ -129,10 +129,6 @@ impl DispatcherClient {
     #[cfg_attr(test, mutants::skip)] // Will cause tests to hang due to runtime never stopping.
     pub(crate) fn stop(&self, cause: ShutdownCause) -> ShutdownCause {
         self.core.stop_inner(cause)
-    }
-
-    pub(crate) fn panic_starts_shutdown(&self) -> bool {
-        self.core.panic_starts_shutdown()
     }
 
     // Impractical to test real waiting at this API layer. We test the real waiter implementation

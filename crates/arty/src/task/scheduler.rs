@@ -10,9 +10,8 @@ use thread_aware::{Thread, ThreadAware};
 use crate::runtime::blocking_worker::BlockingWorker;
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
 use crate::task::Builtins;
-use crate::task::execution::DeferredTask;
-use crate::task::join::JoinHandle;
-use crate::task::remote::Pool as RemotePool;
+use crate::task::handle::{JoinHandle, JoinHandlePool};
+use crate::task::preparation::DeferredTask;
 
 thread_local! {
     // Remains set while executor shutdown destroys user futures, even after the
@@ -31,7 +30,7 @@ struct CurrentWorker {
     tasks: TaskSet,
     executor_shutdown: ExecutorShutdown,
     // Child submissions must not contend with every other worker's result-channel rentals.
-    results: RemotePool,
+    results: JoinHandlePool,
 }
 
 /// A worker-bound handle for submitting async and blocking tasks.
@@ -92,12 +91,13 @@ impl Scheduler {
         assert!(!ACTIVE_WORKER.replace(true), "a worker is already active on this thread");
         CURRENT_WORKER.with_borrow_mut(|current| {
             assert!(current.is_none(), "a worker already owns this scheduler context");
+            let results = JoinHandlePool::new(builtins.dispatcher().shutdown().clone());
             *current = Some(CurrentWorker {
                 thread: builtins.thread().clone(),
                 builtins,
                 tasks,
                 executor_shutdown,
-                results: RemotePool::new(),
+                results,
             });
         });
     }
@@ -224,16 +224,12 @@ impl Scheduler {
             let sink = current.builtins.sink();
             let parent_task_enrichment = sink.transfer_context();
             let builtins = current.builtins.clone();
-            let (result_tx, result_rx) = current.results.channel();
+            let (handle, result_tx) = current.results.handle();
             let inner = DeferredTask::new(future_factory, builtins);
             let options = TaskOptions::observed(parent_task_enrichment, TaskPlacement::SameThread);
             current.tasks.add(inner, options, result_tx);
             self.dispatcher.wake_worker(self.binding.worker_index);
-            Ok(JoinHandle::new(
-                result_rx,
-                self.dispatcher.shutdown().clone(),
-                self.dispatcher.panic_starts_shutdown(),
-            ))
+            Ok(handle)
         })
     }
 
