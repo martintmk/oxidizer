@@ -68,8 +68,9 @@ impl LocalWorker {
     }
 
     pub(crate) fn begin_executor_shutdown(dispatcher: &DispatcherClient, cause: ShutdownCause) {
-        Self::with_scheduler(|current| {
-            let Some(current) = current else {
+        _ = CURRENT.try_with(|current| {
+            let current = current.borrow();
+            let Some(current) = current.as_ref().and_then(|current| current.scheduler.as_ref()) else {
                 return;
             };
             if dispatcher.owns(current.thread()) {
