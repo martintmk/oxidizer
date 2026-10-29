@@ -173,7 +173,7 @@ impl Runtime {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn stop(mut self) -> Result<(), Error> {
-        if crate::runtime::worker::LocalWorker::is_worker_thread() {
+        if crate::runtime::worker::WorkerKind::is_current() {
             _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
             self.shutdown_on_drop = false;
             panic_shutdown_from_worker("Runtime::stop");
@@ -206,7 +206,7 @@ impl Drop for Runtime {
         }
 
         _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
-        if crate::runtime::worker::LocalWorker::is_worker_thread() {
+        if crate::runtime::worker::WorkerKind::is_current() {
             if std::thread::panicking() {
                 return;
             }

@@ -3,10 +3,11 @@
 
 use std::cell::RefCell;
 
-use arty_executor::TaskSet;
+use arty_executor::{Shutdown as ExecutorShutdown, ShutdownCause, TaskSet};
 use thread_aware::Thread;
 
 use crate::io::RuntimeDriverHost;
+use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::worker;
 use crate::task::Builtins;
 use crate::task::handle::JoinHandlePool;
@@ -31,22 +32,20 @@ impl LocalWorker {
     }
 
     pub(crate) fn attach() {
-        assert!(
-            !worker::LocalWorker::is_worker_thread(),
-            "a local worker is already attached to this thread"
-        );
+        worker::WorkerKind::attach(worker::WorkerKind::Task);
         CURRENT.with_borrow_mut(|current| {
             assert!(current.is_none(), "a task local worker is already attached to this thread");
             *current = Some(Self::new());
         });
     }
 
-    pub(super) fn register_scheduler(builtins: Builtins, tasks: TaskSet) {
+    pub(super) fn register_scheduler(builtins: Builtins, tasks: TaskSet, executor_shutdown: ExecutorShutdown) {
         let results = JoinHandlePool::new(builtins.dispatcher().shutdown().clone());
         let scheduler = SchedulerContext {
             thread: builtins.thread().clone(),
             builtins,
             tasks,
+            executor_shutdown,
             results,
         };
         Self::with_current_mut(|current| {
@@ -66,6 +65,17 @@ impl LocalWorker {
 
     pub(crate) fn with_scheduler<R>(f: impl FnOnce(Option<&SchedulerContext>) -> R) -> R {
         Self::with_current(|current| f(current.and_then(|current| current.scheduler.as_ref())))
+    }
+
+    pub(crate) fn begin_executor_shutdown(dispatcher: &DispatcherClient, cause: ShutdownCause) {
+        Self::with_scheduler(|current| {
+            let Some(current) = current else {
+                return;
+            };
+            if dispatcher.owns(current.thread()) {
+                current.executor_shutdown.trigger(cause);
+            }
+        });
     }
 
     pub(super) fn clear_scheduler() {
@@ -122,6 +132,7 @@ pub(crate) struct SchedulerContext {
     thread: Thread,
     builtins: Builtins,
     tasks: TaskSet,
+    executor_shutdown: ExecutorShutdown,
     results: JoinHandlePool,
 }
 

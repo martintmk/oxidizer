@@ -155,7 +155,8 @@ pub(super) fn runtime_error(dispatcher: &DispatcherClient) -> Option<Error> {
 
 pub(super) fn fail_runtime(dispatcher: &DispatcherClient, error: DriverError) -> Error {
     let error = Arc::new(error);
-    _ = dispatcher.stop(Error::io_failure(Arc::clone(&error)).into_shutdown_cause());
+    let cause = dispatcher.stop(Error::io_failure(Arc::clone(&error)).into_shutdown_cause());
+    crate::runtime::worker::task::LocalWorker::begin_executor_shutdown(dispatcher, cause);
     Error::io_failure(error)
 }
 

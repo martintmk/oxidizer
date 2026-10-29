@@ -20,10 +20,7 @@ pub(crate) struct LocalWorker {
 
 impl LocalWorker {
     pub(crate) fn attach(pool: PoolIdentity) {
-        assert!(
-            !worker::LocalWorker::is_worker_thread(),
-            "a local worker is already attached to this thread"
-        );
+        worker::WorkerKind::attach(worker::WorkerKind::Blocking);
         CURRENT.with_borrow_mut(|current| {
             assert!(current.is_none(), "a blocking local worker is already attached to this thread");
             *current = Some(Self { pool });

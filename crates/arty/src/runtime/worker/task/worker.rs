@@ -135,9 +135,10 @@ impl Worker {
             .clock(cycle_clock.clone())
             .build();
         let tasks = executor.tasks();
+        let executor_shutdown = executor.shutdown();
 
         let builtins = Builtins::new(dispatcher, clock, io, thread, sink);
-        LocalWorker::register_scheduler(builtins.clone(), tasks.clone());
+        LocalWorker::register_scheduler(builtins.clone(), tasks.clone(), executor_shutdown);
 
         Self {
             command_rx: Some(command_rx),
@@ -1161,6 +1162,31 @@ mod tests {
         worker.run();
 
         assert!(!invoked.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn same_worker_stop_skips_a_later_initialized_task() {
+        let (command_tx, command_rx) = channel::unbounded();
+        let mut worker = test_worker(
+            command_tx,
+            command_rx,
+            test_blocking_worker(),
+            InactiveClock::new_isolated(),
+            Arc::new(Signal::default()),
+        );
+        let control = worker.builtins.as_ref().unwrap().control().clone();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_task = Arc::clone(&invoked);
+        worker.tasks.add_test(async move {
+            control.request_stop();
+        });
+        worker.tasks.add_test(async move {
+            invoked_by_task.store(true, Ordering::Release);
+        });
+        let executor = worker.executor.as_mut().unwrap();
+
+        assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+        assert!(!invoked.load(Ordering::Acquire));
     }
 
     #[test]

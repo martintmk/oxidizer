@@ -6,6 +6,6 @@
 pub(crate) mod blocking;
 pub(crate) mod task;
 
-mod local_worker;
+mod worker_kind;
 
-pub(crate) use local_worker::LocalWorker;
+pub(crate) use worker_kind::WorkerKind;

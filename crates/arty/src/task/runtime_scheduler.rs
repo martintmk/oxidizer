@@ -113,7 +113,7 @@ impl RuntimeScheduler {
         F: Future<Output = R> + 'a,
         R: Send + 'static,
     {
-        if crate::runtime::worker::LocalWorker::is_worker_thread() {
+        if crate::runtime::worker::WorkerKind::is_current() {
             return Err(Error::block_on_from_worker());
         }
         // Validate the ambient executor before any caller-borrowing work is submitted.
