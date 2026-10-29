@@ -3,11 +3,12 @@
 
 //! Worker routing, submission capabilities, and stop coordination.
 
-mod dispatcher_client;
-mod dispatcher_core;
-pub(crate) use dispatcher_client::DispatcherClient;
-pub(crate) use dispatcher_core::WorkerIndex;
-pub(super) use dispatcher_core::{DispatcherCore, WorkerEndpoint};
+mod client;
+mod core;
+pub(crate) use core::WorkerIndex;
+pub(super) use core::{DispatcherCore, WorkerEndpoint};
+
+pub(crate) use client::DispatcherClient;
 
 #[cfg(test)]
 fn test_threads(count: usize) -> Vec<thread_aware::Thread> {

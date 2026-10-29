@@ -9,7 +9,7 @@ use crate::runtime::telemetry::events::{
     PanicMessage, SystemMetricCount, ThreadExiting, ThreadName, ThreadPanicked, ThreadSpawn, ThreadStarted,
 };
 
-/// Spawns a thread with a preferred name and stack size, reporting the thread's
+/// Spawns a worker thread with a preferred name and stack size, reporting the thread's
 /// lifecycle (spawn, start, panic, exit) through `sink`.
 pub(crate) fn spawn<F>(sink: &Sink, name: &str, stack_size: Option<usize>, task: F) -> JoinHandle<()>
 where

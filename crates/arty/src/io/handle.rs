@@ -10,10 +10,11 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::{Thread, ThreadAware};
 
-use super::current_host::RuntimeDriverHost;
+use super::driver_host::RuntimeDriverHost;
 use crate::runtime::Error;
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
-use crate::task::{Builtins, Scheduler};
+use crate::runtime::worker::task::LocalWorker;
+use crate::task::Builtins;
 
 /// Access to I/O contexts hosted by an Arty runtime.
 ///
@@ -103,7 +104,7 @@ impl Io {
         if let Some(result) = RuntimeDriverHost::try_context_current(&self.runtime, &self.thread, options) {
             return result;
         }
-        if Scheduler::is_current_worker_thread() {
+        if LocalWorker::is_current() {
             return Err(Error::io_outside_worker());
         }
         let Some(worker_index) = self.dispatcher.worker_index(self.thread.id()) else {
@@ -154,8 +155,7 @@ pub(super) fn runtime_error(dispatcher: &DispatcherClient) -> Option<Error> {
 
 pub(super) fn fail_runtime(dispatcher: &DispatcherClient, error: DriverError) -> Error {
     let error = Arc::new(error);
-    let cause = dispatcher.stop(Error::io_failure(Arc::clone(&error)).into_shutdown_cause());
-    Scheduler::begin_current_executor_shutdown(dispatcher, cause);
+    _ = dispatcher.stop(Error::io_failure(Arc::clone(&error)).into_shutdown_cause());
     Error::io_failure(error)
 }
 

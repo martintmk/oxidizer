@@ -3,12 +3,12 @@
 
 use std::num::NonZeroUsize;
 
-use crate::runtime::blocking_worker::BlockingPool;
+use crate::runtime::worker::blocking::Pool;
 
 /// Resolves whether workers share their blocking-task pool.
 #[derive(Debug, Clone)]
 pub(crate) enum BlockingPools {
-    Shared(BlockingPool),
+    Shared(Pool),
     PerWorker(Option<NonZeroUsize>),
 }
 
@@ -18,13 +18,13 @@ impl BlockingPools {
     }
 
     pub(crate) fn shared(max_workers: Option<NonZeroUsize>) -> Self {
-        Self::Shared(BlockingPool::new_with_mode(max_workers, "shared"))
+        Self::Shared(Pool::new_with_mode(max_workers, "shared"))
     }
 
-    pub(super) fn build_worker(&self) -> BlockingPool {
+    pub(super) fn build_worker(&self) -> Pool {
         match self {
             Self::Shared(pool) => pool.clone(),
-            Self::PerWorker(max_workers) => BlockingPool::new_with_mode(*max_workers, "per_worker"),
+            Self::PerWorker(max_workers) => Pool::new_with_mode(*max_workers, "per_worker"),
         }
     }
 }

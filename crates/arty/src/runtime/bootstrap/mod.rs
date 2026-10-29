@@ -5,5 +5,6 @@
 
 pub(crate) mod pools;
 mod startup;
+pub(super) mod thread;
 
 pub(crate) use startup::build;

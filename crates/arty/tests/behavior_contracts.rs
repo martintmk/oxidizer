@@ -10,7 +10,6 @@ mod support;
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
@@ -240,27 +239,25 @@ fn worker_context_belongs_to_one_runtime_and_rejects_nested_block_on() {
 }
 
 #[test]
-fn blocking_callbacks_can_run_borrowing_tasks_on_an_async_worker() {
+fn blocking_callbacks_reject_block_on_before_factory_submission() {
     let runtime = Arc::new(runtime(1));
     let captured = Arc::clone(&runtime);
-    let (on_worker, value) = runtime
+    let invoked = Arc::new(AtomicBool::new(false));
+    let invoked_by_factory = Arc::clone(&invoked);
+    let error = runtime
         .scheduler()
         .spawn_blocking(move || {
-            let mut value = 40;
-            let on_worker = captured
-                .scheduler()
-                .block_on(async |cx| {
-                    let child = cx.scheduler().spawn(async |_| 2).await.unwrap();
-                    let local = Rc::new(child);
-                    value += *local;
-                    cx.thread().id() == thread::current().id()
-                })
-                .unwrap();
-            (on_worker, value)
+            captured.scheduler().block_on(move |_| {
+                invoked_by_factory.store(true, Ordering::Relaxed);
+                async { 42 }
+            })
         })
         .join()
-        .unwrap();
-    assert_eq!((on_worker, value), (true, 42));
+        .unwrap()
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "block_on cannot be called from an Arty worker");
+    assert!(!invoked.load(Ordering::Relaxed));
     Arc::try_unwrap(runtime).unwrap().stop().unwrap();
 }
 

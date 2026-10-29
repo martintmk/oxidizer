@@ -12,7 +12,7 @@ use performables::sync::mutex::{Mutex, MutexGuard};
 
 use crate::runtime::Error;
 
-/// Joins workers on one waiting caller; other callers wait for that join to finish.
+/// Joins worker threads on one waiting caller; other callers wait for that join to finish.
 #[derive(Debug)]
 pub(crate) struct ThreadWaiter {
     shared: Arc<(Mutex<State>, Condvar)>,

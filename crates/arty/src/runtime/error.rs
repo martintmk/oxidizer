@@ -115,7 +115,7 @@ impl Display for RuntimeValidation {
         f.write_str(match self {
             Self::InvalidWorkerCount => "worker count must be greater than zero",
             Self::InvalidBlockingPoolLimit => "blocking pool max_workers must be greater than zero",
-            Self::BlockOnFromWorker => "block_on cannot be called from an async Arty worker",
+            Self::BlockOnFromWorker => "block_on cannot be called from an Arty worker",
             Self::ShutdownWaitFromWorker => "an async Arty worker cannot wait for runtime shutdown",
             Self::ShutdownWaitFromBlockingCallback => "a runtime blocking callback cannot wait for its own shutdown",
         })
@@ -205,7 +205,7 @@ mod tests {
             (
                 Error::block_on_from_worker(),
                 RuntimeValidation::BlockOnFromWorker,
-                "block_on cannot be called from an async Arty worker",
+                "block_on cannot be called from an Arty worker",
             ),
             (
                 Error::shutdown_wait_from_worker(),

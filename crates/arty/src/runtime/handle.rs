@@ -4,7 +4,7 @@
 use crate::runtime::builder::RuntimeBuilder;
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::error::Error;
-use crate::task::{RuntimeScheduler, Scheduler};
+use crate::task::RuntimeScheduler;
 
 /// Owns an Arty runtime's workers and their shutdown.
 ///
@@ -181,7 +181,7 @@ impl Runtime {
     }
 
     fn wait(&self) -> Result<(), Error> {
-        if Scheduler::is_current_worker_thread() {
+        if crate::runtime::worker::task::LocalWorker::is_current() {
             return Err(Error::shutdown_wait_from_worker());
         }
         if self.scheduler.dispatcher.is_current_blocking_thread() {
@@ -231,9 +231,9 @@ mod tests {
     use thread_aware::{ThreadBuilder, Unaware};
 
     use super::*;
-    use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingPool, BlockingWorker};
+    use crate::runtime::bootstrap::thread::ThreadWaiter;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
-    use crate::runtime::thread::waiter::ThreadWaiter;
+    use crate::runtime::worker::blocking::{PanicPolicy, Pool, Worker};
 
     #[test]
     fn explicit_stop_reports_a_worker_panic_after_joining() {
@@ -242,11 +242,11 @@ mod tests {
             command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: ThreadBuilder::default().build(worker.thread().id()),
-            blocking_worker: BlockingWorker::new(
-                BlockingPool::new(None),
+            blocking_worker: Worker::new(
+                Pool::new(None),
                 Sink::noop(),
                 crate::runtime::shutdown::Shutdown::default(),
-                BlockingPanicPolicy::Ignore,
+                PanicPolicy::Ignore,
             ),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
@@ -266,11 +266,11 @@ mod tests {
             command_tx: channel::unbounded().0,
             waker: Waker::noop().clone(),
             thread: ThreadBuilder::default().build(worker.thread().id()),
-            blocking_worker: BlockingWorker::new(
-                BlockingPool::new(None),
+            blocking_worker: Worker::new(
+                Pool::new(None),
                 Sink::noop(),
                 crate::runtime::shutdown::Shutdown::default(),
-                BlockingPanicPolicy::Ignore,
+                PanicPolicy::Ignore,
             ),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
@@ -316,7 +316,12 @@ mod tests {
             .spawn_anywhere((), |cx, ()| async move { cx.scheduler().clone() })
             .join()
             .unwrap();
-        assert!(scheduler.spawn(async |_| Scheduler::is_current_worker_thread()).join().unwrap());
+        assert!(
+            scheduler
+                .spawn(async |_| crate::runtime::worker::task::LocalWorker::is_current())
+                .join()
+                .unwrap()
+        );
 
         scheduler.spawn(async move |_| drop(runtime)).join().unwrap();
 
@@ -364,7 +369,7 @@ mod tests {
         assert!(
             caller
                 .scheduler()
-                .spawn_anywhere((), |_, ()| async { Scheduler::is_current_worker_thread() })
+                .spawn_anywhere((), |_, ()| async { crate::runtime::worker::task::LocalWorker::is_current() })
                 .join()
                 .unwrap()
         );

@@ -1,9 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! OS-thread lifecycle and joining.
+//! Runtime worker OS-thread lifecycle and joining.
 
 mod lifecycle;
-pub(super) mod waiter;
+mod waiter;
 
 pub(super) use lifecycle::spawn;
+pub(crate) use waiter::ThreadWaiter;

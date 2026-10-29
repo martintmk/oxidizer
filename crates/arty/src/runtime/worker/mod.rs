@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Async worker execution, wake notification, and executor shutdown.
+//! Async and blocking worker execution.
 
-mod async_worker;
-pub(super) mod protocol;
-pub(crate) mod signal;
+pub(crate) mod blocking;
+pub(crate) mod task;
 
-pub(super) use async_worker::AsyncWorker;
+mod local_worker;
+
+pub(crate) use local_worker::LocalWorker;

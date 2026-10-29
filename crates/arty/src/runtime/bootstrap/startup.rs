@@ -17,8 +17,8 @@ use tick::runtime::InactiveClock;
 
 use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::PanicPolicy;
-use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingWorker};
 use crate::runtime::bootstrap::pools::BlockingPools;
+use crate::runtime::bootstrap::thread::{ThreadWaiter, spawn};
 use crate::runtime::config::{MonitorOptions, RuntimeConfig};
 use crate::runtime::dispatch::{DispatcherClient, DispatcherCore, WorkerEndpoint};
 use crate::runtime::error::Error;
@@ -27,11 +27,7 @@ use crate::runtime::shutdown::Shutdown;
 use crate::runtime::telemetry::events::{
     AsyncWorkerActive, AsyncWorkerStarted, AsyncWorkerStopped, BlockingWorkerPoolMode, RuntimeStartFailed, RuntimeStarted,
 };
-use crate::runtime::thread::spawn;
-use crate::runtime::thread::waiter::ThreadWaiter;
-use crate::runtime::worker::AsyncWorker;
-use crate::runtime::worker::protocol::AsyncWorkerCommand;
-use crate::runtime::worker::signal::WorkerSignal;
+use crate::runtime::worker::{blocking, task};
 
 pub(crate) fn build(
     processor_config: RuntimeConfig,
@@ -61,11 +57,11 @@ fn build_with_processors(
     })?;
     let processors_used = processors.processors_used();
 
-    let mut async_worker_command_txs = Vec::with_capacity(processors.len());
-    let mut async_worker_start_txs = Vec::with_capacity(processors.len());
-    let mut async_worker_success_rxs = Vec::with_capacity(processors.len());
+    let mut task_worker_command_txs = Vec::with_capacity(processors.len());
+    let mut task_worker_start_txs = Vec::with_capacity(processors.len());
+    let mut task_worker_success_rxs = Vec::with_capacity(processors.len());
 
-    let mut async_worker_join_handles = Vec::with_capacity(processors.len());
+    let mut task_worker_join_handles = Vec::with_capacity(processors.len());
 
     // Respect the RUST_MIN_STACK environment variable if set and larger than the configured stack size.
     let stack_size = processor_config
@@ -92,10 +88,10 @@ fn build_with_processors(
         let (start_tx, start_rx) = channel::oneshot();
         let (success_tx, success_rx) = channel::unbounded();
 
-        async_worker_start_txs.push(start_tx);
+        task_worker_start_txs.push(start_tx);
 
-        async_worker_join_handles.push(
-            AsyncWorkerStartInfo {
+        task_worker_join_handles.push(
+            TaskWorkerStartInfo {
                 command_rx,
                 stack_size,
                 start_rx,
@@ -118,19 +114,19 @@ fn build_with_processors(
         let (waker, thread, blocking_worker) = worker_endpoint_rx
             .recv()
             .expect("failed to receive the worker endpoint from the starting worker");
-        async_worker_command_txs.push(WorkerEndpoint {
+        task_worker_command_txs.push(WorkerEndpoint {
             command_tx,
             waker,
             thread,
             blocking_worker,
         });
-        async_worker_success_rxs.push(success_rx);
+        task_worker_success_rxs.push(success_rx);
     }
 
     let runtime_sink = sink.clone();
     let dispatcher = DispatcherCore::new(
-        ThreadWaiter::new(async_worker_join_handles),
-        NonEmpty::from_vec(async_worker_command_txs)
+        ThreadWaiter::new(task_worker_join_handles),
+        NonEmpty::from_vec(task_worker_command_txs)
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown,
@@ -138,7 +134,7 @@ fn build_with_processors(
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
 
-    for start_tx in async_worker_start_txs {
+    for start_tx in task_worker_start_txs {
         start_tx
             .send(StartWorker {
                 dispatcher: dispatcher_client.clone(),
@@ -146,7 +142,7 @@ fn build_with_processors(
             .expect("a starting worker retains its start receiver");
     }
 
-    for success_rx in async_worker_success_rxs {
+    for success_rx in task_worker_success_rxs {
         success_rx.recv().expect("failed to receive worker startup signal");
     }
 
@@ -166,15 +162,15 @@ fn build_with_processors(
 /// The data set required to start one async worker (the message channels and associated data).
 /// These are the inputs necessary to initialize one worker thread.
 #[derive(Debug)]
-struct AsyncWorkerStartInfo {
-    command_rx: channel::Receiver<AsyncWorkerCommand>,
+struct TaskWorkerStartInfo {
+    command_rx: channel::Receiver<task::Command>,
     stack_size: usize,
     start_rx: OneshotReceiver<StartWorker>,
     success_tx: Sender<()>,
     inactive_clock: InactiveClock,
     processor: ProcessorSet,
     worker_index: usize,
-    worker_endpoint_tx: Sender<(Waker, Thread, Arc<BlockingWorker>)>,
+    worker_endpoint_tx: Sender<(Waker, Thread, Arc<blocking::Worker>)>,
     thread_builder: ThreadBuilder,
     blocking_pools: BlockingPools,
     shutdown: Shutdown,
@@ -184,7 +180,7 @@ struct AsyncWorkerStartInfo {
     panic_policy: PanicPolicy,
 }
 
-impl AsyncWorkerStartInfo {
+impl TaskWorkerStartInfo {
     fn start(self) -> thread::JoinHandle<()> {
         let thread_name = format!("oxidizer-rt-{}", self.worker_index);
         let thread_lifecycle_sink = self.sink.clone();
@@ -219,18 +215,19 @@ impl AsyncWorkerStartInfo {
         let thread_builder = thread_builder.with_numa_node(processor.processors().first().memory_region_id());
         processor.pin_current_thread_to();
         let current = thread_builder.build(thread::current().id());
+        task::LocalWorker::attach();
 
         // The constructing thread is outside the runtime, so the relocation source is unknown.
         let mut clock = inactive_clock;
         clock.relocate(None, &current);
 
-        let signal = Arc::new(WorkerSignal::default());
-        let worker_waker = WorkerSignal::waker(&signal);
+        let signal = Arc::new(task::Signal::default());
+        let worker_waker = task::Signal::waker(&signal);
         let blocking_panic_policy = match panic_policy.clone().into_executor_policy() {
-            arty_executor::PanicPolicy::Ignore => BlockingPanicPolicy::Ignore,
-            arty_executor::PanicPolicy::Shutdown => BlockingPanicPolicy::Shutdown(worker_waker.clone()),
+            arty_executor::PanicPolicy::Ignore => blocking::PanicPolicy::Ignore,
+            arty_executor::PanicPolicy::Shutdown => blocking::PanicPolicy::Shutdown(worker_waker.clone()),
         };
-        let blocking_worker = BlockingWorker::new(blocking_pools.build_worker(), worker_sink.clone(), shutdown, blocking_panic_policy);
+        let blocking_worker = blocking::Worker::new(blocking_pools.build_worker(), worker_sink.clone(), shutdown, blocking_panic_policy);
 
         worker_endpoint_tx
             .send((worker_waker, current.clone(), Arc::clone(&blocking_worker)))
@@ -244,10 +241,10 @@ impl AsyncWorkerStartInfo {
             .expect("RuntimeBuilder failed between initializing and starting a worker - impossible to continue worker execution");
         let dispatcher = start_signal.dispatcher;
         let io = Io::new(io_runtime.clone(), dispatcher.clone(), current.clone());
-        let driver_waker = RuntimeDriverHost::install(&io_runtime, dispatcher.clone(), &current, WorkerSignal::waker(&signal));
+        let driver_waker = RuntimeDriverHost::install(&io_runtime, dispatcher.clone(), &current, task::Signal::waker(&signal));
         signal.set_driver_waker(driver_waker);
 
-        let mut worker = AsyncWorker::new(
+        let mut worker = task::Worker::new(
             command_rx,
             dispatcher.clone(),
             current,
@@ -352,7 +349,6 @@ mod tests {
     use performables::arc::PerThread;
 
     use super::*;
-    use crate::runtime::blocking_worker::BlockingPool;
     use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, WorkersPolicy};
 
     thread_local! {
@@ -390,7 +386,12 @@ mod tests {
         let (command_tx, _command_rx) = channel::unbounded();
         let shutdown = Shutdown::default();
         let current = ThreadBuilder::default().build(thread::current().id());
-        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone(), BlockingPanicPolicy::Ignore);
+        let blocking_worker = blocking::Worker::new(
+            blocking::Pool::new(None),
+            Sink::noop(),
+            shutdown.clone(),
+            blocking::PanicPolicy::Ignore,
+        );
         let endpoint = WorkerEndpoint {
             command_tx,
             waker: Waker::noop().clone(),
@@ -414,7 +415,12 @@ mod tests {
         let (command_tx, _command_rx) = channel::unbounded();
         let shutdown = Shutdown::default();
         let current = ThreadBuilder::default().build(thread::current().id());
-        let blocking_worker = BlockingWorker::new(BlockingPool::new(None), Sink::noop(), shutdown.clone(), BlockingPanicPolicy::Ignore);
+        let blocking_worker = blocking::Worker::new(
+            blocking::Pool::new(None),
+            Sink::noop(),
+            shutdown.clone(),
+            blocking::PanicPolicy::Ignore,
+        );
         let endpoint = WorkerEndpoint {
             command_tx,
             waker: Waker::noop().clone(),

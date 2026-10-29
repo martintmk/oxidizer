@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Shared worker routing and shutdown state.
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Waker;
 use std::thread::ThreadId;
@@ -13,11 +15,11 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::{Thread, ThreadAware};
 
-use crate::runtime::blocking_worker::BlockingWorker;
+use crate::runtime::bootstrap::thread::ThreadWaiter;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::telemetry::events::{RuntimeStopped, RuntimeStopping};
-use crate::runtime::thread::waiter::ThreadWaiter;
-use crate::runtime::worker::protocol::{AsyncWorkerCommand, QueuedIoAccess, QueuedTaskFactory};
+use crate::runtime::worker::blocking::Worker;
+use crate::runtime::worker::task::{Command, QueuedFactory, QueuedIoAccess};
 use crate::runtime::{Error, Workers};
 use crate::task::Builtins;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
@@ -25,10 +27,10 @@ use crate::task::preparation::prepare_remote;
 
 #[derive(Debug)]
 pub(crate) struct WorkerEndpoint {
-    pub(crate) command_tx: channel::Sender<AsyncWorkerCommand>,
+    pub(crate) command_tx: channel::Sender<Command>,
     pub(crate) waker: Waker,
     pub(crate) thread: Thread,
-    pub(crate) blocking_worker: Arc<BlockingWorker>,
+    pub(crate) blocking_worker: Arc<Worker>,
 }
 
 /// Index resolved against a dispatcher's registered workers, not a hardware processor ID.
@@ -135,7 +137,7 @@ impl DispatcherCore {
         for endpoint in &self.worker_endpoints {
             // We ignore the result here because we do not care if the channel is already closed for
             // whatever reason (after all, that is relatively compatible with the "shut down" idea).
-            _ = endpoint.command_tx.send(AsyncWorkerCommand::Shutdown);
+            _ = endpoint.command_tx.send(Command::Shutdown);
             endpoint.waker.wake_by_ref();
         }
         cause
@@ -195,7 +197,7 @@ impl DispatcherCore {
             .worker_endpoints
             .get(usize::from(worker_index))
             .expect("worker index must identify a registered runtime worker");
-        let send_result = endpoint.command_tx.send(AsyncWorkerCommand::AccessIo {
+        let send_result = endpoint.command_tx.send(Command::AccessIo {
             access: QueuedIoAccess::new(access),
         });
         endpoint.waker.wake_by_ref();
@@ -217,11 +219,11 @@ impl DispatcherCore {
             .any(|endpoint| endpoint.blocking_worker.owns_current_thread())
     }
 
-    pub(crate) fn next_blocking_worker(&self) -> Arc<BlockingWorker> {
+    pub(crate) fn next_blocking_worker(&self) -> Arc<Worker> {
         self.blocking_worker(self.next_worker_index())
     }
 
-    pub(crate) fn blocking_worker(&self, worker_index: WorkerIndex) -> Arc<BlockingWorker> {
+    pub(crate) fn blocking_worker(&self, worker_index: WorkerIndex) -> Arc<Worker> {
         Arc::clone(
             &self
                 .worker_endpoints
@@ -279,8 +281,8 @@ impl DispatcherCore {
 
         // There is nothing we can really do if the worker is already gone and closed the channel.
         // That may be the case when we landed here when the runtime was already shutting down.
-        _ = endpoint.command_tx.send(AsyncWorkerCommand::EnqueueTask {
-            future_factory: QueuedTaskFactory::new(future_factory),
+        _ = endpoint.command_tx.send(Command::EnqueueTask {
+            future_factory: QueuedFactory::new(future_factory),
         });
 
         endpoint.waker.wake_by_ref();
@@ -312,21 +314,16 @@ mod tests {
     use testing_aids::TEST_TIMEOUT;
 
     use super::*;
-    use crate::runtime::blocking_worker::{BlockingPanicPolicy, BlockingPool};
     use crate::runtime::dispatch::{DispatcherClient, test_threads};
+    use crate::runtime::worker::blocking::{PanicPolicy, Pool};
 
     #[cfg_attr(test, mutants::skip)]
-    fn endpoint(tx: channel::Sender<AsyncWorkerCommand>, thread: &Thread) -> WorkerEndpoint {
+    fn endpoint(tx: channel::Sender<Command>, thread: &Thread) -> WorkerEndpoint {
         WorkerEndpoint {
             command_tx: tx,
             waker: Waker::noop().clone(),
             thread: thread.clone(),
-            blocking_worker: BlockingWorker::new(
-                BlockingPool::new(None),
-                observed::Sink::noop(),
-                Shutdown::default(),
-                BlockingPanicPolicy::Ignore,
-            ),
+            blocking_worker: Worker::new(Pool::new(None), observed::Sink::noop(), Shutdown::default(), PanicPolicy::Ignore),
         }
     }
 
@@ -495,7 +492,7 @@ mod tests {
 
         // Rejection is synchronous and the callback publishes no other data.
         assert!(!invoked.load(Ordering::Relaxed));
-        assert!(matches!(drain_rx(&rx).as_slice(), [AsyncWorkerCommand::Shutdown]));
+        assert!(matches!(drain_rx(&rx).as_slice(), [Command::Shutdown]));
     }
 
     #[test]
@@ -624,7 +621,7 @@ mod tests {
     }
 
     #[cfg_attr(test, mutants::skip)]
-    fn drain_rx(worker_rx: &channel::Receiver<AsyncWorkerCommand>) -> Vec<AsyncWorkerCommand> {
+    fn drain_rx(worker_rx: &channel::Receiver<Command>) -> Vec<Command> {
         let mut commands = Vec::new();
 
         loop {

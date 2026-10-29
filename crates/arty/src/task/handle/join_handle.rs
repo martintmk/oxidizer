@@ -11,8 +11,8 @@ use thread_aware::{Thread, ThreadAware};
 
 use super::JoinError;
 use crate::runtime::Shutdown;
-use crate::runtime::blocking_worker::is_current_blocking_pool;
-use crate::task::Scheduler;
+use crate::runtime::worker::blocking::LocalWorker as BlockingLocalWorker;
+use crate::runtime::worker::task::LocalWorker as TaskLocalWorker;
 
 /// A handle for receiving an async or blocking task's result.
 ///
@@ -25,7 +25,8 @@ use crate::task::Scheduler;
 /// If the task returns its own `Result<T, E>`, joining it produces
 /// `Result<Result<T, E>, JoinError>`.
 ///
-/// A result from [`Scheduler::spawn_anywhere`] or [`Scheduler::spawn_at`] is
+/// A result from [`Scheduler::spawn_anywhere`](crate::task::Scheduler::spawn_anywhere)
+/// or [`Scheduler::spawn_at`](crate::task::Scheduler::spawn_at) is
 /// relocated to the joining Arty worker before it is returned. Joining from
 /// outside an Arty worker leaves its association unchanged. Other submission
 /// methods do not relocate their results.
@@ -155,7 +156,7 @@ where
 #[cfg_attr(test, mutants::skip)] // Removing this guard makes the black-box blocking-pool regression deadlock.
 fn assert_not_current_blocking_pool(blocking_pool: Option<&Arc<()>>) {
     assert!(
-        !blocking_pool.is_some_and(is_current_blocking_pool),
+        !blocking_pool.is_some_and(BlockingLocalWorker::is_current_pool),
         "blocking JoinHandle cannot be polled while the current blocking pool waits for it"
     );
 }
@@ -183,7 +184,7 @@ where
 
         if let Poll::Ready(Ok(value)) = &mut result
             && let Some(relocation) = this.relocation.as_ref()
-            && let Some(destination) = Scheduler::current_thread()
+            && let Some(destination) = TaskLocalWorker::current_thread()
         {
             (relocation.relocate)(value, Some(&relocation.source), &destination);
         }
