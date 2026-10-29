@@ -5,7 +5,6 @@ use std::task::Waker;
 
 use observed::Sink;
 use thread_aware_core::Thread;
-use tick::SimpleClock;
 
 use crate::{Executor, PanicPolicy};
 
@@ -17,7 +16,6 @@ pub struct ExecutorBuilder {
     sink: Sink,
     thread: Option<Thread>,
     panic_policy: PanicPolicy,
-    clock: SimpleClock,
 }
 
 impl ExecutorBuilder {
@@ -28,7 +26,6 @@ impl ExecutorBuilder {
             sink: Sink::noop(),
             thread: None,
             panic_policy: PanicPolicy::default(),
-            clock: SimpleClock::new_system().with_fast_instant(true),
         }
     }
 
@@ -67,14 +64,6 @@ impl ExecutorBuilder {
         self
     }
 
-    /// Configures the clock used to measure cycles and timestamp their completion.
-    ///
-    /// The default is a system clock with lower-overhead instant retrieval enabled.
-    pub fn clock(mut self, clock: SimpleClock) -> Self {
-        self.clock = clock;
-        self
-    }
-
     /// Builds the executor with the configured settings.
     ///
     /// # Panics
@@ -92,7 +81,7 @@ impl ExecutorBuilder {
             );
             thread.id()
         });
-        Executor::new(self.owner_waker, self.sink, thread_id, self.panic_policy, self.clock)
+        Executor::new(self.owner_waker, self.sink, thread_id, self.panic_policy)
     }
 }
 

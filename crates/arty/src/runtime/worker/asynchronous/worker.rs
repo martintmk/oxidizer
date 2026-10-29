@@ -26,8 +26,8 @@ use crate::task::Builtins;
 
 const COMMANDS_PER_CYCLE: usize = 256;
 
-fn suspend_wait(deadline: Instant, fast_now: Instant, precise_now: Instant) -> Duration {
-    deadline.saturating_duration_since(fast_now.max(precise_now))
+fn suspend_wait(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
 }
 
 fn can_suspend(cycle_outcome: &CycleOutcome, batch_exhausted: bool) -> bool {
@@ -98,7 +98,7 @@ pub(crate) struct Worker {
     // This drives moves the timers registered with the clock forward.
     clock_driver: ClockDriver,
 
-    // Cycle-local timestamps and wait budgets use lower-overhead system time.
+    // Cycle-local timestamps and wait budgets use precise system time.
     cycle_clock: SimpleClock,
     signal: Arc<Signal>,
     monitor_options: MonitorOptions,
@@ -125,14 +125,13 @@ impl Worker {
         let worker_waker = Signal::waker(&signal);
         let shutdown = dispatcher.shutdown().clone();
         let (clock, clock_driver) = clock.activate(worker_waker.clone());
-        let cycle_clock = SimpleClock::new_system().with_fast_instant(true);
+        let cycle_clock = SimpleClock::new_system();
 
         let executor = Executor::builder()
             .owner_waker(worker_waker)
             .sink(blocking_worker.sink().clone())
             .thread(thread.clone())
             .panic_policy(panic_policy.into_executor_policy())
-            .clock(cycle_clock.clone())
             .build();
         let tasks = executor.tasks();
         let executor_shutdown = executor.shutdown();
@@ -203,13 +202,14 @@ impl Worker {
             .as_mut()
             .expect("executor removal publishes shutdown, which is handled above");
 
-        let (cycle_outcome, cycle_finished) = executor.execute_cycle();
+        let cycle_outcome = executor.execute_cycle();
 
         if let CycleOutcome::Shutdown(cause) = cycle_outcome {
             self.shutdown.begin(cause);
             return CycleAction::Shutdown;
         }
 
+        let cycle_finished = self.cycle_clock.instant();
         let next_timer = self.clock_driver.advance_timers(cycle_finished).ok().flatten();
         if matches!(self.shutdown.state(), ShutdownState::Started) {
             return CycleAction::Shutdown;
@@ -233,13 +233,13 @@ impl Worker {
     }
 
     fn wait_until(&self, deadline: Instant) -> Duration {
-        suspend_wait(deadline, self.cycle_clock.instant(), Instant::now())
+        suspend_wait(deadline, self.cycle_clock.instant())
     }
 
     fn finish_shutdown(&mut self) -> ControlFlow<()> {
         self.begin_shutdown();
-        // Final task cancellation can register a timer after the coarse cycle sample.
-        let now = SimpleClock::new_system().instant();
+        // Final task cancellation can register a timer after the cycle sample.
+        let now = self.cycle_clock.instant();
         _ = self.clock_driver.advance_timers(now);
         ControlFlow::Break(())
     }
@@ -380,21 +380,20 @@ mod tests {
     }
 
     #[test]
-    fn private_suspend_wait_bounds_a_lagging_fast_clock_with_precise_time() {
+    fn private_suspend_wait_uses_current_time() {
         // The exact wait calculation is private worker-loop policy; public timer wake and
         // completion behavior is covered by integration tests in `tests/time.rs`.
         let now = Instant::now();
 
         assert_eq!(
-            suspend_wait(now + Duration::from_secs(2), now, now + Duration::from_secs(1)),
+            suspend_wait(now + Duration::from_secs(2), now + Duration::from_secs(1)),
             Duration::from_secs(1)
         );
-        assert_eq!(suspend_wait(now + Duration::from_millis(20), now, now), Duration::from_millis(20));
+        assert_eq!(suspend_wait(now + Duration::from_millis(20), now), Duration::from_millis(20));
         assert_eq!(
             suspend_wait(
                 now.checked_sub(Duration::from_millis(1))
                     .expect("the current instant supports a 1 ms subtraction"),
-                now,
                 now
             ),
             Duration::ZERO
@@ -1186,7 +1185,7 @@ mod tests {
         });
         let executor = worker.executor.as_mut().unwrap();
 
-        assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         assert!(!invoked.load(Ordering::Acquire));
     }
 

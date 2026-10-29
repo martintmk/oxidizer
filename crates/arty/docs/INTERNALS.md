@@ -77,11 +77,8 @@ and timer advancement. The action can poll again, wait in the primary I/O
 driver, wait for a worker signal, or finish shutdown. All non-shutdown actions
 still execute secondary I/O drivers before the primary driver.
 
-The executor and worker wait budgets use the fast system clock. The worker
-reuses the executor's cycle-end sample directly for system timer advancement, so
-normal cycles take no additional time sample after task polling. Tick treats a
-timer removed by the driver as complete, even when a precise sample has not
-reached that coarse deadline. Controlled time remains externally owned:
+The worker uses a precise system clock for timer advancement and wait budgets.
+It samples this clock after each executor cycle. Controlled time remains externally owned:
 `ClockControl` advancement wakes the worker when a timer becomes due. Final
 shutdown takes a fresh precise system sample after task cancellation before it
 runs timer callbacks.

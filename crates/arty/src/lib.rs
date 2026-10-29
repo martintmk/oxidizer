@@ -404,7 +404,10 @@ pub mod core {
 /// # #[cfg(all(feature = "macros", feature = "rt"))]
 /// # #[arty::main]
 /// # async fn main(cx: arty::task::Builtins) {
-/// cx.clock().delay(std::time::Duration::from_millis(1)).await;
+/// let duration = std::time::Duration::from_millis(1);
+/// let watch = cx.clock().stopwatch();
+/// cx.clock().delay(duration).await;
+/// assert!(watch.elapsed() >= duration);
 /// # }
 /// # #[cfg(not(all(feature = "macros", feature = "rt")))] fn main() {}
 /// ```

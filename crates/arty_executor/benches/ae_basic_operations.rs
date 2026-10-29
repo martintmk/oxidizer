@@ -157,7 +157,7 @@ fn retained_waker_after_executor_drop() -> Waker {
         DiscardCompletion,
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = captured.borrow_mut().take().expect("the task captured its waker");
     drop(executor);
     drop(tasks);
@@ -168,7 +168,7 @@ fn retained_waker_after_executor_drop() -> Waker {
 #[bench::idle(Box::new(cycle_state(false)))]
 #[bench::pending_task(Box::new(cycle_state(true)))]
 fn execute_cycle<S: borrow::BorrowMut<CycleState>>(mut state: S) -> (CycleOutcome, S) {
-    let outcome = state.borrow_mut().executor.execute_cycle().0;
+    let outcome = state.borrow_mut().executor.execute_cycle();
     (outcome, state)
 }
 
@@ -185,7 +185,7 @@ fn add_task<S: borrow::Borrow<ExecutorState>>(state: S) -> S {
 fn self_waking_task<S: borrow::BorrowMut<SelfWakingState>>(mut state: S) -> (CycleOutcome, S) {
     let mut outcome = CycleOutcome::Suspend;
     for _ in 0..SELF_WAKING_POLL_COUNT {
-        outcome = state.borrow_mut().executor.execute_cycle().0;
+        outcome = state.borrow_mut().executor.execute_cycle();
     }
     (outcome, state)
 }
@@ -193,7 +193,7 @@ fn self_waking_task<S: borrow::BorrowMut<SelfWakingState>>(mut state: S) -> (Cyc
 #[metabench::benchmark(CLONE_WAKER_DURING_CYCLE, WAKER, "clone_during_cycle")]
 #[bench::pending_task(Box::new(clone_waker_state()))]
 fn clone_waker_during_cycle<S: borrow::BorrowMut<CloneWakerState>>(mut state: S) -> (CycleOutcome, S) {
-    let outcome = state.borrow_mut().executor.execute_cycle().0;
+    let outcome = state.borrow_mut().executor.execute_cycle();
     (outcome, state)
 }
 

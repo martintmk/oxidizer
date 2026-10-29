@@ -27,9 +27,12 @@ async fn many_timers_with_relocation_ensure_advanced(builtins: Builtins) {
             scheduler.spawn_anywhere(builtins.clone(), move |builtins| async move {
                 println!("delay(pending) - clock: {:?}, thread: {:?}", builtins.clock(), builtins.thread());
 
+                let watch = builtins.clock().stopwatch();
                 builtins.clock().delay(Duration::from_millis(50)).await;
 
                 println!("delay(done) - clock: {:?}, thread: {:?}", builtins.clock(), builtins.thread());
+
+                assert!(watch.elapsed().as_millis() >= 50);
             })
         })
         .collect();

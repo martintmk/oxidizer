@@ -43,7 +43,7 @@ fn remote_wake_burst_notifies_the_owner_once() {
             TaskOptions::default(),
         ));
     }
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     owner.0.store(0, Ordering::Relaxed);
     let wakers = retained.take();
 
@@ -83,7 +83,7 @@ fn remote_notifications_preserve_first_wake_order_and_task_ownership() {
             TaskOptions::default(),
         )
     });
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     polls.borrow_mut().clear();
     ready.set(true);
     let wakers = retained.take();
@@ -98,7 +98,7 @@ fn remote_notifications_preserve_first_wake_order_and_task_ownership() {
     .join()
     .unwrap();
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(*polls.borrow(), [2, 0, 1]);
     for (index, handle) in handles.iter_mut().enumerate() {
         assert!(matches!(
@@ -149,7 +149,7 @@ fn remote_consuming_wake_keeps_payload_on_owner_when_notification_panics() {
         }),
         TaskOptions::default(),
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let waker = retained.borrow_mut().take().unwrap();
 
     std::thread::spawn(move || {
@@ -178,11 +178,11 @@ fn retained_waker_is_noop_after_shutdown() {
         TaskOptions::default(),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = retained.borrow_mut().take().unwrap();
     drop(task);
     executor.shutdown().trigger(arty_executor::ShutdownCause::default());
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     drop(executor);
 
     std::thread::spawn(move || {
@@ -219,7 +219,7 @@ fn owner_waker_panic_does_not_prevent_shutdown() {
         }),
         TaskOptions::default(),
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let retained = retained.borrow_mut().take().unwrap();
 
     assert!(catch_unwind(AssertUnwindSafe(|| retained.wake())).is_err());
@@ -230,7 +230,7 @@ fn owner_waker_panic_does_not_prevent_shutdown() {
         }))
         .is_err()
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 }
 
 #[test]
@@ -294,7 +294,7 @@ fn context_restoration_panic_does_not_release_local_payload_to_remote_waker() {
         TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any),
     );
 
-    catch_unwind(AssertUnwindSafe(|| executor.execute_cycle().0)).unwrap_err();
+    catch_unwind(AssertUnwindSafe(|| executor.execute_cycle())).unwrap_err();
     let waker = retained.borrow_mut().take().unwrap();
     let remote = std::thread::spawn(move || drop(waker));
     drop(Rc::clone(&local));

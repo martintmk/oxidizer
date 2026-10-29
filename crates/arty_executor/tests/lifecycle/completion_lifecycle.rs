@@ -193,13 +193,13 @@ fn failed_construction_preserves_existing_executor_notifications() {
         }),
         TaskOptions::default(),
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     ready.set(true);
     retained.borrow().as_ref().unwrap().wake_by_ref();
 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Executor::builder().build())).unwrap_err();
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_completed(&mut handle), 42);
 }
 
@@ -218,7 +218,7 @@ fn noop_executor_applies_task_context_and_restores_caller_context() {
         TaskOptions::observed(task_context, TaskPlacement::Any),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_completed(&mut handle), [String::from("task.context")]);
     assert_eq!(enrichment_keys(&sink), ["caller.context"]);
 }
@@ -229,7 +229,7 @@ fn completed_result_remains_available_after_executor_stops() {
     let mut handle = executor.tasks().add_test(async { 42 }, TaskOptions::default());
 
     assert!(executor.has_tasks());
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert!(!executor.has_tasks());
     drop(executor);
 
@@ -246,7 +246,7 @@ fn task_panic_publishes_the_original_payload_and_keeps_the_executor_usable() {
         TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut panicked) else {
         panic!("panicking task must publish its panic payload");
     };
@@ -254,7 +254,7 @@ fn task_panic_publishes_the_original_payload_and_keeps_the_executor_usable() {
     assert!(processor.events().iter().any(|event| event.name() == "arty.rt.task.panicked"));
 
     let mut completed = tasks.add_test(async { 7 }, TaskOptions::default());
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_completed(&mut completed), 7);
 }
 
@@ -279,9 +279,9 @@ fn self_wake_requests_an_immediate_follow_up_cycle() {
         TaskOptions::default(),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Continue));
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Continue));
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_completed(&mut completion), 42);
 }
 
@@ -322,12 +322,12 @@ fn assert_future_is_destroyed_at_its_pinned_address(completes: bool) {
         TaskOptions::default(),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     if completes {
         poll_completed(&mut completion);
     } else {
         executor.shutdown().trigger(ShutdownCause::default());
-        assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+        assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
         poll_cancelled(&mut completion);
     }
 
@@ -359,9 +359,9 @@ fn inactive_task_is_not_polled_again_without_a_wake() {
         TaskOptions::default(),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(polls.get(), 1);
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(polls.get(), 1);
 }
 
@@ -393,9 +393,9 @@ fn tasks_submitted_during_poll_wait_for_the_next_cycle_in_registration_order() {
         );
     }
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Continue));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Continue));
     assert_eq!(*polls.borrow(), [0, 1]);
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(*polls.borrow(), [0, 1, 2, 3]);
 }
 
@@ -424,7 +424,7 @@ fn newly_submitted_tasks_run_before_awakened_tasks() {
         TaskOptions::default(),
         crate::support::DiscardCompletion,
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     polls.borrow_mut().clear();
     ready.set(true);
     retained.borrow().as_ref().unwrap().wake_by_ref();
@@ -441,7 +441,7 @@ fn newly_submitted_tasks_run_before_awakened_tasks() {
         );
     }
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(*polls.borrow(), [0, 1, 2]);
 }
 
@@ -452,7 +452,7 @@ fn shutdown_panic_policy_publishes_the_payload_before_shutdown() {
         .tasks()
         .add_test(poll_fn(|_| -> Poll<()> { panic!("shutdown panic") }), TaskOptions::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
         panic!("panicking task must publish its payload before shutdown");
     };
@@ -531,7 +531,7 @@ fn panic_notification_carries_the_authoritative_shutdown_cause() {
             },
         );
 
-        let outcome = executor.execute_cycle().0;
+        let outcome = executor.execute_cycle();
         let notification = notification.take().unwrap();
         assert!(notification.original_payload);
         assert_eq!(notification.cause.is_some(), expects_shutdown);
@@ -579,7 +579,7 @@ fn completed_future_destructor_panic_is_published_as_the_task_panic() {
     let mut executor = Executor::builder().panic_policy(PanicPolicy::Ignore).build();
     let mut completion = executor.tasks().add_test(ReadyDropPanic, TaskOptions::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
         panic!("completed future destructor panic must be published");
     };
@@ -609,7 +609,7 @@ fn poll_panic_remains_primary_when_future_disposal_also_panics() {
     let mut executor = Executor::builder().panic_policy(PanicPolicy::Ignore).build();
     let mut completion = executor.tasks().add_test(PollAndDropPanic, TaskOptions::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
         panic!("poll panic must be published");
     };
@@ -646,11 +646,11 @@ fn cancellation_destructor_panic_still_publishes_cancellation_and_completes_shut
         },
         TaskOptions::default(),
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(dropped.get());
     assert!(matches!(poll_once(&mut completion), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
@@ -662,7 +662,7 @@ fn retained_handle_reports_shutdown_without_delaying_shutdown() {
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(!executor.has_tasks());
     drop(executor);
     assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
@@ -677,29 +677,12 @@ fn caused_shutdown_is_attached_to_cancelled_and_rejected_tasks() {
 
     executor.shutdown().trigger(cause);
     let mut rejected = tasks.add_test(async {}, TaskOptions::default());
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 
     for cause in [poll_cancelled(&mut pending), poll_cancelled(&mut rejected)] {
         let source = cause.as_error().unwrap();
         assert_same_shutdown_source(source, &expected);
     }
-}
-
-#[test]
-fn shutdown_requested_during_poll_cancels_the_pending_task() {
-    let mut executor = Executor::builder().build();
-    let shutdown = executor.shutdown();
-    let mut completion = executor.tasks().add_test(
-        poll_fn(move |_| {
-            shutdown.trigger(ShutdownCause::default());
-            Poll::Pending::<()>
-        }),
-        TaskOptions::default(),
-    );
-
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
-    assert!(!executor.has_tasks());
-    poll_cancelled(&mut completion);
 }
 
 #[test]
@@ -747,7 +730,7 @@ fn shutdown_handle_cancels_tasks_without_executor_drop() {
     let mut handle = tasks.add_test(pending::<()>(), TaskOptions::default());
 
     shutdown.trigger(ShutdownCause::default());
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     assert!(!executor.has_tasks());
     drop(executor);
 
@@ -763,7 +746,7 @@ fn executor_drop_during_thread_local_teardown_is_safe() {
         THREAD_LOCAL_EXECUTOR.with(|slot| {
             let mut executor = slot.borrow_mut();
             assert!(matches!(
-                executor.as_mut().expect("thread-local executor is initialized").execute_cycle().0,
+                executor.as_mut().expect("thread-local executor is initialized").execute_cycle(),
                 CycleOutcome::Suspend
             ));
         });
@@ -832,7 +815,7 @@ fn task_created_processor_may_submit_a_nested_task() {
 
     let _outer = tasks.add_test(async {}, TaskOptions::observed(sink.transfer_context(), TaskPlacement::Any));
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert!(nested_completed.get());
 }
 
@@ -842,7 +825,7 @@ fn default_options_emit_lifecycle_events_without_context_enrichment() {
     let mut executor = Executor::builder().sink(sink).build();
     let _handle = executor.tasks().add_test(async {}, TaskOptions::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
     let events = processor.events();
     assert!(events.iter().any(|event| event.name() == "arty.rt.task.spawned"));
@@ -885,7 +868,7 @@ fn into_future_conversion_may_submit_a_nested_task() {
         TaskOptions::default(),
     );
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     assert_eq!(poll_completed(&mut handle), 42);
     assert!(nested_completed.get());
 }
@@ -979,7 +962,7 @@ fn shutdown_during_into_future_conversion_rejects_the_outer_task() {
     );
 
     assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
 }
 
 struct SubmitOnDrop {
@@ -1014,11 +997,11 @@ fn cancelled_future_drop_can_submit_and_receive_shutdown_error() {
         },
         TaskOptions::default(),
     );
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     let mut submitted_handle = submitted.borrow_mut().take().expect("future destructor submitted a task");
     assert!(matches!(poll_once(&mut submitted_handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
@@ -1043,14 +1026,14 @@ fn shutdown_retires_a_batch_of_queued_tasks() {
             TaskOptions::default(),
         ));
     }
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     for waker in wakers.borrow().iter() {
         waker.wake_by_ref();
     }
 
     executor.shutdown().trigger(ShutdownCause::default());
 
-    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Shutdown(_)));
     for mut handle in handles {
         assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
     }
