@@ -283,7 +283,6 @@ impl DispatcherCore {
     }
 
     /// Waits for the runtime to shut down and all worker threads to exit.
-    ///
     pub(crate) fn join(&self) -> Result<(), Error> {
         let outcome = self.worker_joiner.join();
         emit!(&self.sink, RuntimeStopped);
