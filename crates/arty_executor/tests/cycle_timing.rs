@@ -3,7 +3,7 @@
 
 //! Cycle outcomes carry the completion time from the configured clock.
 
-use std::future::poll_fn;
+use std::future::{pending, poll_fn};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -107,4 +107,36 @@ fn completion_clock_wake_prevents_suspend() {
     let (outcome, _) = executor.execute_cycle();
     assert!(matches!(outcome, CycleOutcome::Suspend));
     assert!(!executor.has_tasks());
+}
+
+#[test]
+fn shutdown_completion_timestamp_includes_future_destruction() {
+    struct AdvanceOnDrop(ClockControl);
+
+    impl Drop for AdvanceOnDrop {
+        fn drop(&mut self) {
+            self.0.advance(Duration::from_secs(3));
+        }
+    }
+
+    let control = ClockControl::new();
+    let clock = control.to_simple_clock();
+    let start = clock.instant();
+    let mut executor = Executor::builder().clock(clock).build();
+    let task_control = control;
+    executor.tasks().add(
+        async move {
+            let _advance_on_drop = AdvanceOnDrop(task_control);
+            pending::<()>().await;
+        },
+        TaskOptions::default(),
+        DiscardCompletion,
+    );
+    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Suspend));
+
+    executor.shutdown().trigger(ShutdownCause::default());
+    let (outcome, finished) = executor.execute_cycle();
+
+    assert!(matches!(outcome, CycleOutcome::Shutdown(_)));
+    assert_eq!(finished, start + Duration::from_secs(3));
 }

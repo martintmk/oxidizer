@@ -151,7 +151,11 @@ impl Executor {
         self.activate_awakened_tasks();
         self.poll_active_tasks();
         let cycle_finished = self.clock.instant();
-        self.cancel_if_shutting_down();
+        let cycle_finished = if self.cancel_if_shutting_down() {
+            self.clock.instant()
+        } else {
+            cycle_finished
+        };
         let outcome = self.cycle_outcome();
         self.finish_cycle(cycle_started, cycle_finished);
         (outcome, cycle_finished)
@@ -182,11 +186,14 @@ impl Executor {
         }
     }
 
-    fn cancel_if_shutting_down(&mut self) {
+    fn cancel_if_shutting_down(&mut self) -> bool {
         if self.shared.shutdown().is_triggered() {
             let cause = self.shared.shutdown().cause();
             let aborted_count = self.prepare_task_abort();
             self.abort_prepared_tasks(aborted_count, true, &cause);
+            aborted_count != 0
+        } else {
+            false
         }
     }
 
