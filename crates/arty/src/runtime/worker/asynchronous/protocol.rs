@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Commands and queued work sent to a task worker.
+//! Commands and queued work sent to an asynchronous worker.
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};

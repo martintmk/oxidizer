@@ -10,8 +10,8 @@ use thread_aware::{Thread, ThreadAware};
 
 use super::JoinError;
 use crate::runtime::Shutdown;
+use crate::runtime::worker::asynchronous::LocalWorker as AsyncLocalWorker;
 use crate::runtime::worker::blocking::{LocalWorker as BlockingLocalWorker, PoolIdentity};
-use crate::runtime::worker::task::LocalWorker as TaskLocalWorker;
 
 /// A handle for receiving an async or blocking task's result.
 ///
@@ -183,7 +183,7 @@ where
 
         if let Poll::Ready(Ok(value)) = &mut result
             && let Some(relocation) = this.relocation.as_ref()
-            && let Some(destination) = TaskLocalWorker::current_thread()
+            && let Some(destination) = AsyncLocalWorker::current_thread()
         {
             (relocation.relocate)(value, Some(&relocation.source), &destination);
         }

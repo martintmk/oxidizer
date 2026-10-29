@@ -3,8 +3,8 @@
 
 //! Async and blocking worker execution.
 
+pub(crate) mod asynchronous;
 pub(crate) mod blocking;
-pub(crate) mod task;
 
 mod worker_kind;
 

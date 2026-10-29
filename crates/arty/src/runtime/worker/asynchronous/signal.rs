@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Wake notification shared by a task worker and its callers.
+//! Wake notification shared by an asynchronous worker and its callers.
 
 use std::sync::{Arc as StdArc, OnceLock};
 use std::task::{Wake, Waker};

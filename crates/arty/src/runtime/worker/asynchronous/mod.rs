@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Cooperative task worker execution.
+//! Asynchronous worker execution.
 
 mod local_worker;
 mod protocol;

@@ -26,7 +26,7 @@ use crate::runtime::shutdown::Shutdown;
 use crate::runtime::telemetry::events::{
     AsyncWorkerActive, AsyncWorkerStarted, AsyncWorkerStopped, BlockingWorkerPoolMode, RuntimeStartFailed, RuntimeStarted,
 };
-use crate::runtime::worker::{blocking, task};
+use crate::runtime::worker::{asynchronous, blocking};
 
 pub(crate) fn build(
     processor_config: RuntimeConfig,
@@ -161,7 +161,7 @@ fn build_with_processors(
 /// These are the inputs necessary to initialize one worker thread.
 #[derive(Debug)]
 struct TaskWorkerStartInfo {
-    command_rx: channel::Receiver<task::Command>,
+    command_rx: channel::Receiver<asynchronous::Command>,
     stack_size: usize,
     start_rx: OneshotReceiver<StartWorker>,
     success_tx: Sender<()>,
@@ -213,14 +213,14 @@ impl TaskWorkerStartInfo {
         let thread_builder = thread_builder.with_numa_node(processor.processors().first().memory_region_id());
         processor.pin_current_thread_to();
         let current = thread_builder.build(thread::current().id());
-        task::LocalWorker::attach();
+        asynchronous::LocalWorker::attach();
 
         // The constructing thread is outside the runtime, so the relocation source is unknown.
         let mut clock = inactive_clock;
         clock.relocate(None, &current);
 
-        let signal = Arc::new(task::Signal::default());
-        let worker_waker = task::Signal::waker(&signal);
+        let signal = Arc::new(asynchronous::Signal::default());
+        let worker_waker = asynchronous::Signal::waker(&signal);
         let blocking_panic_policy = match panic_policy.clone().into_executor_policy() {
             arty_executor::PanicPolicy::Ignore => blocking::PanicPolicy::Ignore,
             arty_executor::PanicPolicy::Shutdown => blocking::PanicPolicy::Shutdown(worker_waker.clone()),
@@ -239,10 +239,10 @@ impl TaskWorkerStartInfo {
             .expect("RuntimeBuilder failed between initializing and starting a worker - impossible to continue worker execution");
         let dispatcher = start_signal.dispatcher;
         let io = Io::new(io_runtime.clone(), dispatcher.clone(), current.clone());
-        let driver_waker = RuntimeDriverHost::install(&io_runtime, dispatcher.clone(), &current, task::Signal::waker(&signal));
+        let driver_waker = RuntimeDriverHost::install(&io_runtime, dispatcher.clone(), &current, asynchronous::Signal::waker(&signal));
         signal.set_driver_waker(driver_waker);
 
-        let mut worker = task::Worker::new(
+        let mut worker = asynchronous::Worker::new(
             command_rx,
             dispatcher.clone(),
             current,

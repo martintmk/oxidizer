@@ -13,7 +13,7 @@ use thread_aware::{Thread, ThreadAware};
 use super::driver_host::RuntimeDriverHost;
 use crate::runtime::Error;
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
-use crate::runtime::worker::task::LocalWorker;
+use crate::runtime::worker::asynchronous::LocalWorker;
 use crate::task::Builtins;
 
 /// Access to I/O contexts hosted by an Arty runtime.
@@ -156,7 +156,7 @@ pub(super) fn runtime_error(dispatcher: &DispatcherClient) -> Option<Error> {
 pub(super) fn fail_runtime(dispatcher: &DispatcherClient, error: DriverError) -> Error {
     let error = Arc::new(error);
     let cause = dispatcher.stop(Error::io_failure(Arc::clone(&error)).into_shutdown_cause());
-    crate::runtime::worker::task::LocalWorker::begin_executor_shutdown(dispatcher, cause);
+    crate::runtime::worker::asynchronous::LocalWorker::begin_executor_shutdown(dispatcher, cause);
     Error::io_failure(error)
 }
 

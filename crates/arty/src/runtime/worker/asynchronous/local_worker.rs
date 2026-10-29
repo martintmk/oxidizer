@@ -16,7 +16,7 @@ thread_local! {
     static CURRENT: RefCell<Option<LocalWorker>> = const { RefCell::new(None) };
 }
 
-/// Task worker state that remains attached throughout thread teardown.
+/// Asynchronous worker state that remains attached throughout thread teardown.
 #[derive(Debug)]
 pub(crate) struct LocalWorker {
     scheduler: Option<SchedulerContext>,

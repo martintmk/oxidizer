@@ -11,7 +11,7 @@ use thread_aware::Thread;
 use super::handle::{fail_runtime, runtime_error};
 use crate::runtime::Error;
 use crate::runtime::dispatch::DispatcherClient;
-use crate::runtime::worker::task::LocalWorker;
+use crate::runtime::worker::asynchronous::LocalWorker;
 
 /// Adapter between a task worker's lifecycle and `arty_io_host`.
 ///

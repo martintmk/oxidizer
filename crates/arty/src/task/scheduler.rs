@@ -6,8 +6,8 @@ use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::dispatch::{DispatcherClient, WorkerIndex};
+use crate::runtime::worker::asynchronous;
 use crate::runtime::worker::blocking::Worker;
-use crate::runtime::worker::task;
 use crate::task::Builtins;
 use crate::task::handle::JoinHandle;
 use crate::task::preparation::DeferredTask;
@@ -149,7 +149,7 @@ impl Scheduler {
         F: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        task::LocalWorker::with_scheduler(|current| {
+        asynchronous::LocalWorker::with_scheduler(|current| {
             let Some(current) = current else {
                 return Err(future_factory);
             };
@@ -401,8 +401,8 @@ mod tests {
         let registered = runtime
             .scheduler()
             .block_on(async |_| {
-                assert!(task::LocalWorker::is_current());
-                task::LocalWorker::has_scheduler_context()
+                assert!(asynchronous::LocalWorker::is_current());
+                asynchronous::LocalWorker::has_scheduler_context()
             })
             .unwrap();
 
@@ -440,7 +440,10 @@ mod tests {
         impl Drop for DropProbe {
             fn drop(&mut self) {
                 self.0
-                    .send((!task::LocalWorker::has_scheduler_context(), task::LocalWorker::is_current()))
+                    .send((
+                        !asynchronous::LocalWorker::has_scheduler_context(),
+                        asynchronous::LocalWorker::is_current(),
+                    ))
                     .unwrap();
             }
         }

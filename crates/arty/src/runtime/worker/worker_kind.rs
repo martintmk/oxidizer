@@ -31,7 +31,7 @@ impl WorkerKind {
 #[cfg_attr(coverage_nightly, coverage(off))] // Test scaffolding is not runtime behavior.
 mod tests {
     use super::*;
-    use crate::runtime::worker::task;
+    use crate::runtime::worker::asynchronous;
 
     thread_local! {
         static OWNER: Owner = const { Owner };
@@ -55,7 +55,7 @@ mod tests {
     fn marker_remains_accessible_after_destructible_worker_state() {
         std::thread::spawn(|| {
             OWNER.with(|_| {});
-            task::LocalWorker::attach();
+            asynchronous::LocalWorker::attach();
         })
         .join()
         .unwrap();

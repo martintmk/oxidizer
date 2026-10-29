@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Cooperative task worker execution loop.
+//! Asynchronous worker execution loop.
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -20,8 +20,8 @@ use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::config::MonitorOptions;
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
+use crate::runtime::worker::asynchronous::{Command, LocalWorker, Signal};
 use crate::runtime::worker::blocking;
-use crate::runtime::worker::task::{Command, LocalWorker, Signal};
 use crate::task::Builtins;
 
 const COMMANDS_PER_CYCLE: usize = 256;
@@ -351,8 +351,8 @@ mod tests {
     use crate::runtime::bootstrap::thread::WorkerJoiner;
     use crate::runtime::config::MonitorPolicy;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
+    use crate::runtime::worker::asynchronous::{QueuedFactory, QueuedIoAccess};
     use crate::runtime::worker::blocking::blocking_worker_tests::is_blocking_worker_shutting_down;
-    use crate::runtime::worker::task::{QueuedFactory, QueuedIoAccess};
     use crate::task::preparation::RemoteFutureFactory;
 
     fn test_blocking_worker() -> (Arc<blocking::Worker>, Shutdown) {
