@@ -29,11 +29,9 @@ use crate::task::RuntimeScheduler;
 /// diagnostics are still emitted; use [`stop`](Self::stop) to receive the
 /// shutdown outcome.
 ///
-/// On any asynchronous Arty worker or one of this runtime's blocking worker
-/// threads, including callback teardown, dropping the owner only requests
-/// shutdown and returns without waiting.
-/// The workers complete their cleanup independently; destruction in those
-/// contexts is not a shutdown-completion barrier.
+/// Dropping the owner on a task or blocking worker panics. Keep the owner on an
+/// external thread, and use [`RuntimeControl::request_stop`](crate::runtime::RuntimeControl::request_stop)
+/// from worker code.
 ///
 /// Worker-bound schedulers and [`Builtins`](crate::task::Builtins) do not keep
 /// the runtime running after its owner is dropped.
@@ -136,7 +134,6 @@ impl Runtime {
     ///
     /// Cancels pending async tasks and prevents queued blocking callbacks from
     /// starting. Already-running blocking callbacks are allowed to finish.
-    /// Shutdown is still requested when the calling context cannot wait.
     /// `Ok(())` means shutdown has completed. A calling-context error does not
     /// mean the workers have stopped.
     ///
@@ -146,16 +143,17 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if called from an async Arty worker or one of this
-    /// runtime's blocking worker threads, including callback teardown, because
-    /// those contexts cannot wait for shutdown. In those cases the owner is
-    /// consumed without waiting.
-    ///
-    /// Also returns an error if a worker panicked or an I/O driver failed during
+    /// Returns an error if a worker panicked or an I/O driver failed during
     /// initialization or cycle execution. Driver shutdown errors are reported
     /// through telemetry while shutdown continues. All workers are joined
     /// before reporting a failure; task failures must be observed through their
     /// own join handles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from an Arty task or blocking worker. Use
+    /// [`RuntimeControl::request_stop`](crate::runtime::RuntimeControl::request_stop)
+    /// to request shutdown from worker code.
     ///
     /// # Examples
     ///
@@ -175,18 +173,17 @@ impl Runtime {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn stop(mut self) -> Result<(), Error> {
+        if crate::runtime::worker::LocalWorker::is_worker_thread() {
+            _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
+            self.shutdown_on_drop = false;
+            panic_shutdown_from_worker("Runtime::stop");
+        }
         _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
         self.shutdown_on_drop = false;
         self.wait()
     }
 
     fn wait(&self) -> Result<(), Error> {
-        if crate::runtime::worker::task::LocalWorker::is_current() {
-            return Err(Error::shutdown_wait_from_worker());
-        }
-        if self.scheduler.dispatcher.is_current_blocking_thread() {
-            return Err(Error::shutdown_wait_from_blocking_callback());
-        }
         let wait_error = self.scheduler.dispatcher.wait().err();
         if let Some(error) = self.scheduler.dispatcher.shutdown().error() {
             return Err(Error::shutdown_failure(error));
@@ -209,15 +206,22 @@ impl Drop for Runtime {
         }
 
         _ = self.scheduler.dispatcher.stop(arty_executor::ShutdownCause::default());
-        // `wait` rejects self-waits from async workers and blocking callbacks;
-        // worker entry wrappers report any resulting failure.
+        if crate::runtime::worker::LocalWorker::is_worker_thread() {
+            if std::thread::panicking() {
+                return;
+            }
+            panic_shutdown_from_worker("Runtime drop");
+        }
         let _ = self.wait();
     }
 }
 
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod worker_wait_guards_tests;
+#[cold]
+#[inline(never)]
+#[expect(clippy::panic, reason = "runtime ownership on a worker is a programming error")]
+fn panic_shutdown_from_worker(operation: &str) -> ! {
+    panic!("{operation} cannot run on an Arty worker; use RuntimeControl::request_stop")
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -227,13 +231,13 @@ mod tests {
 
     use observed::Sink;
     use performables::sync::channel;
-    use testing_aids::TEST_TIMEOUT;
-    use thread_aware::{ThreadBuilder, Unaware};
+    use thread_aware::ThreadBuilder;
 
     use super::*;
-    use crate::runtime::bootstrap::thread::ThreadWaiter;
+    use crate::runtime::bootstrap::thread::WorkerJoiner;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
     use crate::runtime::worker::blocking::{PanicPolicy, Pool, Worker};
+    use crate::task::JoinError;
 
     #[test]
     fn explicit_stop_reports_a_worker_panic_after_joining() {
@@ -250,7 +254,7 @@ mod tests {
             ),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(vec![worker]),
+            WorkerJoiner::new(vec![worker]),
             nonempty::NonEmpty::new(endpoint),
             Sink::noop(),
             crate::runtime::shutdown::Shutdown::default(),
@@ -274,7 +278,7 @@ mod tests {
             ),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(vec![worker]),
+            WorkerJoiner::new(vec![worker]),
             nonempty::NonEmpty::new(endpoint),
             Sink::noop(),
             crate::runtime::shutdown::Shutdown::default(),
@@ -286,104 +290,78 @@ mod tests {
     }
 
     #[test]
-    fn blocking_callback_is_detected_before_waiting_for_shutdown() {
-        let runtime = Runtime::builder()
-            .workers(crate::runtime::WorkersPolicy::exactly(1))
-            .build()
-            .unwrap();
+    fn task_worker_stop_panics() {
+        let runtime = single_worker_runtime();
         let dispatcher = runtime.scheduler.dispatcher.clone();
+        let scheduler = worker_scheduler(&runtime);
 
-        assert!(
-            runtime
-                .scheduler()
-                .spawn_blocking(move || dispatcher.is_current_blocking_thread())
-                .join()
-                .unwrap()
-        );
+        let error = scheduler.spawn(async move |_| runtime.stop()).join().unwrap_err();
 
-        runtime.stop().unwrap();
+        assert_programming_error(error, "Runtime::stop");
+        dispatcher.wait().unwrap();
     }
 
     #[test]
-    fn dropping_the_owner_on_its_async_worker_requests_shutdown_without_unwinding() {
-        let runtime = Runtime::builder()
-            .workers(crate::runtime::WorkersPolicy::exactly(1))
-            .build()
-            .unwrap();
+    fn blocking_worker_stop_panics() {
+        let runtime = single_worker_runtime();
         let dispatcher = runtime.scheduler.dispatcher.clone();
-        let scheduler = runtime
+        let scheduler = worker_scheduler(&runtime);
+
+        let error = scheduler.spawn_blocking(move || runtime.stop()).join().unwrap_err();
+
+        assert_programming_error(error, "Runtime::stop");
+        dispatcher.wait().unwrap();
+    }
+
+    #[test]
+    fn task_worker_owner_drop_panics() {
+        let runtime = single_worker_runtime();
+        let dispatcher = runtime.scheduler.dispatcher.clone();
+        let scheduler = worker_scheduler(&runtime);
+
+        let error = scheduler.spawn(async move |_| drop(runtime)).join().unwrap_err();
+
+        assert_programming_error(error, "Runtime drop");
+        dispatcher.wait().unwrap();
+    }
+
+    #[test]
+    fn blocking_worker_owner_drop_panics() {
+        let runtime = single_worker_runtime();
+        let dispatcher = runtime.scheduler.dispatcher.clone();
+        let scheduler = worker_scheduler(&runtime);
+
+        let error = scheduler.spawn_blocking(move || drop(runtime)).join().unwrap_err();
+
+        assert_programming_error(error, "Runtime drop");
+        dispatcher.wait().unwrap();
+    }
+
+    fn assert_programming_error(error: JoinError, operation: &str) {
+        assert!(error.is_panic());
+        let panic = error.into_panic().expect("the join error was checked as a panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("runtime ownership panic uses a string payload");
+        assert!(message.contains(operation));
+        assert!(message.contains("RuntimeControl::request_stop"));
+    }
+
+    fn worker_scheduler(runtime: &Runtime) -> crate::task::Scheduler {
+        runtime
             .scheduler()
             .spawn_anywhere((), |cx, ()| async move { cx.scheduler().clone() })
             .join()
-            .unwrap();
-        assert!(
-            scheduler
-                .spawn(async |_| crate::runtime::worker::task::LocalWorker::is_current())
-                .join()
-                .unwrap()
-        );
-
-        scheduler.spawn(async move |_| drop(runtime)).join().unwrap();
-
-        assert_eq!(dispatcher.shutdown().state(), crate::runtime::ShutdownState::Started);
-        dispatcher.wait().unwrap();
-        assert!(scheduler.spawn(async |_| 42).join().unwrap_err().is_shutdown());
+            .unwrap()
     }
 
-    #[test]
-    fn dropping_the_owner_on_an_async_worker_does_not_wait_for_shutdown() {
-        let runtime = Runtime::builder()
+    fn single_worker_runtime() -> Runtime {
+        Runtime::builder()
             .workers(crate::runtime::WorkersPolicy::exactly(1))
+            .blocking_pool(crate::runtime::BlockingPoolPolicy::shared().max(1))
             .build()
-            .unwrap();
-        let dispatcher = runtime.scheduler.dispatcher.clone();
-        let scheduler = runtime
-            .scheduler()
-            .spawn_anywhere((), |cx, ()| async move { cx.scheduler().clone() })
-            .join()
-            .unwrap();
-        scheduler.spawn(async move |_| drop(runtime)).join().unwrap();
-        assert_eq!(dispatcher.shutdown().state(), crate::runtime::ShutdownState::Started);
-        dispatcher.wait().unwrap();
-    }
-
-    #[test]
-    fn dropping_another_runtime_on_a_worker_does_not_wait_for_blocking_work() {
-        let runtime = Runtime::builder()
-            .workers(crate::runtime::WorkersPolicy::exactly(1))
-            .build()
-            .unwrap();
-        let caller = Runtime::builder()
-            .workers(crate::runtime::WorkersPolicy::exactly(1))
-            .build()
-            .unwrap();
-        let dispatcher = runtime.scheduler.dispatcher.clone();
-        let (started, ready) = channel::unbounded();
-        let (release, released) = channel::unbounded();
-        let blocking = runtime.scheduler().spawn_blocking(move || {
-            started.send(()).unwrap();
-            released.recv_timeout(TEST_TIMEOUT).unwrap();
-            42
-        });
-        ready.recv_timeout(TEST_TIMEOUT).unwrap();
-        assert!(
-            caller
-                .scheduler()
-                .spawn_anywhere((), |_, ()| async { crate::runtime::worker::task::LocalWorker::is_current() })
-                .join()
-                .unwrap()
-        );
-
-        caller
-            .scheduler()
-            .spawn_anywhere(Unaware(runtime), |_, Unaware(runtime)| async move { drop(runtime) })
-            .join()
-            .unwrap();
-
-        assert_eq!(dispatcher.shutdown().state(), crate::runtime::ShutdownState::Started);
-        release.send(()).unwrap();
-        assert_eq!(blocking.join().unwrap(), 42);
-        dispatcher.wait().unwrap();
-        caller.stop().unwrap();
+            .unwrap()
     }
 }

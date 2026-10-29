@@ -18,7 +18,7 @@ use tick::runtime::InactiveClock;
 use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::PanicPolicy;
 use crate::runtime::bootstrap::pools::BlockingPools;
-use crate::runtime::bootstrap::thread::{ThreadWaiter, spawn};
+use crate::runtime::bootstrap::thread::{WorkerJoiner, spawn};
 use crate::runtime::config::{MonitorOptions, RuntimeConfig};
 use crate::runtime::dispatch::{DispatcherClient, DispatcherCore, WorkerEndpoint};
 use crate::runtime::error::Error;
@@ -125,7 +125,7 @@ fn build_with_processors(
 
     let runtime_sink = sink.clone();
     let dispatcher = DispatcherCore::new(
-        ThreadWaiter::new(task_worker_join_handles),
+        WorkerJoiner::new(task_worker_join_handles),
         NonEmpty::from_vec(task_worker_command_txs)
             .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
@@ -399,7 +399,7 @@ mod tests {
             blocking_worker,
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint),
             Sink::noop(),
             shutdown.clone(),
@@ -428,7 +428,7 @@ mod tests {
             blocking_worker,
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint),
             Sink::noop(),
             shutdown.clone(),

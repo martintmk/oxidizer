@@ -211,11 +211,6 @@ impl Worker {
         join_handle
     }
 
-    #[cfg_attr(test, mutants::skip)] // Removing this wait guard deadlocks runtime-owner teardown.
-    pub(crate) fn owns_current_thread(&self) -> bool {
-        LocalWorker::is_current_pool(&self.pool.identity)
-    }
-
     /// Waits for the currently running blocking tasks to complete.
     #[cfg_attr(test, mutants::skip)] // Impractical to test without overly-expensive timeout logic.
     pub(crate) fn join(&self) {

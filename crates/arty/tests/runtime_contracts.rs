@@ -366,7 +366,7 @@ fn scoped_borrowed_storage_is_destroyed_before_success_or_error() {
 }
 
 #[test]
-fn a_blocking_task_can_drop_its_runtime_without_joining_itself() {
+fn dropping_a_runtime_on_a_blocking_worker_panics() {
     for policy in [BlockingPoolPolicy::per_worker(), BlockingPoolPolicy::shared().max(1)] {
         let runtime = Runtime::builder()
             .workers(WorkersPolicy::exactly(1))
@@ -378,13 +378,8 @@ fn a_blocking_task_can_drop_its_runtime_without_joining_itself() {
             .spawn_anywhere((), |cx, ()| async move { cx.scheduler().clone() })
             .join()
             .unwrap();
-        let (finished, receive) = mpsc::channel();
-        let task = scheduler.spawn_blocking(move || {
-            drop(runtime);
-            finished.send(()).unwrap();
-        });
-        receive.recv_timeout(TEST_TIMEOUT).unwrap();
-        task.join().unwrap();
+        let error = scheduler.spawn_blocking(move || drop(runtime)).join().unwrap_err();
+        assert!(error.is_panic());
     }
 }
 

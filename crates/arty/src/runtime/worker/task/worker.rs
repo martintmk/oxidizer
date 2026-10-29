@@ -347,7 +347,7 @@ mod tests {
     use tick::ClockControl;
 
     use super::*;
-    use crate::runtime::bootstrap::thread::ThreadWaiter;
+    use crate::runtime::bootstrap::thread::WorkerJoiner;
     use crate::runtime::config::MonitorPolicy;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
     use crate::runtime::worker::blocking::blocking_worker_tests::is_blocking_worker_shutting_down;
@@ -600,7 +600,7 @@ mod tests {
             blocking_worker: Arc::clone(&blocking_worker),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint),
             sink.clone(),
             shutdown,

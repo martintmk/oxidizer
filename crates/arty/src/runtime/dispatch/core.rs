@@ -15,7 +15,7 @@ use performables::arc::Arc;
 use performables::sync::channel;
 use thread_aware::{Thread, ThreadAware};
 
-use crate::runtime::bootstrap::thread::ThreadWaiter;
+use crate::runtime::bootstrap::thread::WorkerJoiner;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::telemetry::events::{RuntimeStopped, RuntimeStopping};
 use crate::runtime::worker::blocking::Worker;
@@ -56,12 +56,11 @@ impl From<WorkerIndex> for usize {
 /// Commands are received as function calls to the dispatcher and delivered via message channels.
 #[derive(Debug)]
 pub(crate) struct DispatcherCore {
-    wait_for_shutdown: ThreadWaiter,
+    worker_joiner: WorkerJoiner,
 
     // Completion senders can publish the cause before dispatcher coordination.
     // This separate flag elects the one worker broadcaster.
     shutdown_signaled: AtomicBool,
-    stopped_reported: AtomicBool,
 
     worker_endpoints: NonEmpty<WorkerEndpoint>,
     workers: Workers,
@@ -82,7 +81,7 @@ pub(crate) struct DispatcherCore {
 
 impl DispatcherCore {
     pub(crate) fn new(
-        wait_for_shutdown: ThreadWaiter,
+        worker_joiner: WorkerJoiner,
         worker_endpoints: NonEmpty<WorkerEndpoint>,
         sink: observed::Sink,
         shutdown: Shutdown,
@@ -110,9 +109,8 @@ impl DispatcherCore {
             "each runtime worker must have a distinct thread ID"
         );
         Arc::new(Self {
-            wait_for_shutdown,
+            worker_joiner,
             shutdown_signaled: AtomicBool::new(false),
-            stopped_reported: AtomicBool::new(false),
             worker_endpoints,
             workers,
             worker_indices,
@@ -213,12 +211,6 @@ impl DispatcherCore {
     }
 
     #[cfg_attr(test, mutants::skip)] // Removing this wait guard deadlocks runtime-owner teardown.
-    pub(crate) fn is_current_blocking_thread(&self) -> bool {
-        self.worker_endpoints
-            .iter()
-            .any(|endpoint| endpoint.blocking_worker.owns_current_thread())
-    }
-
     pub(crate) fn next_blocking_worker(&self) -> Arc<Worker> {
         self.blocking_worker(self.next_worker_index())
     }
@@ -292,12 +284,9 @@ impl DispatcherCore {
 
     /// Waits for the runtime to shut down and all worker threads to exit.
     ///
-    /// Safe to call multiple times.
     pub(crate) fn join(&self) -> Result<(), Error> {
-        let outcome = self.wait_for_shutdown.wait();
-        if !self.stopped_reported.swap(true, Ordering::Relaxed) {
-            emit!(&self.sink, RuntimeStopped);
-        }
+        let outcome = self.worker_joiner.join();
+        emit!(&self.sink, RuntimeStopped);
         outcome
     }
 }
@@ -336,7 +325,7 @@ mod tests {
         let (second_tx, _second_rx) = channel::unbounded();
 
         DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::from_vec(vec![endpoint(first_tx, &first), endpoint(second_tx, &second)]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
@@ -348,7 +337,7 @@ mod tests {
         // We dispatch two tasks to the only worker.
 
         let (worker_tx, worker_rx) = channel::unbounded();
-        let wfs = ThreadWaiter::new(Vec::new());
+        let wfs = WorkerJoiner::new(Vec::new());
         let threads = test_threads(1);
 
         let dispatcher = DispatcherCore::new(
@@ -375,7 +364,7 @@ mod tests {
 
         let (worker1_tx, worker1_rx) = channel::unbounded();
         let (worker2_tx, worker2_rx) = channel::unbounded();
-        let wfs = ThreadWaiter::new(Vec::new());
+        let wfs = WorkerJoiner::new(Vec::new());
         let threads = test_threads(2);
 
         let dispatcher = DispatcherCore::new(
@@ -397,7 +386,7 @@ mod tests {
     fn round_robin_repeats_without_resetting() {
         let (worker1_tx, worker1_rx) = channel::unbounded();
         let (worker2_tx, worker2_rx) = channel::unbounded();
-        let wfs = ThreadWaiter::new(Vec::new());
+        let wfs = WorkerJoiner::new(Vec::new());
         let threads = test_threads(2);
 
         let dispatcher = DispatcherCore::new(
@@ -421,7 +410,7 @@ mod tests {
         let (first_tx, first_rx) = channel::unbounded();
         let (second_tx, second_rx) = channel::unbounded();
         let dispatcher = DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::from_vec(vec![endpoint(first_tx, &threads[0]), endpoint(second_tx, &threads[1])]).unwrap(),
             observed::Sink::noop(),
             Shutdown::default(),
@@ -438,7 +427,7 @@ mod tests {
         let threads = test_threads(2);
         let (tx, _rx) = channel::unbounded();
         let dispatcher = DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
@@ -452,7 +441,7 @@ mod tests {
         let (tx, _rx) = channel::unbounded();
         let threads = test_threads(1);
         let core = DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
@@ -470,7 +459,7 @@ mod tests {
         let (tx, rx) = channel::unbounded();
         let threads = test_threads(1);
         let dispatcher = DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
@@ -500,7 +489,7 @@ mod tests {
         let (tx, _rx) = channel::unbounded();
         let threads = test_threads(1);
         let dispatcher = DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint(tx, &threads[0])),
             observed::Sink::noop(),
             Shutdown::default(),
@@ -524,7 +513,7 @@ mod tests {
     fn dispatcher_stop_sends_one_stop_command_to_each_worker() {
         let (worker1_tx, worker1_rx) = channel::unbounded();
         let (worker2_tx, worker2_rx) = channel::unbounded();
-        let wfs = ThreadWaiter::new(Vec::new());
+        let wfs = WorkerJoiner::new(Vec::new());
         let threads = test_threads(2);
 
         let dispatcher = DispatcherCore::new(
@@ -555,7 +544,7 @@ mod tests {
         // we ignore any further spawn requests (they simply return disconnected join handles).
 
         let (worker_tx, worker_rx) = channel::unbounded();
-        let wfs = ThreadWaiter::new(Vec::new());
+        let wfs = WorkerJoiner::new(Vec::new());
         let threads = test_threads(1);
 
         let dispatcher = DispatcherCore::new(
@@ -588,7 +577,7 @@ mod tests {
         let thread = test_threads(1).remove(0);
         let shutdown = Shutdown::default();
         let core = DispatcherCore::new(
-            ThreadWaiter::new(Vec::new()),
+            WorkerJoiner::new(Vec::new()),
             NonEmpty::new(endpoint(tx, &thread)),
             observed::Sink::noop(),
             shutdown.clone(),

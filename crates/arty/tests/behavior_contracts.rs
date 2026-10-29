@@ -15,7 +15,7 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use arty::runtime::{BlockingPoolPolicy, Runtime, WorkersPolicy};
+use arty::runtime::{BlockingPoolPolicy, PanicPolicy, Runtime, WorkersPolicy};
 use arty::task::{Builtins, Scheduler};
 use arty::time::Clock;
 #[cfg(feature = "macros")]
@@ -160,11 +160,7 @@ fn construction_and_shutdown_work_inside_a_futures_executor() {
 }
 
 #[test]
-#[cfg_attr(
-    miri,
-    ignore = "self-stop intentionally returns before the worker can finish; native and careful suites retain the guard contract"
-)]
-fn explicit_stop_on_an_async_worker_returns_an_error_without_unwinding() {
+fn explicit_stop_on_a_task_worker_panics() {
     completes_without_deadlock(|| {
         let runtime = runtime(1);
         let scheduler = worker_scheduler(&runtime);
@@ -174,21 +170,21 @@ fn explicit_stop_on_an_async_worker_returns_an_error_without_unwinding() {
                 .join()
                 .unwrap()
         );
-        let outcome = scheduler.spawn(async move |_| runtime.stop()).join().unwrap();
-        assert!(outcome.unwrap_err().to_string().contains("async Arty worker"));
+        let error = scheduler.spawn(async move |_| runtime.stop()).join().unwrap_err();
+        assert!(error.is_panic());
     });
 }
 
 #[test]
-fn explicit_stop_in_its_blocking_callback_returns_an_error_without_self_joining() {
+fn explicit_stop_on_a_blocking_worker_panics() {
     let runtime = runtime(1);
     let scheduler = worker_scheduler(&runtime);
     assert_ne!(
         scheduler.spawn_blocking(|| thread::current().id()).join().unwrap(),
         scheduler.spawn(async |_| thread::current().id()).join().unwrap()
     );
-    let outcome = scheduler.spawn_blocking(move || runtime.stop()).join().unwrap();
-    assert!(outcome.unwrap_err().to_string().contains("blocking callback"));
+    let error = scheduler.spawn_blocking(move || runtime.stop()).join().unwrap_err();
+    assert!(error.is_panic());
 }
 
 #[test]
@@ -403,9 +399,13 @@ fn stopping_one_runtime_does_not_stop_another() {
 }
 
 #[test]
-fn dropping_another_runtime_from_a_worker_does_not_wait_for_its_blocking_callback() {
+fn dropping_another_runtime_from_a_worker_panics() {
     let target = runtime(1);
-    let caller = runtime(1);
+    let caller = Runtime::builder()
+        .workers(WorkersPolicy::exactly(1))
+        .panic(PanicPolicy::ignore())
+        .build()
+        .unwrap();
     let retained = worker_scheduler(&target);
     let (started, ready) = mpsc::channel();
     let (release, gate) = mpsc::channel();
@@ -415,11 +415,12 @@ fn dropping_another_runtime_from_a_worker_does_not_wait_for_its_blocking_callbac
         42
     });
     ready.recv_timeout(TEST_TIMEOUT).unwrap();
-    caller
+    let error = caller
         .scheduler()
         .spawn_anywhere(Unaware(target), |_, Unaware(target)| async move { drop(target) })
         .join()
-        .unwrap();
+        .unwrap_err();
+    assert!(error.is_panic());
     assert!(retained.spawn(async |_| 42).join().unwrap_err().is_shutdown());
     release.send(()).unwrap();
     assert_eq!(callback.join().unwrap(), 42);

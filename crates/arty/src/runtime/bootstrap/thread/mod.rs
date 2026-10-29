@@ -3,8 +3,8 @@
 
 //! Runtime worker OS-thread lifecycle and joining.
 
-mod lifecycle;
-mod waiter;
+mod joiner;
+mod spawn;
 
-pub(super) use lifecycle::spawn;
-pub(crate) use waiter::ThreadWaiter;
+pub(crate) use joiner::WorkerJoiner;
+pub(super) use spawn::spawn;

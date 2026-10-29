@@ -29,15 +29,15 @@ owns the complete endpoint set and maps runtime thread IDs to worker indexes.
 `DispatcherClient` is the cloneable capability used by schedulers and workers;
 it does not own a separate runtime or worker set.
 
-`Runtime` owns the dispatcher and the worker-shutdown waiter. Scheduler,
+`Runtime` owns the dispatcher and the worker joiner. Scheduler,
 `Builtins`, join, clock, and control handles can outlive individual tasks,
 but they do not keep the runtime running. `Runtime::stop` and `Runtime::drop`
-request shutdown through the dispatcher; the waiter joins async workers, and
+request shutdown through the dispatcher; the joiner joins task workers, and
 each worker closes its blocking queue and joins every owned blocking thread
 before its own thread exits. Blocking task completion alone is not a shutdown
 barrier because a pool thread may still be running thread-local destructors.
-Blocking-thread membership remains registered through those destructors so a
-runtime owner released there requests shutdown without waiting on itself.
+The runtime owner must stay on an external thread. Stopping or dropping it on
+a task or blocking worker panics.
 
 ### Relocated result delivery
 
@@ -54,19 +54,14 @@ Runtime-wide submissions use the ordinary path and do not register result
 relocation. See the [scheduling guide](../src/documentation/scheduling.rs) for
 the public contract.
 
-### Shutdown guard tests
+### Worker-side owner tests
 
-Tests that consume or drop a runtime owner on an async worker must retain a
-dispatcher on the test thread and call its `wait` method after the worker-side
-operation. Joining a task or a different runtime does not join that runtime's
-workers. Cancellation can also destroy captured runtime owners on the worker,
-so each nested runtime needs its own completion barrier.
+Tests that stop or drop a runtime owner on a worker retain a private dispatcher
+on the test thread. The worker operation must panic and request shutdown. The
+test then uses the dispatcher to join the worker and confirm cleanup.
 
-The consuming-owner cases live in `runtime/handle/worker_wait_guards_tests.rs`
-because the public API does not expose a completion handle after consuming the owner.
-The public cancellation test retains its runtime owner outside the cancelled
-task and calls `stop` from the test thread. Both forms keep the worker wait
-guards active and join every runtime before returning.
+These cases live in `runtime/handle/worker_shutdown_panics_tests.rs`. Public
+tests confirm the panic contract without using the private completion handle.
 
 ## Worker command lifecycle
 

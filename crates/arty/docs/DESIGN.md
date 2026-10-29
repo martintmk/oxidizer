@@ -79,10 +79,10 @@ join handle neither cancels its task nor waits for it.
 
 `Builtins::control()` is the only source of `RuntimeControl`.
 `RuntimeControl::request_stop` requests shutdown without waiting.
-`Runtime::stop` consumes the owner, normally waits, and reports shutdown errors.
-Dropping the owner also requests shutdown and normally waits, but cannot return
-errors. Neither waits when called from an async Arty worker or the runtime's own
-blocking callback. `stop` returns an error in those contexts.
+`Runtime::stop` consumes the owner, waits, and reports shutdown errors.
+Dropping the owner also requests shutdown and waits, but cannot return errors.
+Both operations panic on task and blocking workers. Keep the owner on an
+external thread and use `RuntimeControl::request_stop` from worker code.
 
 Shutdown rejects new submissions and cancels unfinished async tasks on their
 worker. Rejected factories and queued blocking callbacks do not run.

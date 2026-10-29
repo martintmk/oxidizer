@@ -47,7 +47,7 @@ impl DispatcherClient {
             ),
         };
         Self::new(DispatcherCore::new(
-            crate::runtime::bootstrap::thread::ThreadWaiter::new(Vec::new()),
+            crate::runtime::bootstrap::thread::WorkerJoiner::new(Vec::new()),
             nonempty::NonEmpty::new(endpoint),
             observed::Sink::noop(),
             shutdown,
@@ -83,10 +83,6 @@ impl DispatcherClient {
     }
 
     #[cfg_attr(test, mutants::skip)] // Removing this wait guard deadlocks runtime-owner teardown.
-    pub(crate) fn is_current_blocking_thread(&self) -> bool {
-        self.core.is_current_blocking_thread()
-    }
-
     /// Submits to a previously resolved worker without discarding destination affinity.
     pub(crate) fn spawn_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
@@ -133,8 +129,8 @@ impl DispatcherClient {
         self.core.stop_inner(cause.into())
     }
 
-    // Impractical to test real waiting at this API layer. We test the real waiter implementation
-    // but not the API layers that simply call the waiter, as it is hard to prove the wait failed.
+    // Impractical to test real joining at this API layer. WorkerJoiner tests the
+    // operation; this method only delegates to it.
     #[cfg_attr(test, mutants::skip)]
     pub(crate) fn wait(&self) -> Result<(), Error> {
         self.core.join()
@@ -160,7 +156,7 @@ mod tests {
     use thread_aware::Thread;
 
     use super::*;
-    use crate::runtime::bootstrap::thread::ThreadWaiter;
+    use crate::runtime::bootstrap::thread::WorkerJoiner;
     use crate::runtime::dispatch::{WorkerEndpoint, test_threads};
     use crate::runtime::worker::blocking::{PanicPolicy, Pool};
     use crate::task::scheduler::Scheduler;
@@ -175,7 +171,7 @@ mod tests {
             blocking_worker: Worker::new(Pool::new(None), Sink::noop(), Shutdown::default(), PanicPolicy::Ignore),
         };
         let client = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(vec![]),
+            WorkerJoiner::new(vec![]),
             nonempty::NonEmpty::new(worker),
             Sink::noop(),
             Shutdown::default(),
@@ -193,7 +189,7 @@ mod tests {
         // Create a dispatcher with 2 workers so we can verify which one receives tasks.
         let (worker0_tx, worker0_rx) = channel::unbounded();
         let (worker1_tx, worker1_rx) = channel::unbounded();
-        let wfs = ThreadWaiter::new(vec![]);
+        let wfs = WorkerJoiner::new(vec![]);
         let threads = test_threads(2);
         let blocking_worker = Worker::new(Pool::new(None), Sink::noop(), Shutdown::default(), PanicPolicy::Ignore);
 
@@ -245,7 +241,7 @@ mod tests {
         destination_shutdown.begin(ShutdownCause::default());
 
         let dispatcher = DispatcherCore::new(
-            ThreadWaiter::new(vec![]),
+            WorkerJoiner::new(vec![]),
             nonempty::NonEmpty::from_vec(vec![
                 WorkerEndpoint {
                     command_tx: channel::unbounded().0,
@@ -329,7 +325,7 @@ mod tests {
             blocking_worker: Worker::new(Pool::new(None), Sink::noop(), Shutdown::default(), PanicPolicy::Ignore),
         };
         let dispatcher = DispatcherClient::new(DispatcherCore::new(
-            ThreadWaiter::new(vec![]),
+            WorkerJoiner::new(vec![]),
             nonempty::NonEmpty::new(worker),
             Sink::noop(),
             Shutdown::default(),
