@@ -5,7 +5,7 @@
 
 use std::future::poll_fn;
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arty_executor::{CycleOutcome, Executor, ShutdownCause, TaskCompletion, TaskOptions, TaskPanicPayload, discard_task_panic_payload};
 use tick::ClockControl;
@@ -86,15 +86,25 @@ fn completion_timestamp_reuses_the_cycle_end_sample() {
 }
 
 #[test]
-fn default_clock_returns_a_system_timestamp() {
-    let mut executor = Executor::builder().build();
-    let before = Instant::now();
-    let (outcome, now) = executor.execute_cycle();
-    let after = Instant::now();
+fn completion_clock_wake_prevents_suspend() {
+    let control = ClockControl::new();
+    let task_clock = control.to_clock();
+    let clock = task_clock.simple_clock().clone();
+    let control = control.auto_advance(Duration::from_secs(1));
+    let mut executor = Executor::builder().clock(clock).build();
+    executor.tasks().add(
+        async move {
+            task_clock.delay(Duration::from_secs(1)).await;
+        },
+        TaskOptions::default(),
+        DiscardCompletion,
+    );
 
+    let (outcome, _) = executor.execute_cycle();
+    assert!(matches!(outcome, CycleOutcome::Continue));
+
+    let _control = control.auto_advance(Duration::ZERO);
+    let (outcome, _) = executor.execute_cycle();
     assert!(matches!(outcome, CycleOutcome::Suspend));
-    // The default clock can be coarse on Linux and Windows.
-    let tolerance = Duration::from_millis(100);
-    assert!(now >= before.checked_sub(tolerance).unwrap());
-    assert!(now <= after + tolerance);
+    assert!(!executor.has_tasks());
 }

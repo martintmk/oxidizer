@@ -15,7 +15,7 @@ use performables::sync::mutex::Mutex;
 
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::telemetry::events::{BlockingWorkerPoolMode, BlockingWorkerPoolSaturated, SystemMetricCount};
-use crate::runtime::worker::blocking::{LocalWorker, PanicPolicy};
+use crate::runtime::worker::blocking::{LocalWorker, PanicPolicy, PoolIdentity};
 use crate::task::handle::{JoinHandle, JoinHandlePool};
 use crate::task::preparation::prepare_blocking;
 
@@ -23,7 +23,7 @@ const ERR_POISONED_LOCK: &str = "poisoned lock - cannot continue execution becau
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-fn attach_thread(pool: Arc<()>) {
+fn attach_thread(pool: PoolIdentity) {
     LocalWorker::attach(pool);
 }
 
@@ -31,14 +31,14 @@ fn attach_thread(pool: Arc<()>) {
 struct JoinableThreadPool {
     jobs: Option<channel::Sender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
-    identity: Arc<()>,
+    identity: PoolIdentity,
     receiver: channel::Receiver<Job>,
     queued_count: Arc<std::sync::atomic::AtomicUsize>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl JoinableThreadPool {
-    fn new(thread_count: usize, identity: Arc<()>) -> Self {
+    fn new(thread_count: usize, identity: PoolIdentity) -> Self {
         let (jobs, receiver) = channel::unbounded();
         let mut pool = Self {
             jobs: Some(jobs),
@@ -221,7 +221,7 @@ impl Worker {
 #[derive(Debug, Clone)]
 pub(crate) struct Pool {
     inner: Arc<Mutex<Option<JoinableThreadPool>>>,
-    identity: Arc<()>,
+    identity: PoolIdentity,
     saturation_reported: Arc<AtomicBool>,
     max_thread_count: NonZeroUsize,
     mode: &'static str,

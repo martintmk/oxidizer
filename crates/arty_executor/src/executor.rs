@@ -150,9 +150,10 @@ impl Executor {
         self.accept_new_tasks();
         self.activate_awakened_tasks();
         self.poll_active_tasks();
+        let cycle_finished = self.clock.instant();
         self.cancel_if_shutting_down();
         let outcome = self.cycle_outcome();
-        let cycle_finished = self.finish_cycle(cycle_started);
+        self.finish_cycle(cycle_started, cycle_finished);
         (outcome, cycle_finished)
     }
 
@@ -166,14 +167,12 @@ impl Executor {
         started
     }
 
-    fn finish_cycle(&mut self, started: Instant) -> Instant {
-        let ended = self.clock.instant();
+    fn finish_cycle(&mut self, started: Instant, ended: Instant) {
         self.last_cycle_ended = Some(ended);
         CYCLE_DURATION_MILLIS.with(|event| {
             event.observe_millis(ended.saturating_duration_since(started));
         });
         EXECUTOR_PUSHER.with(MetricsPusher::push);
-        ended
     }
 
     fn accept_new_tasks(&mut self) {

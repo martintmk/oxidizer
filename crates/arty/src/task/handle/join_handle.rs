@@ -6,12 +6,11 @@ use std::task::{self, Poll};
 
 use arty_executor::ShutdownCause;
 use events_once::PooledReceiver;
-use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
 
 use super::JoinError;
 use crate::runtime::Shutdown;
-use crate::runtime::worker::blocking::LocalWorker as BlockingLocalWorker;
+use crate::runtime::worker::blocking::{LocalWorker as BlockingLocalWorker, PoolIdentity};
 use crate::runtime::worker::task::LocalWorker as TaskLocalWorker;
 
 /// A handle for receiving an async or blocking task's result.
@@ -58,7 +57,7 @@ where
 {
     #[debug(ignore)]
     state: State<R>,
-    blocking_pool: Option<Arc<()>>,
+    blocking_pool: Option<PoolIdentity>,
     #[debug(ignore)]
     relocation: Option<ResultRelocation<R>>,
 }
@@ -130,7 +129,7 @@ where
         }
     }
 
-    pub(crate) fn blocking_pool(mut self, pool: Arc<()>) -> Self {
+    pub(crate) fn blocking_pool(mut self, pool: PoolIdentity) -> Self {
         self.blocking_pool = Some(pool);
         self
     }
@@ -154,7 +153,7 @@ where
 }
 
 #[cfg_attr(test, mutants::skip)] // Removing this guard makes the black-box blocking-pool regression deadlock.
-fn assert_not_current_blocking_pool(blocking_pool: Option<&Arc<()>>) {
+fn assert_not_current_blocking_pool(blocking_pool: Option<&PoolIdentity>) {
     assert!(
         !blocking_pool.is_some_and(BlockingLocalWorker::is_current_pool),
         "blocking JoinHandle cannot be polled while the current blocking pool waits for it"

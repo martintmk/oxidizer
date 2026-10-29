@@ -17,7 +17,6 @@ use tick::runtime::InactiveClock;
 
 use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::PanicPolicy;
-use crate::runtime::bootstrap::pools::BlockingPools;
 use crate::runtime::bootstrap::thread::{WorkerJoiner, spawn};
 use crate::runtime::config::{MonitorOptions, RuntimeConfig};
 use crate::runtime::dispatch::{DispatcherClient, DispatcherCore, WorkerEndpoint};
@@ -172,7 +171,7 @@ struct TaskWorkerStartInfo {
     worker_index: usize,
     worker_endpoint_tx: Sender<(Waker, Thread, Arc<blocking::Worker>)>,
     thread_builder: ThreadBuilder,
-    blocking_pools: BlockingPools,
+    blocking_pools: blocking::Pools,
     shutdown: Shutdown,
     io_runtime: IoRuntime,
     sink: Sink,

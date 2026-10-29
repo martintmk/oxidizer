@@ -26,8 +26,8 @@ use crate::task::Builtins;
 
 const COMMANDS_PER_CYCLE: usize = 256;
 
-fn suspend_wait(deadline: Instant, now: Instant) -> Duration {
-    deadline.saturating_duration_since(now)
+fn suspend_wait(deadline: Instant, fast_now: Instant, precise_now: Instant) -> Duration {
+    deadline.saturating_duration_since(fast_now.max(precise_now))
 }
 
 fn can_suspend(cycle_outcome: &CycleOutcome, batch_exhausted: bool) -> bool {
@@ -232,7 +232,7 @@ impl Worker {
     }
 
     fn wait_until(&self, deadline: Instant) -> Duration {
-        suspend_wait(deadline, self.cycle_clock.instant())
+        suspend_wait(deadline, self.cycle_clock.instant(), Instant::now())
     }
 
     fn finish_shutdown(&mut self) -> ControlFlow<()> {
@@ -378,17 +378,21 @@ mod tests {
     }
 
     #[test]
-    fn private_suspend_wait_uses_the_exact_timer_deadline() {
+    fn private_suspend_wait_bounds_a_lagging_fast_clock_with_precise_time() {
         // The exact wait calculation is private worker-loop policy; public timer wake and
         // completion behavior is covered by integration tests in `tests/time.rs`.
         let now = Instant::now();
 
-        assert_eq!(suspend_wait(now + Duration::from_secs(2), now), Duration::from_secs(2));
-        assert_eq!(suspend_wait(now + Duration::from_millis(20), now), Duration::from_millis(20));
+        assert_eq!(
+            suspend_wait(now + Duration::from_secs(2), now, now + Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(suspend_wait(now + Duration::from_millis(20), now, now), Duration::from_millis(20));
         assert_eq!(
             suspend_wait(
                 now.checked_sub(Duration::from_millis(1))
                     .expect("the current instant supports a 1 ms subtraction"),
+                now,
                 now
             ),
             Duration::ZERO

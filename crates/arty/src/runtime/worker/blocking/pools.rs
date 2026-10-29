@@ -7,12 +7,12 @@ use crate::runtime::worker::blocking::Pool;
 
 /// Resolves whether workers share their blocking-task pool.
 #[derive(Debug, Clone)]
-pub(crate) enum BlockingPools {
+pub(crate) enum Pools {
     Shared(Pool),
     PerWorker(Option<NonZeroUsize>),
 }
 
-impl BlockingPools {
+impl Pools {
     pub(crate) const fn per_worker(max_workers: Option<NonZeroUsize>) -> Self {
         Self::PerWorker(max_workers)
     }
@@ -21,7 +21,7 @@ impl BlockingPools {
         Self::Shared(Pool::new_with_mode(max_workers, "shared"))
     }
 
-    pub(super) fn build_worker(&self) -> Pool {
+    pub(crate) fn build_worker(&self) -> Pool {
         match self {
             Self::Shared(pool) => pool.clone(),
             Self::PerWorker(max_workers) => Pool::new_with_mode(*max_workers, "per_worker"),
@@ -36,13 +36,13 @@ mod tests {
 
     #[test]
     fn shared_policy_reuses_the_same_blocking_pool() {
-        let pools = BlockingPools::shared(NonZeroUsize::new(1));
+        let pools = Pools::shared(NonZeroUsize::new(1));
         assert!(pools.build_worker().shares_pool_with(&pools.build_worker()));
     }
 
     #[test]
     fn per_worker_policy_creates_independent_blocking_pools() {
-        let pools = BlockingPools::per_worker(NonZeroUsize::new(1));
+        let pools = Pools::per_worker(NonZeroUsize::new(1));
         assert!(!pools.build_worker().shares_pool_with(&pools.build_worker()));
     }
 }

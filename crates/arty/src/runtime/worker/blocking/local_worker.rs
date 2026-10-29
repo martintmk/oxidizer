@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use performables::arc::Arc;
 
 use crate::runtime::worker;
+use crate::runtime::worker::blocking::PoolIdentity;
 
 thread_local! {
     static CURRENT: RefCell<Option<LocalWorker>> = const { RefCell::new(None) };
@@ -14,11 +15,11 @@ thread_local! {
 /// Blocking pool identity attached to each pool thread.
 #[derive(Debug)]
 pub(crate) struct LocalWorker {
-    pool: Arc<()>,
+    pool: PoolIdentity,
 }
 
 impl LocalWorker {
-    pub(crate) fn attach(pool: Arc<()>) {
+    pub(crate) fn attach(pool: PoolIdentity) {
         assert!(
             !worker::LocalWorker::is_worker_thread(),
             "a local worker is already attached to this thread"
@@ -29,11 +30,11 @@ impl LocalWorker {
         });
     }
 
-    fn owns_pool(&self, pool: &Arc<()>) -> bool {
+    fn owns_pool(&self, pool: &PoolIdentity) -> bool {
         Arc::ptr_eq(&self.pool, pool)
     }
 
-    pub(crate) fn is_current_pool(pool: &Arc<()>) -> bool {
+    pub(crate) fn is_current_pool(pool: &PoolIdentity) -> bool {
         Self::with_current(|current| current.is_some_and(|current| current.owns_pool(pool)))
     }
 

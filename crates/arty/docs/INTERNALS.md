@@ -74,8 +74,8 @@ unsafe executor storage is dropped.
 
 Each worker cycle selects one next action after command processing, task polling,
 and timer advancement. The action can poll again, wait in the primary I/O
-driver, wait for a worker signal, or finish shutdown. All actions still execute
-secondary I/O drivers before the primary driver.
+driver, wait for a worker signal, or finish shutdown. All non-shutdown actions
+still execute secondary I/O drivers before the primary driver.
 
 The executor and worker wait budgets use the fast system clock. The worker
 reuses the executor's cycle-end sample directly for system timer advancement, so

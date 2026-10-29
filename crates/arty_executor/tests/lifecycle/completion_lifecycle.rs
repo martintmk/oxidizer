@@ -686,6 +686,23 @@ fn caused_shutdown_is_attached_to_cancelled_and_rejected_tasks() {
 }
 
 #[test]
+fn shutdown_requested_during_poll_cancels_the_pending_task() {
+    let mut executor = Executor::builder().build();
+    let shutdown = executor.shutdown();
+    let mut completion = executor.tasks().add_test(
+        poll_fn(move |_| {
+            shutdown.trigger(ShutdownCause::default());
+            Poll::Pending::<()>
+        }),
+        TaskOptions::default(),
+    );
+
+    assert!(matches!(executor.execute_cycle().0, CycleOutcome::Shutdown(_)));
+    assert!(!executor.has_tasks());
+    poll_cancelled(&mut completion);
+}
+
+#[test]
 fn clean_shutdown_remains_authoritative_for_rejected_tasks() {
     let executor = Executor::builder().build();
     let tasks = executor.tasks();
