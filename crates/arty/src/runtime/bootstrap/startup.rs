@@ -56,11 +56,11 @@ fn build_with_processors(
     })?;
     let processors_used = processors.processors_used();
 
-    let mut task_worker_command_txs = Vec::with_capacity(processors.len());
-    let mut task_worker_start_txs = Vec::with_capacity(processors.len());
-    let mut task_worker_success_rxs = Vec::with_capacity(processors.len());
+    let mut command_txs = Vec::with_capacity(processors.len());
+    let mut start_txs = Vec::with_capacity(processors.len());
+    let mut success_rxs = Vec::with_capacity(processors.len());
 
-    let mut task_worker_join_handles = Vec::with_capacity(processors.len());
+    let mut join_handles = Vec::with_capacity(processors.len());
 
     // Respect the RUST_MIN_STACK environment variable if set and larger than the configured stack size.
     let stack_size = processor_config
@@ -87,9 +87,9 @@ fn build_with_processors(
         let (start_tx, start_rx) = channel::oneshot();
         let (success_tx, success_rx) = channel::unbounded();
 
-        task_worker_start_txs.push(start_tx);
+        start_txs.push(start_tx);
 
-        task_worker_join_handles.push(
+        join_handles.push(
             TaskWorkerStartInfo {
                 command_rx,
                 stack_size,
@@ -113,27 +113,26 @@ fn build_with_processors(
         let (waker, thread, blocking_worker) = worker_endpoint_rx
             .recv()
             .expect("failed to receive the worker endpoint from the starting worker");
-        task_worker_command_txs.push(WorkerEndpoint {
+        command_txs.push(WorkerEndpoint {
             command_tx,
             waker,
             thread,
             blocking_worker,
         });
-        task_worker_success_rxs.push(success_rx);
+        success_rxs.push(success_rx);
     }
 
     let runtime_sink = sink.clone();
     let dispatcher = DispatcherCore::new(
-        WorkerJoiner::new(task_worker_join_handles),
-        NonEmpty::from_vec(task_worker_command_txs)
-            .expect("the number is either hardcoded or validated in the builder, so can never be zero"),
+        WorkerJoiner::new(join_handles),
+        NonEmpty::from_vec(command_txs).expect("the number is either hardcoded or validated in the builder, so can never be zero"),
         sink,
         shutdown,
     );
 
     let dispatcher_client = DispatcherClient::new(dispatcher);
 
-    for start_tx in task_worker_start_txs {
+    for start_tx in start_txs {
         start_tx
             .send(StartWorker {
                 dispatcher: dispatcher_client.clone(),
@@ -141,7 +140,7 @@ fn build_with_processors(
             .expect("a starting worker retains its start receiver");
     }
 
-    for success_rx in task_worker_success_rxs {
+    for success_rx in success_rxs {
         success_rx.recv().expect("failed to receive worker startup signal");
     }
 
