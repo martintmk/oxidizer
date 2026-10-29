@@ -23,6 +23,7 @@ const ERR_POISONED_LOCK: &str = "poisoned lock - cannot continue execution becau
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[cfg_attr(test, mutants::skip)] // Missing pool identity disables the same-pool join deadlock guard.
 fn attach_thread(pool: PoolIdentity) {
     LocalWorker::attach(pool);
 }

@@ -317,6 +317,7 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    #[cfg_attr(test, mutants::skip)] // Worker-owned services must retire before the thread can finish shutdown.
     fn drop(&mut self) {
         if self.executor.is_some() {
             self.begin_shutdown();

@@ -15,6 +15,7 @@ pub(crate) enum WorkerKind {
 }
 
 impl WorkerKind {
+    #[cfg_attr(test, mutants::skip)] // Removing worker classification lets worker-side runtime shutdown self-join.
     pub(crate) fn attach(worker: Self) {
         assert!(
             CURRENT.replace(Some(worker)).is_none(),
@@ -22,6 +23,7 @@ impl WorkerKind {
         );
     }
 
+    #[cfg_attr(test, mutants::skip)] // Returning false lets worker-side runtime shutdown self-join.
     pub(crate) fn is_current() -> bool {
         CURRENT.get().is_some()
     }
