@@ -1,36 +1,40 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Task placement, worker-local futures, and result handles.
+//! Starting tasks, choosing workers, and receiving results.
 //!
-//! [`RuntimeScheduler`] submits work from outside the runtime and lets the
-//! runtime select a worker. [`Scheduler`] stays bound to one worker and keeps
-//! ordinary child tasks there. [`Scheduler::spawn_at`] targets a worker from
+//! [`RuntimeScheduler`] submits tasks from outside the runtime and lets the
+//! runtime select a worker. [`Scheduler`] sends tasks to one worker and keeps
+//! ordinary child tasks there. [`Scheduler::spawn_at`] selects a worker from
 //! [`RuntimeControl::workers`](crate::runtime::RuntimeControl::workers).
 //!
-//! Task APIs accept factories instead of created futures. Arty calls the
-//! factory on the destination worker. The future can then keep non-[`Send`]
-//! state across awaits. Values that cross the submission boundary must meet the
-//! bounds documented by the selected method.
+//! A task factory is a function that creates a future.
+//! Task APIs accept these factories instead of futures you already created.
+//! Arty calls the factory on the selected worker.
+//! The future can then keep non-[`Send`] state across awaits.
+//! Values sent to a task must meet the trait requirements listed by the method.
 //!
-//! [`Scheduler::spawn_anywhere`] and [`Scheduler::spawn_at`] relocate explicit
-//! [`ThreadAware`](crate::core::ThreadAware) payloads. Their worker-bound result
-//! types are also thread-aware. [`RuntimeScheduler::spawn_anywhere`] does not
-//! relocate its result. See each method for rejection and join behavior.
+//! Relocation updates a value's state for a selected worker.
+//! [`Scheduler::spawn_anywhere`] and [`Scheduler::spawn_at`] relocate the
+//! [`ThreadAware`](crate::core::ThreadAware) data you pass to them.
+//! Their results must also implement `ThreadAware`.
+//! [`RuntimeScheduler::spawn_anywhere`] does not relocate its result.
+//! Each method explains how it rejects tasks and returns results.
 //!
 //! Use [`Scheduler::spawn_blocking`] or [`RuntimeScheduler::spawn_blocking`] for
-//! synchronous calls that can stall an async worker. Blocking callbacks run in
+//! synchronous calls that can stop an async worker from running other tasks.
+//! Blocking functions run on separate threads in
 //! pools configured by [`BlockingPoolPolicy`](crate::runtime::BlockingPoolPolicy).
-//! A callback owns one pool thread until it returns.
+//! Each function uses one pool thread until it returns.
 //!
 //! Await [`JoinHandle`] to receive a result. [`JoinError`] reports task panic,
-//! shutdown, or an invalid destination. Dropping a join handle does not cancel
+//! shutdown, or an invalid destination. Dropping a `JoinHandle` does not cancel
 //! its task. Keep the [`Runtime`](crate::runtime::Runtime) alive until required
-//! work completes.
+//! tasks finish.
 //!
 //! # Example
 //!
-//! Create worker-local state in an async task and run a blocking callback
+//! Create state on an async worker and run a blocking function
 //! outside the async worker. This example requires `macros`, which enables
 //! `rt`:
 //!
