@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! A safe receiver waker may panic while a task publishes its successful result.
+//! A safe receiver waker can panic while a task publishes its successful result.
 
 use std::pin::pin;
 use std::sync::Arc;
