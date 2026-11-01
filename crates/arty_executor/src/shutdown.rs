@@ -3,7 +3,7 @@
 
 use std::cell::OnceCell;
 use std::error::Error;
-use std::fmt::{self, Debug};
+use std::fmt;
 use std::rc::Rc;
 use std::task::Waker;
 
@@ -14,7 +14,6 @@ use ohno::OhnoCore;
 /// Clones share the first shutdown cause on the executor owner thread.
 #[derive(Clone, derive_more::Debug)]
 pub struct Shutdown {
-    #[debug(ignore)]
     inner: Rc<ShutdownInner>,
 }
 
@@ -70,6 +69,7 @@ impl Shutdown {
     }
 }
 
+#[derive(derive_more::Debug)]
 struct ShutdownInner {
     cause: OnceCell<ShutdownCause>,
     owner_waker: Waker,
@@ -79,7 +79,8 @@ struct ShutdownInner {
 ///
 /// Clones share the same immutable source error. Use [`inner`](Self::inner) or
 /// [`Error::source`] to inspect the original error and its source chain.
-#[derive(Clone)]
+/// Debug output includes the source error.
+#[derive(Clone, derive_more::Debug)]
 pub struct ShutdownError {
     inner: ShutdownErrorInner,
 }
@@ -121,12 +122,6 @@ impl ShutdownError {
     }
 }
 
-impl Debug for ShutdownError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ShutdownError").finish_non_exhaustive()
-    }
-}
-
 impl fmt::Display for ShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.inner, f)
@@ -142,7 +137,7 @@ impl Error for ShutdownError {
 /// Describes why executor shutdown started.
 ///
 /// The default value represents shutdown without an error.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, derive_more::Debug)]
 pub struct ShutdownCause {
     error: Option<ShutdownError>,
 }
@@ -180,14 +175,6 @@ struct ContainedRuntimePanic;
 impl From<ShutdownError> for ShutdownCause {
     fn from(error: ShutdownError) -> Self {
         Self::from_error(error)
-    }
-}
-
-impl Debug for ShutdownCause {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ShutdownCause")
-            .field("has_error", &self.as_error().is_some())
-            .finish()
     }
 }
 
@@ -254,6 +241,7 @@ mod tests {
         assert_impl_all!(ShutdownCause: Clone, Debug, Default, Send, Sync, UnwindSafe, RefUnwindSafe);
 
         assert!(ShutdownCause::default().as_error().is_none());
+        assert_eq!(format!("{:?}", ShutdownCause::default()), "ShutdownCause { error: None }");
     }
 
     #[test]
@@ -286,7 +274,9 @@ mod tests {
         let cloned_source = clone.inner().downcast_ref::<SourceError>().unwrap();
         assert!(std::ptr::eq(source, cloned_source));
         assert_eq!(error.to_string(), "source failure");
-        assert!(format!("{error:?}").contains("ShutdownError"));
+        let debug = format!("{error:?}");
+        assert_eq!(debug, format!("ShutdownError {{ inner: {:?} }}", error.inner));
+        assert!(debug.contains("SourceError"));
     }
 
     #[test]

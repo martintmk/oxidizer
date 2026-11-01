@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::panic::Location;
+
 use observed::Sink;
 use observed::context::Transfer;
 
@@ -29,10 +31,13 @@ pub enum TaskPlacement {
 /// and lifecycle events. The placement value classifies how the caller selected
 /// the executor. It does not select a worker. The default has no observed context
 /// and uses [`TaskPlacement::Any`].
+/// [`TaskSet::add`](crate::TaskSet::add) records its caller location unless
+/// [`location`](Self::location) supplies an earlier submission location.
 #[derive(Debug, Default)]
 pub struct TaskOptions {
     context: Option<Transfer>,
     placement: TaskPlacement,
+    pub(crate) location: Option<&'static Location<'static>>,
 }
 
 pub(crate) struct TaskCreatedReporter {
@@ -56,7 +61,11 @@ impl TaskOptions {
     /// Creates options with the specified placement classification.
     #[must_use]
     pub const fn new(placement: TaskPlacement) -> Self {
-        Self { context: None, placement }
+        Self {
+            context: None,
+            placement,
+            location: None,
+        }
     }
 
     /// Creates options that apply the observed `context` for the task lifecycle.
@@ -65,7 +74,17 @@ impl TaskOptions {
         Self {
             context: Some(context),
             placement,
+            location: None,
         }
+    }
+
+    /// Sets the original task submission location.
+    ///
+    /// Use this when registration runs after submission or on another thread.
+    #[must_use]
+    pub const fn location(mut self, location: &'static Location<'static>) -> Self {
+        self.location = Some(location);
+        self
     }
 
     pub(crate) fn with_context<T>(&self, f: impl FnOnce() -> T) -> T {

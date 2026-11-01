@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, Location, catch_unwind};
 
 use arty_executor::{ShutdownCause, TaskCompletion, TaskPanicPayload, discard_task_panic_payload};
 use events_once::{EventLake, PooledSender};
@@ -28,10 +28,10 @@ impl JoinHandlePool {
         &self.shutdown
     }
 
-    pub(crate) fn handle<R: Send + 'static>(&self) -> (JoinHandle<R>, Sender<R>) {
+    pub(crate) fn handle<R: Send + 'static>(&self, location: &'static Location<'static>) -> (JoinHandle<R>, Sender<R>) {
         let (tx, rx) = self.events.rent();
         (
-            JoinHandle::new(rx, self.shutdown.clone()),
+            JoinHandle::new(rx, self.shutdown.clone(), location),
             Sender {
                 tx: Some(tx),
                 shutdown: self.shutdown.clone(),
@@ -46,7 +46,6 @@ impl JoinHandlePool {
 /// contains failures from result notification or sender disposal.
 #[derive(derive_more::Debug)]
 pub(crate) struct Sender<R: Send + 'static> {
-    #[debug(ignore)]
     tx: Option<PooledSender<Result<R, JoinError>>>,
     shutdown: Shutdown,
 }
@@ -108,7 +107,7 @@ mod tests {
     #[test]
     fn completion_delivers_the_result_to_the_handle() {
         let pool = JoinHandlePool::new(Shutdown::default());
-        let (mut handle, sender) = pool.handle::<u32>();
+        let (mut handle, sender) = pool.handle::<u32>(Location::caller());
 
         assert!(Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop())).is_pending());
         sender.completed(42);
@@ -119,7 +118,7 @@ mod tests {
     #[test]
     fn cancellation_reports_shutdown() {
         let pool = JoinHandlePool::new(Shutdown::default());
-        let (mut handle, sender) = pool.handle::<u32>();
+        let (mut handle, sender) = pool.handle::<u32>(Location::caller());
 
         sender.cancelled(ShutdownCause::default());
 
@@ -132,7 +131,7 @@ mod tests {
     #[test]
     fn disconnected_sender_reports_shutdown() {
         let pool = JoinHandlePool::new(Shutdown::default());
-        let (mut handle, sender) = pool.handle::<u32>();
+        let (mut handle, sender) = pool.handle::<u32>(Location::caller());
 
         drop(sender);
 
@@ -145,7 +144,7 @@ mod tests {
     #[test]
     fn cancellation_preserves_the_executor_shutdown_cause() {
         let pool = JoinHandlePool::new(Shutdown::default());
-        let (handle, sender) = pool.handle::<u32>();
+        let (handle, sender) = pool.handle::<u32>(Location::caller());
         let cause = ShutdownCause::panic();
         let expected = cause.as_error().unwrap().clone();
 
@@ -161,7 +160,7 @@ mod tests {
     fn cancellation_preserves_the_authoritative_runtime_shutdown_cause() {
         let shutdown = Shutdown::default();
         let pool = JoinHandlePool::new(shutdown.clone());
-        let (handle, sender) = pool.handle::<u32>();
+        let (handle, sender) = pool.handle::<u32>(Location::caller());
         let cause = ShutdownCause::panic();
         let expected = cause.as_error().unwrap().clone();
         shutdown.begin(cause);
@@ -178,7 +177,7 @@ mod tests {
     fn disconnection_preserves_the_runtime_shutdown_cause() {
         let shutdown = Shutdown::default();
         let pool = JoinHandlePool::new(shutdown.clone());
-        let (handle, sender) = pool.handle::<u32>();
+        let (handle, sender) = pool.handle::<u32>(Location::caller());
         let cause = ShutdownCause::panic();
         let expected = cause.as_error().unwrap().clone();
 
@@ -195,7 +194,7 @@ mod tests {
     fn receiving_a_panic_does_not_start_shutdown() {
         let shutdown = Shutdown::default();
         let pool = JoinHandlePool::new(shutdown.clone());
-        let (handle, sender) = pool.handle::<u32>();
+        let (handle, sender) = pool.handle::<u32>(Location::caller());
 
         sender.panicked(Box::new(42_u32), None);
         let error = handle.join().unwrap_err();
@@ -208,7 +207,7 @@ mod tests {
     fn panic_preserves_the_executor_shutdown_cause_before_joining() {
         let shutdown = Shutdown::default();
         let pool = JoinHandlePool::new(shutdown.clone());
-        let (handle, sender) = pool.handle::<u32>();
+        let (handle, sender) = pool.handle::<u32>(Location::caller());
         let cause = ShutdownCause::panic();
         let expected = cause.as_error().unwrap().clone();
 

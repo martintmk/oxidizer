@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::panic::Location;
+
 use arty_executor::{TaskOptions, TaskPlacement};
 use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
@@ -30,6 +32,9 @@ use crate::task::preparation::DeferredTask;
 /// Once shutdown starts, submissions return an immediately ready
 /// [`JoinError`](crate::task::JoinError) without invoking the factory. Await
 /// required results before shutdown; dropping a join does not cancel its task.
+///
+/// Each submission records its caller location in the join handle.
+/// Async executor tasks retain the same location.
 ///
 /// # Examples
 ///
@@ -127,6 +132,7 @@ impl Scheduler {
     /// # }
     /// # #[cfg(not(all(feature = "macros", feature = "rt")))] fn main() {}
     /// ```
+    #[track_caller]
     pub fn spawn<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
@@ -143,12 +149,14 @@ impl Scheduler {
         self.dispatcher.spawn_on_worker(self.binding.worker_index, future_factory)
     }
 
+    #[track_caller]
     fn spawn_on_current_worker<FF, F, R>(&self, future_factory: FF) -> Result<JoinHandle<R>, FF>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: Send + 'static,
     {
+        let location = Location::caller();
         asynchronous::LocalWorker::with_scheduler(|current| {
             let Some(current) = current else {
                 return Err(future_factory);
@@ -157,9 +165,9 @@ impl Scheduler {
                 return Err(future_factory);
             }
             let context = current.context().clone();
-            let (handle, result_tx) = current.results().handle();
+            let (handle, result_tx) = current.results().handle(location);
             let inner = DeferredTask::new(future_factory, context);
-            let options = TaskOptions::new(TaskPlacement::SameThread);
+            let options = TaskOptions::new(TaskPlacement::SameThread).location(location);
             current.tasks().add(inner, options, result_tx);
             self.dispatcher.wake_worker(self.binding.worker_index);
             Ok(handle)
@@ -209,6 +217,7 @@ impl Scheduler {
     /// let scheduler = runtime.scheduler().block_on(async |cx| cx.scheduler().clone()).unwrap();
     /// scheduler.spawn_anywhere((), |()| async { SendOnly });
     /// ```
+    #[track_caller]
     pub fn spawn_anywhere<D, F, R>(&self, data: D, f: fn(D) -> F) -> JoinHandle<R>
     where
         D: ThreadAware + 'static,
@@ -284,6 +293,7 @@ impl Scheduler {
     ///     Ok(())
     /// }
     /// ```
+    #[track_caller]
     pub fn spawn_at<D, F, R>(&self, destination: &Thread, data: D, f: fn(D) -> F) -> JoinHandle<R>
     where
         D: ThreadAware + 'static,
@@ -344,6 +354,7 @@ impl Scheduler {
     /// ```
     ///
     /// The first `?` handles task failure; the second handles the file's I/O error.
+    #[track_caller]
     pub fn spawn_blocking<B, R>(&self, body: B) -> JoinHandle<R>
     where
         B: FnOnce() -> R + Send + 'static,

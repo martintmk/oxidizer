@@ -4,7 +4,7 @@
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::fmt::Debug;
 use std::marker::PhantomPinned;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, Location, catch_unwind};
 use std::pin::Pin;
 use std::task;
 
@@ -64,10 +64,11 @@ where
     clippy::non_send_fields_in_send_ty,
     reason = "remote owners retain only the allocation; the executor retires non-Send payloads on their owner thread"
 )]
-// SAFETY: Remote threads can retain and reference-count task cells, but task access is
-// private and owner-thread-only. Cross-thread wakers touch only separately synchronized wake
-// metadata. Completion and cancellation empty the non-Send payload before the owner releases its
-// final scheduling reference, so remote final reclamation cannot drop user state.
+// SAFETY: Remote threads can retain and reference-count task cells. Payload and link access is
+// private and owner-thread-only. The immutable submission location can be read from any thread.
+// Cross-thread wakers touch only separately synchronized wake metadata. Completion and cancellation
+// empty the non-Send payload before the owner releases its final scheduling reference, so remote
+// final reclamation cannot drop user state.
 unsafe impl<F, R, T> Send for Task<F, R, T>
 where
     F: Future<Output = R> + 'static,
@@ -158,6 +159,10 @@ where
 
     fn created_reporter(&self) -> Option<TaskCreatedReporter> {
         self.options.created_reporter(self.sink.clone())
+    }
+
+    fn location(&self) -> Option<&'static Location<'static>> {
+        self.options.location
     }
 
     fn links(&self) -> &TaskLinks {
@@ -445,6 +450,9 @@ pub(crate) trait TypeErasedTask: Send + Sync {
 
     /// Captures independently owned data for task-created telemetry.
     fn created_reporter(&self) -> Option<TaskCreatedReporter>;
+
+    /// Returns the immutable task submission location, readable from any thread.
+    fn location(&self) -> Option<&'static Location<'static>>;
 
     /// Returns owner-thread intrusive-list links for this task.
     fn links(&self) -> &TaskLinks;

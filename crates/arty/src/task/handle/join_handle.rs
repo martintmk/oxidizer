@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::panic::Location;
 use std::pin::Pin;
 use std::task::{self, Poll};
 
@@ -23,6 +24,11 @@ use crate::runtime::worker::blocking::{LocalWorker as BlockingLocalWorker, PoolI
 /// The runtime must remain running for pending async work to complete.
 /// If the task returns its own `Result<T, E>`, joining it produces
 /// `Result<Result<T, E>, JoinError>`.
+///
+/// Debug output shows the join state, any immediate error, the submission
+/// location, result relocation metadata, and whether the handle is tied to a
+/// blocking pool.
+/// It does not format the task result.
 ///
 /// A result from [`Scheduler::spawn_anywhere`](crate::task::Scheduler::spawn_anywhere)
 /// or [`Scheduler::spawn_at`](crate::task::Scheduler::spawn_at) is
@@ -55,10 +61,10 @@ pub struct JoinHandle<R>
 where
     R: Send + 'static,
 {
-    #[debug(ignore)]
     state: State<R>,
+    location: &'static Location<'static>,
+    #[debug("{}", blocking_pool.is_some())]
     blocking_pool: Option<PoolIdentity>,
-    #[debug(ignore)]
     relocation: Option<ResultRelocation<R>>,
 }
 
@@ -66,15 +72,18 @@ where
 ///
 /// `source` is the worker that executed the task. The function pointer keeps
 /// the [`ThreadAware`] bound on registration instead of every join handle.
+#[derive(derive_more::Debug)]
 struct ResultRelocation<R> {
     source: Thread,
     relocate: fn(&mut R, Option<&Thread>, &Thread),
 }
 
+#[derive(derive_more::Debug)]
 enum State<R>
 where
     R: Send + 'static,
 {
+    #[debug("Pending")]
     Pending {
         rx: PooledReceiver<Result<R, JoinError>>,
         shutdown: Shutdown,
@@ -83,6 +92,7 @@ where
     Completed,
 }
 
+#[derive(Debug)]
 enum ImmediateError {
     Shutdown(ShutdownCause),
     InvalidDestination,
@@ -101,32 +111,47 @@ impl<R> JoinHandle<R>
 where
     R: Send + 'static,
 {
-    pub(super) fn new(rx: PooledReceiver<Result<R, JoinError>>, shutdown: Shutdown) -> Self {
+    pub(super) fn new(rx: PooledReceiver<Result<R, JoinError>>, shutdown: Shutdown, location: &'static Location<'static>) -> Self {
         Self {
             state: State::Pending { rx, shutdown },
+            location,
             blocking_pool: None,
             relocation: None,
         }
     }
 
+    #[track_caller]
     pub(crate) fn shutdown(cause: ShutdownCause) -> Self {
         Self {
             state: State::Error(Some(ImmediateError::Shutdown(cause))),
+            location: Location::caller(),
             blocking_pool: None,
             relocation: None,
         }
     }
 
+    #[track_caller]
     pub(crate) fn try_from_shutdown(shutdown: &Shutdown) -> Option<Self> {
-        shutdown.cause().map(Self::shutdown)
+        let cause = shutdown.cause()?;
+        Some(Self::shutdown(cause))
     }
 
+    #[track_caller]
     pub(crate) fn invalid_destination() -> Self {
         Self {
             state: State::Error(Some(ImmediateError::InvalidDestination)),
+            location: Location::caller(),
             blocking_pool: None,
             relocation: None,
         }
+    }
+
+    /// Returns the caller location of the task submission.
+    ///
+    /// Rejected submissions also retain this location.
+    #[must_use]
+    pub const fn location(&self) -> &'static Location<'static> {
+        self.location
     }
 
     pub(crate) fn blocking_pool(mut self, pool: PoolIdentity) -> Self {
@@ -191,5 +216,44 @@ where
             this.state = State::Completed;
         }
         result
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::error::Error as _;
+    use std::fmt;
+
+    use arty_executor::ShutdownError;
+
+    use super::*;
+
+    #[test]
+    fn debug_shows_a_shutdown_error_cause() {
+        let cause = ShutdownCause::from_error(ShutdownError::new(fmt::Error));
+        let cause_debug = format!("{cause:?}");
+        let handle = JoinHandle::<()>::shutdown(cause);
+        let location = handle.location();
+        assert_eq!(
+            format!("{handle:?}"),
+            format!(
+                "JoinHandle {{ state: Error(Some(Shutdown({cause_debug}))), location: {location:?}, blocking_pool: false, relocation: None }}"
+            )
+        );
+        assert!(handle.join().unwrap_err().source().unwrap().source().unwrap().is::<fmt::Error>());
+    }
+
+    #[test]
+    fn debug_shows_an_invalid_destination_error() {
+        let handle = JoinHandle::<()>::invalid_destination();
+        let location = handle.location();
+        assert_eq!(
+            format!("{handle:?}"),
+            format!(
+                "JoinHandle {{ state: Error(Some(InvalidDestination)), location: {location:?}, blocking_pool: false, relocation: None }}"
+            )
+        );
+        assert!(handle.join().unwrap_err().is_invalid_destination());
     }
 }

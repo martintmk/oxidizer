@@ -35,6 +35,73 @@ fn runtime() -> Runtime {
     runtime_builder().build().unwrap()
 }
 
+#[test]
+fn join_handle_debug_shows_state_without_formatting_the_result() {
+    struct ResultWithoutDebug(u32);
+
+    static_assertions::assert_not_impl_any!(ResultWithoutDebug: std::fmt::Debug);
+    static_assertions::assert_impl_all!(arty::task::JoinHandle<ResultWithoutDebug>: std::fmt::Debug);
+
+    let runtime = runtime();
+    let handles = runtime
+        .scheduler()
+        .block_on(async |cx| {
+            let async_line = line!() + 1;
+            let async_task = cx.scheduler().spawn(async |_| ResultWithoutDebug(42));
+            let blocking_line = line!() + 1;
+            let blocking_task = cx.scheduler().spawn_blocking(|| ResultWithoutDebug(42));
+            assert_eq!((async_task.location().file(), async_task.location().line()), (file!(), async_line));
+            assert_eq!(
+                (blocking_task.location().file(), blocking_task.location().line()),
+                (file!(), blocking_line)
+            );
+            [async_task, blocking_task]
+        })
+        .unwrap();
+
+    for (mut handle, is_blocking) in handles.into_iter().zip([false, true]) {
+        let location = handle.location();
+        assert_eq!(
+            format!("{handle:?}"),
+            format!("JoinHandle {{ state: Pending, location: {location:?}, blocking_pool: {is_blocking}, relocation: None }}")
+        );
+        assert_eq!(futures::executor::block_on(&mut handle).unwrap().0, 42);
+        assert_eq!(
+            format!("{handle:?}"),
+            format!("JoinHandle {{ state: Completed, location: {location:?}, blocking_pool: {is_blocking}, relocation: None }}")
+        );
+        assert_eq!(handle.location(), location);
+    }
+    runtime.stop().unwrap();
+}
+
+#[test]
+fn join_handle_debug_shows_an_immediate_error_until_received() {
+    let runtime = runtime();
+    let (scheduler, control) = runtime
+        .scheduler()
+        .block_on(async |cx| (cx.scheduler().clone(), cx.control().clone()))
+        .unwrap();
+    control.request_stop();
+    let line = line!() + 1;
+    let mut handle = scheduler.spawn(async |_| 42);
+    let location = handle.location();
+    assert_eq!((location.file(), location.line()), (file!(), line));
+    assert_eq!(
+        format!("{handle:?}"),
+        format!(
+            "JoinHandle {{ state: Error(Some(Shutdown(ShutdownCause {{ error: None }}))), location: {location:?}, blocking_pool: false, relocation: None }}"
+        )
+    );
+    assert!(futures::executor::block_on(&mut handle).unwrap_err().is_shutdown());
+    assert_eq!(
+        format!("{handle:?}"),
+        format!("JoinHandle {{ state: Completed, location: {location:?}, blocking_pool: false, relocation: None }}")
+    );
+    assert_eq!(handle.location(), location);
+    runtime.stop().unwrap();
+}
+
 #[cfg(feature = "macros")]
 #[arty::test(workers = 1, panic = ignore)]
 async fn async_and_blocking_panics_are_join_errors(cx: Context) {

@@ -8,7 +8,6 @@ use arty_executor::{ShutdownCause, ShutdownError};
 /// Shared runtime shutdown state.
 #[derive(Clone, Default, derive_more::Debug)]
 pub(crate) struct Shutdown {
-    #[debug(ignore)]
     inner: Arc<OnceLock<ShutdownCause>>,
 }
 

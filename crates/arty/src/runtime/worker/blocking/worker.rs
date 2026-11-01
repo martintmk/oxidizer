@@ -156,6 +156,7 @@ impl Worker {
     }
 
     /// Submits a blocking task to the worker. If the worker is shutting down, the task will be ignored.
+    #[track_caller]
     pub(crate) fn spawn_blocking<F, R>(&self, body: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,

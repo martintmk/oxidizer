@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::panic::Location;
+
 use crate::{ExecutorShared, TaskCompletion, TaskOptions};
 
 /// A handle that registers tasks with an executor.
@@ -22,12 +24,17 @@ impl TaskSet {
     /// The executor polls the future until it completes. Executor shutdown can
     /// cancel and drop the future before completion. Use [`TaskOptions::default()`]
     /// when the task needs no observed context or placement metadata.
-    pub fn add<F, R, T>(&self, future: F, options: TaskOptions, completion: T)
+    ///
+    /// Records the caller location unless [`TaskOptions::location`] supplies
+    /// an earlier submission location.
+    #[track_caller]
+    pub fn add<F, R, T>(&self, future: F, mut options: TaskOptions, completion: T)
     where
         F: IntoFuture<Output = R> + 'static,
         R: 'static,
         T: TaskCompletion<R>,
     {
+        options.location.get_or_insert(Location::caller());
         self.shared.add_task(future, options, completion);
     }
 }

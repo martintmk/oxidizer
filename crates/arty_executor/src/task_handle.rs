@@ -18,14 +18,10 @@ use crate::TypeErasedTask;
 /// This keeps raw ownership private without a detached allocation or new plurality APIs.
 pub(crate) type TaskHandleSlot = OnceLock<ManuallyDrop<TaskHandleTemplate>>;
 
+#[derive(derive_more::Debug)]
 pub(crate) struct TaskHandleTemplate {
+    #[debug("{{ location: {:?} }}", inner.as_ref().get_ref().location())]
     inner: Pin<PoolArc<dyn TypeErasedTask>>,
-}
-
-impl std::fmt::Debug for TaskHandleTemplate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TaskHandleTemplate").finish_non_exhaustive()
-    }
 }
 
 /// A counted owner of a pinned, type-erased task allocation.
@@ -167,8 +163,10 @@ impl TaskPtr {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 pub(crate) struct RemoteTaskHandle {
+    // Remote diagnostics must not access owner-thread task state.
+    #[debug("{{ location: {:?} }}", inner.as_ref().get_ref().location())]
     inner: Pin<PoolArc<dyn TypeErasedTask>>,
 }
 
@@ -207,7 +205,10 @@ impl Eq for TaskPtr {}
 
 impl std::fmt::Debug for TaskHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("TaskHandle").field(&self.as_ptr()).finish()
+        f.debug_struct("TaskHandle")
+            .field("task", &self.as_ptr())
+            .field("location", &self.inner.as_ref().get_ref().location())
+            .finish()
     }
 }
 
@@ -228,14 +229,27 @@ mod tests {
         let pool = MultiPool::new();
         let handle = crate::allocate_test_task_in(&pool);
         let pointer = handle.as_ptr();
-        assert_eq!(format!("{handle:?}"), format!("TaskHandle({pointer:?})"));
+        assert_eq!(format!("{handle:?}"), format!("TaskHandle {{ task: {pointer:?}, location: None }}"));
         let template = handle.inner.as_ref().get_ref().handle_slot().get().unwrap();
-        assert_eq!(format!("{:?}", **template), "TaskHandleTemplate { .. }");
+        assert_eq!(format!("{:?}", **template), "TaskHandleTemplate { inner: { location: None } }");
 
         let owned = handle.into_raw();
         assert_eq!(owned, pointer);
         // SAFETY: `into_raw` transferred exactly one strong reference.
         drop(unsafe { owned.into_handle() });
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn remote_diagnostics_read_metadata_off_the_owner_thread() {
+        let pool = MultiPool::new();
+        let owner = crate::allocate_test_task_in(&pool);
+        // SAFETY: `owner` keeps the initialized task alive during the remote read.
+        let remote = unsafe { owner.as_ptr().retain_remote() };
+        let debug = std::thread::spawn(move || format!("{remote:?}")).join().unwrap();
+
+        assert_eq!(debug, "RemoteTaskHandle { inner: { location: None } }");
+        drop(owner);
         assert!(pool.is_empty());
     }
 

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, Location, catch_unwind};
 
 use arty_executor::{ShutdownCause, TaskCompletion};
 
@@ -10,6 +10,7 @@ use crate::runtime::worker::blocking::PanicPolicy;
 use crate::task::handle::{JoinHandle, JoinHandlePool, Sender};
 use crate::task::preparation::discard_panicking_drop;
 
+#[track_caller]
 pub(crate) fn prepare_blocking<F, R>(
     result_pool: &JoinHandlePool,
     body: F,
@@ -19,7 +20,7 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let (handle, result_tx) = result_pool.handle();
+    let (handle, result_tx) = result_pool.handle(Location::caller());
     let task = BlockingTask {
         pending: Some((body, result_tx)),
         panic_policy,

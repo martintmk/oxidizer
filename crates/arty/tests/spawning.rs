@@ -32,6 +32,42 @@ fn assert_send_sync() {
     static_assertions::assert_impl_all!(Scheduler: Send, Sync);
 }
 
+#[test]
+fn remote_and_blocking_submissions_keep_their_caller_locations() {
+    let runtime = Runtime::new().unwrap();
+    let (scheduler, destination) = runtime
+        .scheduler()
+        .block_on(async |cx| (cx.scheduler().clone(), cx.thread().clone()))
+        .unwrap();
+
+    let bound_line = line!() + 1;
+    let bound = scheduler.spawn(async |_| 42);
+    let anywhere_line = line!() + 1;
+    let anywhere = scheduler.spawn_anywhere((), |()| async { 42 });
+    let at_line = line!() + 1;
+    let at = scheduler.spawn_at(&destination, (), |()| async { 42 });
+    let runtime_line = line!() + 1;
+    let runtime_task = runtime.scheduler().spawn_anywhere((), |_, ()| async { 42 });
+    let blocking_line = line!() + 1;
+    let blocking = scheduler.spawn_blocking(|| 42);
+    let runtime_blocking_line = line!() + 1;
+    let runtime_blocking = runtime.scheduler().spawn_blocking(|| 42);
+
+    for (task, line) in [
+        (bound, bound_line),
+        (anywhere, anywhere_line),
+        (at, at_line),
+        (runtime_task, runtime_line),
+        (blocking, blocking_line),
+        (runtime_blocking, runtime_blocking_line),
+    ] {
+        assert_eq!((task.location().file(), task.location().line()), (file!(), line));
+        assert!(task.location().column() > 0);
+        assert_eq!(task.join().unwrap(), 42);
+    }
+    runtime.stop().unwrap();
+}
+
 #[cfg(feature = "macros")]
 #[arty::test(workers = 2)]
 async fn spawn_some_tasks(cx: Context) {
@@ -354,6 +390,7 @@ fn spawn_at_rejects_a_worker_from_another_runtime() {
         .unwrap();
     let relocations = Arc::new(AtomicUsize::new(0));
     let invocations = Arc::new(AtomicUsize::new(0));
+    let line = line!() + 1;
     let task = scheduler.spawn_at(
         &destination,
         RejectionProbe {
@@ -366,6 +403,7 @@ fn spawn_at_rejects_a_worker_from_another_runtime() {
         },
     );
 
+    assert_eq!((task.location().file(), task.location().line()), (file!(), line));
     let error = task.join().unwrap_err();
 
     assert!(error.is_invalid_destination());

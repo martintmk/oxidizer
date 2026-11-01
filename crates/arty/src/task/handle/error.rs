@@ -3,7 +3,7 @@
 
 use std::any::Any;
 use std::error::Error;
-use std::fmt::{self, Debug, Display};
+use std::fmt::{self, Display};
 
 use arty_executor::ShutdownError;
 use performables::sync::mutex::Mutex;
@@ -28,6 +28,8 @@ use performables::sync::mutex::Mutex;
 /// If a runtime failure caused shutdown, [`Error::source`] returns that
 /// failure. Shutdown requested without an error has no source.
 ///
+/// Debug output identifies the failure kind without formatting a panic payload.
+///
 /// # Examples
 ///
 /// A submission after shutdown reports a task error without invoking its factory:
@@ -48,13 +50,15 @@ use performables::sync::mutex::Mutex;
 /// runtime.stop()?;
 /// # Ok::<(), arty::runtime::Error>(())
 /// ```
+#[derive(derive_more::Debug)]
 pub struct JoinError {
     kind: Kind,
 }
 
+#[derive(derive_more::Debug)]
 enum Kind {
     // The payload can be Send without being Sync. It is only consumed, never borrowed.
-    Panic(Mutex<Box<dyn Any + Send + 'static>>),
+    Panic(#[debug(ignore)] Mutex<Box<dyn Any + Send + 'static>>),
     Shutdown(Option<ShutdownError>),
     InvalidDestination,
 }
@@ -142,16 +146,6 @@ impl JoinError {
     }
 }
 
-impl Debug for JoinError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(std::any::type_name::<Self>())
-            .field("is_panic", &self.is_panic())
-            .field("is_shutdown", &self.is_shutdown())
-            .field("is_invalid_destination", &self.is_invalid_destination())
-            .finish()
-    }
-}
-
 impl Display for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match &self.kind {
@@ -184,13 +178,18 @@ mod tests {
         assert!(!panic.is_shutdown());
         assert!(!panic.is_invalid_destination());
         assert_eq!(panic.to_string(), "task panicked");
+        assert_eq!(format!("{panic:?}"), "JoinError { kind: Panic(..) }");
 
         let shutdown = JoinError::shutdown(None);
         assert!(!shutdown.is_panic());
         assert!(shutdown.is_shutdown());
         assert!(!shutdown.is_invalid_destination());
         assert_eq!(shutdown.to_string(), "runtime is shutting down");
-        assert!(format!("{shutdown:?}").contains("is_shutdown: true"));
+        assert_eq!(format!("{shutdown:?}"), "JoinError { kind: Shutdown(None) }");
         assert!(shutdown.source().is_none());
+
+        let invalid_destination = JoinError::invalid_destination();
+        assert!(invalid_destination.is_invalid_destination());
+        assert_eq!(format!("{invalid_destination:?}"), "JoinError { kind: InvalidDestination }");
     }
 }

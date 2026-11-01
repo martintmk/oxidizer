@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::cell::Cell;
+use std::panic::Location;
 
 use arty_executor::{TaskOptions, TaskPlacement, TaskSet};
 use plurality::{Box as PoolBox, MultiPool, coerce};
@@ -50,7 +51,9 @@ impl<F> Drop for TaskFactory<F> {
 /// type behind a `Pin<Box<dyn Future>>`, adding a heap allocation to every remote spawn.
 type ErasedRemoteFutureFactory = dyn Fn(Context, &TaskSet) + Send;
 
+#[derive(derive_more::Debug)]
 pub(crate) struct RemoteFutureFactory {
+    #[debug("{:p}", std::ptr::from_ref(&**inner))]
     inner: PoolBox<ErasedRemoteFutureFactory>,
 }
 
@@ -85,6 +88,7 @@ impl RemoteFutureFactory {
     }
 }
 
+#[track_caller]
 pub(crate) fn prepare_remote<FF, F, R>(
     result_pool: &JoinHandlePool,
     future_factory: FF,
@@ -95,12 +99,13 @@ where
     F: Future<Output = R> + 'static,
     R: Send + 'static,
 {
-    let (handle, result_tx) = result_pool.handle();
+    let location = Location::caller();
+    let (handle, result_tx) = result_pool.handle(location);
     let future_factory = TaskFactory::new(future_factory);
     let future_factory = RemoteFutureFactory::new(move |cx, tasks| {
         let future_factory = future_factory.into_inner();
         let inner = DeferredTask::new(future_factory, cx);
-        let options = TaskOptions::new(placement);
+        let options = TaskOptions::new(placement).location(location);
         tasks.add(inner, options, result_tx);
     });
     (future_factory, handle)
@@ -135,6 +140,7 @@ mod tests {
 
         let first = RemoteFutureFactory::new(factory);
         let address = std::ptr::from_ref(&*first.inner).cast::<()>();
+        assert_eq!(format!("{first:?}"), format!("RemoteFutureFactory {{ inner: {address:p} }}"));
         let chunks = FUTURE_FACTORIES.with(MultiPool::chunks_allocated);
         drop(first);
         let second = RemoteFutureFactory::new(factory);

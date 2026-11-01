@@ -129,6 +129,7 @@ impl DispatcherCore {
         WorkerIndex(self.next_async_worker_index.fetch_add(1, Ordering::Relaxed) % self.worker_endpoints.len())
     }
 
+    #[track_caller]
     pub(crate) fn spawn<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
@@ -138,6 +139,7 @@ impl DispatcherCore {
         self.enqueue(self.next_worker_index(), TaskPlacement::Any, future_factory)
     }
 
+    #[track_caller]
     pub(crate) fn spawn_relocating<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
@@ -148,6 +150,7 @@ impl DispatcherCore {
         self.spawn_relocating_on_worker(worker_index, TaskPlacement::Any, future_factory)
     }
 
+    #[track_caller]
     pub(crate) fn spawn_at_worker_relocating<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
@@ -215,6 +218,7 @@ impl DispatcherCore {
             .wake_by_ref();
     }
 
+    #[track_caller]
     pub(crate) fn spawn_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
@@ -225,6 +229,7 @@ impl DispatcherCore {
     }
 
     /// Records the execution worker so a successful result can relocate when its join is polled.
+    #[track_caller]
     fn spawn_relocating_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, placement: TaskPlacement, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
@@ -235,6 +240,7 @@ impl DispatcherCore {
         self.enqueue(worker_index, placement, future_factory).relocate_result_from(source)
     }
 
+    #[track_caller]
     fn enqueue<FF, F, R>(&self, worker_index: WorkerIndex, placement: TaskPlacement, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,

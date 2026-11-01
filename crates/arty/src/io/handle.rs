@@ -1,9 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::any::type_name;
-use std::fmt;
-
 use arty_io_core::{DriverError, IoContext};
 use arty_io_host::IoRuntime;
 use performables::arc::Arc;
@@ -29,7 +26,7 @@ use crate::task::Context;
 /// when they first request that context. The first context type requested from
 /// a runtime is assigned the primary driver role; later context types are
 /// assigned the secondary role.
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 pub struct Io {
     runtime: IoRuntime,
     dispatcher: DispatcherClient,
@@ -130,14 +127,6 @@ impl Io {
         result_rx
             .recv()
             .map_err(|disconnected| runtime_error(&self.dispatcher).unwrap_or_else(|| Error::new(disconnected)))?
-    }
-}
-
-impl fmt::Debug for Io {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(type_name::<Self>())
-            .field("thread", &self.thread)
-            .finish_non_exhaustive()
     }
 }
 

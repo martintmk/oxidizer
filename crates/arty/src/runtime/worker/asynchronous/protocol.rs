@@ -3,7 +3,6 @@
 
 //! Commands and queued work sent to an asynchronous worker.
 
-use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use arty_executor::discard_task_panic_payload;
@@ -17,6 +16,7 @@ pub(crate) type IoAccess = Box<dyn FnOnce(&Context) + Send>;
 ///
 /// Dropping the wrapper contains a panic from disposing the closure. Successful
 /// consumption transfers the closure out exactly once.
+#[derive(derive_more::Debug)]
 pub(crate) struct QueuedClosure<T> {
     inner: Option<T>,
 }
@@ -52,6 +52,7 @@ pub(crate) type QueuedFactory = QueuedClosure<RemoteFutureFactory>;
 /// Owns a synchronous I/O access closure until the destination worker invokes it.
 pub(crate) type QueuedIoAccess = QueuedClosure<IoAccess>;
 
+#[derive(derive_more::Debug)]
 pub(crate) enum Command {
     /// Schedules a new task for execution on this worker, providing the factory function that will
     /// be used to create the future that becomes the body of the task. The factory registers the
@@ -62,7 +63,10 @@ pub(crate) enum Command {
     EnqueueTask { future_factory: QueuedFactory },
 
     /// Executes synchronous I/O context access on this worker.
-    AccessIo { access: QueuedIoAccess },
+    AccessIo {
+        #[debug(ignore)]
+        access: QueuedIoAccess,
+    },
 
     /// Initiates the shutdown process. The worker will stop accepting new tasks and will discard
     /// any tasks that are enqueued after this command is received (e.g. because other threads do
@@ -70,18 +74,6 @@ pub(crate) enum Command {
     ///
     /// It is fine to send this command multiple times - duplicates will be ignored.
     Shutdown,
-}
-
-impl fmt::Debug for Command {
-    #[cfg_attr(coverage_nightly, coverage(off))] // Command names are diagnostic text only.
-    #[cfg_attr(test, mutants::skip)] // We have no contract to test here - can return anything.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EnqueueTask { .. } => write!(f, "EnqueueTask"),
-            Self::AccessIo { .. } => write!(f, "AccessIo"),
-            Self::Shutdown => write!(f, "Shutdown"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -96,6 +88,14 @@ mod tests {
 
     use super::*;
     use crate::task::preparation::prepare_remote;
+
+    #[test]
+    fn queued_closure_debug_keeps_the_inner_value() {
+        let queued = QueuedClosure::new(42);
+
+        assert_eq!(format!("{queued:?}"), "QueuedClosure { inner: Some(42) }");
+        assert_eq!(queued.into_inner(), 42);
+    }
 
     struct PanicWake(AtomicBool);
 

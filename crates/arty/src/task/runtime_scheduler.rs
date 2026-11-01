@@ -63,6 +63,9 @@ impl<F: Future> Future for ScopedStorage<F> {
 /// The runtime chooses where new work starts. Submission order does not imply
 /// execution or completion order.
 /// Complete required joins before stopping the runtime.
+///
+/// Each submission records its caller location in the join handle.
+/// Async executor tasks retain the same location.
 #[derive(Debug)]
 pub struct RuntimeScheduler {
     pub(crate) dispatcher: DispatcherClient,
@@ -107,6 +110,7 @@ impl RuntimeScheduler {
     /// assert_eq!(message, "Hello, Arty");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[track_caller]
     pub fn block_on<'a, FF, F, R>(&self, future_factory: FF) -> Result<R, Error>
     where
         FF: FnOnce(Context) -> F + Send + 'a,
@@ -176,6 +180,7 @@ impl RuntimeScheduler {
     /// runtime.stop()?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[track_caller]
     pub fn spawn_anywhere<D, F, R>(&self, data: D, future_factory: fn(Context, D) -> F) -> JoinHandle<R>
     where
         D: ThreadAware + 'static,
@@ -213,6 +218,7 @@ impl RuntimeScheduler {
     /// assert_eq!(futures::executor::block_on(task)?, 42);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[track_caller]
     pub fn spawn_blocking<B, R>(&self, body: B) -> JoinHandle<R>
     where
         B: FnOnce() -> R + Send + 'static,

@@ -206,6 +206,7 @@ impl Drop for WakeSignal {
     }
 }
 
+#[derive(derive_more::Debug)]
 pub(crate) struct RemoteWake(RemoteTaskHandle);
 
 impl RemoteWake {
@@ -221,12 +222,6 @@ impl RemoteWake {
             let task_handle = unsafe { self.0.into_owner() };
             executor_context::enqueue(owner, task_handle).expect("remote wakes are drained by their registered executor owner");
         }
-    }
-}
-
-impl std::fmt::Debug for RemoteWake {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteWake").finish_non_exhaustive()
     }
 }
 
@@ -356,13 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_wake_has_non_exhaustive_diagnostics() {
+    fn remote_wake_shows_task_metadata() {
         let pool = MultiPool::new();
         let task = crate::allocate_test_task_in(&pool);
         // SAFETY: `task` keeps the initialized template alive.
         let remote = RemoteWake(unsafe { task.as_ptr().retain_remote() });
 
-        assert_eq!(format!("{remote:?}"), "RemoteWake { .. }");
+        assert_eq!(format!("{remote:?}"), "RemoteWake(RemoteTaskHandle { inner: { location: None } })");
 
         drop((remote, task));
         assert!(pool.is_empty());

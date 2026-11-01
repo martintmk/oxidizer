@@ -8,6 +8,7 @@ use std::error::Error as _;
 use std::fmt;
 use std::future::{Ready, pending, poll_fn, ready};
 use std::marker::PhantomPinned;
+use std::panic::Location;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,6 +32,26 @@ thread_local! {
     static THREAD_LOCAL_EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
     static REENTRANT_TELEMETRY_SUBMISSION: RefCell<Option<(TaskSet, Rc<Cell<bool>>)>> = const { RefCell::new(None) };
     static OWNER_DROP_TELEMETRY: RefCell<Option<OwnerDropState>> = const { RefCell::new(None) };
+}
+
+#[test]
+fn task_registration_records_its_caller_location() {
+    let executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
+    let options = TaskOptions::default();
+    let line = line!() + 1;
+    executor.tasks().add(pending::<()>(), options, crate::support::DiscardCompletion);
+
+    assert!(format!("{executor:?}").contains(&format!("location: Some(Location {{ file: {:?}, line: {line},", file!())));
+}
+
+#[test]
+fn task_registration_preserves_an_explicit_submission_location() {
+    let executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
+    let location = Location::caller();
+    let options = TaskOptions::new(TaskPlacement::SpecificThread).location(location);
+    executor.tasks().add(pending::<()>(), options, crate::support::DiscardCompletion);
+
+    assert!(format!("{executor:?}").contains(&format!("location: Some({location:?})")));
 }
 
 struct ReentrantSubmissionProcessor;
@@ -164,7 +185,9 @@ fn shutdown_cause_exposes_the_original_error() {
     let source = actual.source().unwrap().downcast_ref::<TestShutdownError>().unwrap();
     let expected = expected.inner().downcast_ref::<TestShutdownError>().unwrap();
     assert!(std::ptr::eq(source, expected));
-    assert_eq!(format!("{cause:?}"), "ShutdownCause { has_error: true }");
+    let debug = format!("{cause:?}");
+    assert_eq!(debug, format!("ShutdownCause {{ error: Some({actual:?}) }}"));
+    assert!(debug.contains("executor failed"));
 }
 
 fn enrichment_keys(sink: &Sink) -> Vec<String> {
