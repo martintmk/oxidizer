@@ -10,21 +10,19 @@ mod support;
 use std::future::pending;
 use std::sync::{Arc, mpsc};
 
-use performables::sync::channel::oneshot;
-use support::{TEST_TIMEOUT, runtime, stop_bounded};
+use arty::runtime::{Runtime, WorkersPolicy};
+use arty_tokio::TokioSupportExt as _;
+use support::{TEST_TIMEOUT, stop_bounded};
 use tokio::runtime::Builder;
 
 #[test]
 fn external_runtime_is_not_retained_when_it_shuts_down_first() {
     let tokio = Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
     let weak = Arc::downgrade(&tokio);
-    let runtime = runtime(1);
-
-    runtime
-        .scheduler()
-        .block_on(async |cx| {
-            arty_tokio::init(&cx, tokio.handle()).await.unwrap();
-        })
+    let runtime = Runtime::builder()
+        .workers(WorkersPolicy::exactly(1))
+        .tokio_support(tokio.handle())
+        .build()
         .unwrap();
 
     let (dropped, completion) = mpsc::sync_channel(1);
@@ -45,19 +43,22 @@ fn external_runtime_is_not_retained_when_it_shuts_down_first() {
 fn cross_runtime_ownership_cycle_is_broken_during_shutdown() {
     let tokio = Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
     let weak = Arc::downgrade(&tokio);
-    let runtime = runtime(1);
-    let (started, ready) = oneshot();
+    let runtime = Runtime::builder()
+        .workers(WorkersPolicy::exactly(1))
+        .tokio_support(tokio.handle())
+        .build()
+        .unwrap();
+    let (started, ready) = mpsc::sync_channel(1);
 
     runtime
         .scheduler()
         .block_on(async |cx| {
-            arty_tokio::init(&cx, tokio.handle()).await.unwrap();
             let never_completes = cx.scheduler().spawn(async |_| pending::<()>().await);
             drop(tokio::spawn(async move {
                 started.send(()).unwrap();
                 let () = never_completes.await.unwrap();
             }));
-            ready.await.unwrap();
+            ready.recv_timeout(TEST_TIMEOUT).unwrap();
         })
         .unwrap();
 

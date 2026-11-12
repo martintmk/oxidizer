@@ -4,7 +4,7 @@
 use thread_aware::ThreadAware;
 
 use super::hook_fn::{ErasedHookFn, HookFn};
-use super::{Hook, Panic};
+use super::{Hook, Panic, WorkerInit};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanicAction {
@@ -15,11 +15,24 @@ pub(crate) enum PanicAction {
 #[derive(Clone, derive_more::Debug, ThreadAware)]
 pub(crate) enum HookRegistration {
     Panic(ErasedHookFn<Panic>),
+    WorkerInit(ErasedHookFn<WorkerInit>),
+}
+
+impl HookRegistration {
+    pub(crate) const fn is_worker_init(&self) -> bool {
+        matches!(self, Self::WorkerInit(_))
+    }
 }
 
 impl From<ErasedHookFn<Panic>> for HookRegistration {
     fn from(hook: ErasedHookFn<Panic>) -> Self {
         Self::Panic(hook)
+    }
+}
+
+impl From<ErasedHookFn<WorkerInit>> for HookRegistration {
+    fn from(hook: ErasedHookFn<WorkerInit>) -> Self {
+        Self::WorkerInit(hook)
     }
 }
 

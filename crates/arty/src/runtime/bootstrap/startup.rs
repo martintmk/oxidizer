@@ -54,7 +54,6 @@ fn build_with_processors(
             shutdown: shutdown.clone(),
             io_runtime: io_runtime.clone(),
             monitor_options: monitor_options.for_worker(),
-            hook_registrations: hook_registrations.clone(),
         }));
     }
 
@@ -70,6 +69,11 @@ fn build_with_processors(
     for worker in workers {
         join_handles.push(worker.activate(dispatcher_client.clone()));
     }
+
+    for hook in &hook_registrations {
+        dispatcher_client.register_hook(hook);
+    }
+
     let worker_joiner = WorkerJoiner::new(join_handles);
 
     Ok(Runtime::with_dispatcher(dispatcher_client, worker_joiner))

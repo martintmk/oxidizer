@@ -65,6 +65,10 @@ impl RuntimeControl {
     /// when it processes that command. If runtime shutdown has started, Arty
     /// ignores the registration.
     ///
+    /// [`WorkerInit`](crate::runtime::hook::WorkerInit) runs once on each live
+    /// worker. The runtime keeps that registration for workers that start
+    /// later. Each worker discards its callback after it runs.
+    ///
     /// Arty does not catch a panic from the callback. You must make sure that
     /// the callback completes without a panic.
     ///

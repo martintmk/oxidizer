@@ -9,8 +9,8 @@
 //! [`ThreadAware`] relocation.
 //!
 //! Register hooks before startup with [`RuntimeBuilder::on`]. Add hooks after
-//! startup with [`RuntimeControl::on`]. Each worker stores one collection for
-//! each event. Arty invokes callbacks in registration order.
+//! startup with [`RuntimeControl::on`]. Arty invokes callbacks in registration
+//! order. [`WorkerInit`] runs once on each worker before startup completes.
 //!
 //! Arty does not catch a panic from a hook callback. You must make sure that
 //! every hook callback completes without a panic.
@@ -32,12 +32,14 @@ mod hook_fn;
 mod local_hook;
 mod panic;
 mod registry;
+mod worker_init;
 
 pub(crate) use hook_fn::ErasedHookFn;
 pub use hook_fn::HookFn;
 pub(crate) use local_hook::{LocalHook, LocalHookGuard};
 pub use panic::Panic;
 pub(crate) use registry::{HookRegistration, PanicAction, registration};
+pub use worker_init::WorkerInit;
 
 /// Marks an event that can be registered as a runtime hook.
 ///

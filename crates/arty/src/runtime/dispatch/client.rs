@@ -103,6 +103,10 @@ impl DispatcherClient {
         self.core.register_hook(hook);
     }
 
+    pub(crate) fn worker_init_hooks(&self) -> Vec<HookRegistration> {
+        self.core.worker_init_hooks()
+    }
+
     pub(crate) fn stop(&self, cause: impl Into<ShutdownCause>) -> ShutdownCause {
         self.core.stop_inner(cause.into())
     }

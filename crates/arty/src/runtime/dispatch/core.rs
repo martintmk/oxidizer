@@ -11,6 +11,7 @@ use arty_executor::{ShutdownCause, TaskPlacement};
 use foldhash::HashMap;
 use nonempty::NonEmpty;
 use performables::arc::Arc;
+use performables::sync::mutex::Mutex;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::hook::HookRegistration;
@@ -21,6 +22,8 @@ use crate::runtime::{Error, Workers};
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
 use crate::task::preparation::prepare_remote;
+
+const ERR_POISONED_HOOKS: &str = "worker initialization hook lock is poisoned because callback data panicked while it was cloned";
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerEndpoint {
@@ -64,6 +67,8 @@ pub(crate) struct DispatcherCore {
     // cached index. IDs come only from registered workers, so a non-cryptographic hasher fits.
     worker_indices: HashMap<ThreadId, WorkerIndex>,
 
+    worker_init_hooks: Mutex<Vec<HookRegistration>>,
+
     // Minimal effort round-robin scheduling of async tasks.
     next_async_worker_index: AtomicUsize,
 
@@ -99,6 +104,7 @@ impl DispatcherCore {
             worker_endpoints,
             workers,
             worker_indices,
+            worker_init_hooks: Mutex::new(Vec::new()),
             next_async_worker_index: AtomicUsize::new(0),
             remote_results: JoinHandlePool::new(shutdown),
         })
@@ -210,6 +216,10 @@ impl DispatcherCore {
             return;
         }
 
+        if hook.is_worker_init() {
+            self.worker_init_hooks.lock_result().expect(ERR_POISONED_HOOKS).push(hook.clone());
+        }
+
         let source = LocalWorker::current_thread().filter(|thread| self.owns(thread));
         if let Some(source) = &source {
             LocalWorker::install_hook(hook.clone(), Some(source));
@@ -224,6 +234,10 @@ impl DispatcherCore {
             });
             endpoint.waker.wake_by_ref();
         }
+    }
+
+    pub(crate) fn worker_init_hooks(&self) -> Vec<HookRegistration> {
+        self.worker_init_hooks.lock_result().expect(ERR_POISONED_HOOKS).clone()
     }
 
     fn runtime_shutting_down_error(&self) -> Error {
@@ -317,6 +331,7 @@ mod tests {
     use super::*;
     use crate::runtime::config::RuntimeName;
     use crate::runtime::dispatch::{DispatcherClient, test_threads};
+    use crate::runtime::hook::{HookFn, Panic, WorkerInit, registration};
     use crate::runtime::worker::asynchronous::{CommandReceiver, command_channel};
     use crate::runtime::worker::blocking::Pool;
 
@@ -331,6 +346,22 @@ mod tests {
             },
             command_rx,
         )
+    }
+
+    #[test]
+    fn dispatcher_retains_worker_init_hooks_for_future_workers() {
+        let threads = test_threads(1);
+        let (worker, _worker_rx) = endpoint(&threads[0]);
+        let worker_init = registration(HookFn::<WorkerInit, _>::new((), |_event, ()| {}));
+        let panic = registration(HookFn::<Panic, _>::new((), |_event, ()| {}));
+        let dispatcher = DispatcherCore::new(NonEmpty::new(worker), Shutdown::default());
+
+        assert_eq!(dispatcher.worker_init_hooks().len(), 0);
+        dispatcher.register_hook(&worker_init);
+        dispatcher.register_hook(&panic);
+        assert_eq!(dispatcher.worker_init_hooks().len(), 1);
+        dispatcher.register_hook(&worker_init);
+        assert_eq!(dispatcher.worker_init_hooks().len(), 2);
     }
 
     #[test]

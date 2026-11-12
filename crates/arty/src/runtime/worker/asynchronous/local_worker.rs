@@ -4,11 +4,11 @@
 use std::cell::RefCell;
 
 use arty_executor::{Shutdown as ExecutorShutdown, ShutdownCause, TaskPlacement, TaskSet};
-use thread_aware::Thread;
+use thread_aware::{Thread, ThreadAware};
 
 use crate::io::RuntimeDriverHost;
 use crate::runtime::dispatch::DispatcherClient;
-use crate::runtime::hook::{ErasedHookFn, HookRegistration, LocalHook, LocalHookGuard, Panic, PanicAction};
+use crate::runtime::hook::{ErasedHookFn, HookRegistration, LocalHook, LocalHookGuard, Panic, PanicAction, WorkerInit};
 use crate::runtime::worker::{self, WorkerMarker};
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
@@ -46,12 +46,7 @@ impl LocalWorker {
         });
     }
 
-    pub(super) fn install_scheduler(
-        context: Context,
-        tasks: TaskSet,
-        executor_shutdown: ExecutorShutdown,
-        hook_registrations: Vec<HookRegistration>,
-    ) {
+    pub(super) fn install_scheduler(context: Context, tasks: TaskSet, executor_shutdown: ExecutorShutdown) {
         let results = JoinHandlePool::new(context.dispatcher().shutdown().clone());
         let scheduler = SchedulerContext {
             thread: context.thread().clone(),
@@ -67,6 +62,9 @@ impl LocalWorker {
             current.scheduler = Some(scheduler);
             current.panic_hooks = Some(panic_hooks);
         });
+    }
+
+    pub(super) fn install_hooks(hook_registrations: Vec<HookRegistration>) {
         for hook in hook_registrations {
             Self::install_hook(hook, None);
         }
@@ -106,12 +104,22 @@ impl LocalWorker {
     }
 
     pub(crate) fn install_hook(hook: HookRegistration, source: Option<&Thread>) {
-        let destination = Self::with_scheduler(|current| {
-            let current = current.expect("a running worker retains its scheduler while processing hook registration");
-            current.thread.clone()
-        });
         match hook {
-            HookRegistration::Panic(hook) => LOCAL_PANIC_HOOK.install(hook, source, &destination),
+            HookRegistration::Panic(hook) => {
+                let destination = Self::with_scheduler(|current| {
+                    let current = current.expect("a running worker retains its scheduler while processing hook registration");
+                    current.thread.clone()
+                });
+                LOCAL_PANIC_HOOK.install(hook, source, &destination);
+            }
+            HookRegistration::WorkerInit(mut hook) => {
+                let (destination, mut event) = Self::with_scheduler(|current| {
+                    let current = current.expect("a running worker retains its scheduler while processing hook registration");
+                    (current.thread.clone(), WorkerInit::new(current.thread.clone()))
+                });
+                hook.relocate(source, &destination);
+                hook.execute(&mut event);
+            }
         }
     }
 
@@ -277,7 +285,7 @@ mod tests {
             let context = Context::new(dispatcher, clock, io, thread.clone());
             let mut executor = Executor::builder().thread(thread.clone()).build();
             LocalWorker::attach();
-            LocalWorker::install_scheduler(context, executor.tasks(), executor.shutdown(), Vec::new());
+            LocalWorker::install_scheduler(context, executor.tasks(), executor.shutdown());
 
             let mut join = std::pin::pin!(core.spawn_relocating(&thread, |_| async { 42 }));
             let registered_locally = command_rx.spawn_receiver().try_recv().is_err() && executor.has_tasks();

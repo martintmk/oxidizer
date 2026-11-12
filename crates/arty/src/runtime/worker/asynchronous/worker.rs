@@ -17,7 +17,7 @@ use tick::runtime::{ClockDriver, InactiveClock};
 use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::config::MonitorOptions;
 use crate::runtime::dispatch::DispatcherClient;
-use crate::runtime::hook::{HookRegistration, PanicAction};
+use crate::runtime::hook::PanicAction;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::worker::asynchronous::{CommandReceiver, LocalWorker, Signal, SpawnCommand, SystemCommand};
 #[cfg(test)]
@@ -126,7 +126,6 @@ impl Worker {
         clock: InactiveClock,
         signal: WorkerSignal,
         monitor_options: MonitorOptions,
-        hook_registrations: Vec<HookRegistration>,
     ) -> Self {
         let WorkerSignal(signal) = signal;
         let worker_waker = Signal::waker(&signal);
@@ -143,7 +142,7 @@ impl Worker {
         let executor_shutdown = executor.shutdown();
 
         let context = Context::new(dispatcher, clock, io, thread);
-        LocalWorker::install_scheduler(context.clone(), tasks.clone(), executor_shutdown, hook_registrations);
+        LocalWorker::install_scheduler(context.clone(), tasks.clone(), executor_shutdown);
 
         Self {
             state: Some(ReadyWorkerState {
@@ -518,16 +517,7 @@ mod tests {
         let driver_waker = crate::io::RuntimeDriverHost::install(&io_runtime, dispatcher.clone(), &thread, Signal::waker(&signal));
         signal.set_driver_waker(driver_waker);
 
-        Worker::new(
-            command_rx,
-            dispatcher,
-            thread,
-            io,
-            clock,
-            WorkerSignal(signal),
-            monitor_options,
-            Vec::new(),
-        )
+        Worker::new(command_rx, dispatcher, thread, io, clock, WorkerSignal(signal), monitor_options)
     }
 
     fn replenishing_command(sender: CommandSender, processed: Arc<AtomicUsize>) -> SpawnCommand {

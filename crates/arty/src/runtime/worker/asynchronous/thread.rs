@@ -17,7 +17,6 @@ use crate::io::{Io, RuntimeDriverHost};
 use crate::runtime::config::{MonitorOptions, RuntimeName};
 use crate::runtime::dispatch::{DispatcherClient, WorkerEndpoint};
 use crate::runtime::error::Error;
-use crate::runtime::hook::HookRegistration;
 use crate::runtime::shutdown::Shutdown;
 use crate::runtime::worker::{asynchronous, blocking};
 
@@ -34,7 +33,6 @@ pub(crate) struct StartOptions {
     pub(crate) shutdown: Shutdown,
     pub(crate) io_runtime: IoRuntime,
     pub(crate) monitor_options: MonitorOptions,
-    pub(crate) hook_registrations: Vec<HookRegistration>,
 }
 
 /// A spawned worker waiting for runtime activation.
@@ -131,7 +129,6 @@ impl ThreadEntry {
             shutdown,
             io_runtime,
             monitor_options,
-            hook_registrations,
             ..
         } = options;
 
@@ -158,6 +155,7 @@ impl ThreadEntry {
         let dispatcher = futures::executor::block_on(activation_rx)
             .expect("RuntimeBuilder failed between initializing and activating a worker")
             .dispatcher;
+        let hook_registrations = dispatcher.worker_init_hooks();
         let io = Io::new(io_runtime.clone(), dispatcher.clone(), current.clone());
         let driver_waker = RuntimeDriverHost::install(&io_runtime, dispatcher.clone(), &current, asynchronous::Signal::waker(&signal));
         signal.set_driver_waker(driver_waker);
@@ -170,9 +168,9 @@ impl ThreadEntry {
             clock,
             asynchronous::WorkerSignal(signal),
             monitor_options,
-            hook_registrations,
         );
 
+        asynchronous::LocalWorker::install_hooks(hook_registrations);
         _ = ready_tx.send(());
 
         let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run()));
