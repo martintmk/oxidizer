@@ -588,6 +588,17 @@ struct CancellationDropPanic {
     dropped: Rc<Cell<bool>>,
 }
 
+struct PanicOnce(AtomicBool);
+
+impl Drop for PanicOnce {
+    #[expect(clippy::panic, reason = "this test injects a panic payload destructor panic")]
+    fn drop(&mut self) {
+        if !self.0.swap(true, Ordering::Relaxed) {
+            panic!("cancellation panic payload destructor");
+        }
+    }
+}
+
 impl Future for CancellationDropPanic {
     type Output = ();
 
@@ -600,7 +611,7 @@ impl Drop for CancellationDropPanic {
     #[expect(clippy::panic, reason = "this test injects a cancellation destructor panic")]
     fn drop(&mut self) {
         assert!(!self.dropped.replace(true));
-        panic!("cancellation destructor");
+        std::panic::panic_any(PanicOnce(AtomicBool::new(false)));
     }
 }
 

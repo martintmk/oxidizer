@@ -1244,6 +1244,36 @@ mod tests {
         assert_eq!(processed.load(Ordering::Relaxed), COMMANDS_PER_CYCLE + 1);
     }
 
+    #[test]
+    fn pending_system_command_interrupts_spawn_registration() {
+        let (commands, command_rx) = command_channel();
+        let worker = test_worker(
+            (commands.clone(), command_rx),
+            test_blocking_worker(),
+            InactiveClock::new_isolated(),
+            Arc::new(Signal::default()),
+        );
+        let registered = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let registered = Arc::clone(&registered);
+            commands
+                .spawn_sender()
+                .send(enqueue(test_factory(move |_, _| {
+                    registered.fetch_add(1, Ordering::Relaxed);
+                })))
+                .unwrap();
+        }
+        commands
+            .system_sender()
+            .send(SystemCommand::AccessIo {
+                access: QueuedIoAccess::new(Box::new(|_| {})),
+            })
+            .unwrap();
+
+        assert_eq!(worker.process_spawn_commands(), BatchProgress::LimitReached);
+        assert_eq!(registered.load(Ordering::Relaxed), 1);
+    }
+
     #[cfg(any(test, feature = "monitor"))]
     #[test]
     fn inspection_without_worker_diagnostics_reports_failure() {

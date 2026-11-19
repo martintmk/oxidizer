@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskInstrumentation, TaskSet, discard_task_panic_payload};
+use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskCompletion, TaskInstrumentation, TaskSet, discard_task_panic_payload};
 use static_assertions::assert_not_impl_any;
 
 use super::support::{DiscardCompletion, TaskBuilderExt as _};
@@ -94,6 +94,69 @@ struct PanickingCancellation;
 impl TaskInstrumentation for PanickingCancellation {
     fn cancelled(&mut self) {
         panic!("instrumentation cancellation");
+    }
+}
+
+enum TerminalPanic {
+    Completed,
+    Panicked,
+}
+
+impl TaskInstrumentation for TerminalPanic {
+    fn completed(&mut self) {
+        if matches!(self, Self::Completed) {
+            panic!("instrumentation completion");
+        }
+    }
+
+    fn panicked(&mut self) {
+        if matches!(self, Self::Panicked) {
+            panic!("instrumentation panic");
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecordCompletion(Rc<Cell<Option<&'static str>>>);
+
+impl TaskCompletion<()> for RecordCompletion {
+    fn completed(self, (): ()) {
+        self.0.set(Some("completed"));
+    }
+
+    fn panicked(self, panic: arty_executor::TaskPanicPayload, _cause: Option<arty_executor::ShutdownCause>) {
+        discard_task_panic_payload(panic);
+        self.0.set(Some("panicked"));
+    }
+
+    fn cancelled(self, _cause: arty_executor::ShutdownCause) {
+        self.0.set(Some("cancelled"));
+    }
+}
+
+#[test]
+fn terminal_instrumentation_panics_after_completion_delivery() {
+    for (future_panics, instrumentation, message, outcome) in [
+        (false, TerminalPanic::Completed, "instrumentation completion", "completed"),
+        (true, TerminalPanic::Panicked, "instrumentation panic", "panicked"),
+    ] {
+        let mut executor = ExecutorBuilder::new().panic_policy(PanicPolicy::IGNORE).build();
+        let delivered = Rc::new(Cell::new(None));
+        executor
+            .tasks()
+            .task(poll_fn(move |_| {
+                if future_panics {
+                    panic!("task panic");
+                }
+                Poll::Ready(())
+            }))
+            .instrument(instrumentation)
+            .register(RecordCompletion(Rc::clone(&delivered)));
+
+        let panic = catch_unwind(std::panic::AssertUnwindSafe(|| executor.execute_cycle())).unwrap_err();
+
+        assert_eq!(*panic.downcast::<&str>().unwrap(), message);
+        assert_eq!(delivered.get(), Some(outcome));
     }
 }
 

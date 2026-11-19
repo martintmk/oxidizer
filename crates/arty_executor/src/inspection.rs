@@ -129,3 +129,54 @@ where
         self.instrumentation.cancelled();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    struct Recorder(Rc<RefCell<Vec<&'static str>>>);
+
+    impl TaskInstrumentation for Recorder {
+        fn poll_start(&mut self) {
+            self.0.borrow_mut().push("start");
+        }
+
+        fn poll_end(&mut self, _outcome: Poll<()>) {
+            self.0.borrow_mut().push("end");
+        }
+
+        fn completed(&mut self) {
+            self.0.borrow_mut().push("completed");
+        }
+
+        fn panicked(&mut self) {
+            self.0.borrow_mut().push("panicked");
+        }
+
+        fn cancelled(&mut self) {
+            self.0.borrow_mut().push("cancelled");
+        }
+    }
+
+    #[test]
+    fn inspect_wrapper_forwards_instrumentation_callbacks() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut instrumentation = InspectWith::new(Recorder(Rc::clone(&calls)), Some);
+        let mut description = None;
+
+        instrumentation.inspect(TaskState::Ready, &mut |value| {
+            description = value.downcast_ref::<TaskState>().copied();
+        });
+        instrumentation.poll_start();
+        instrumentation.poll_end(Poll::Pending);
+        instrumentation.completed();
+        instrumentation.panicked();
+        instrumentation.cancelled();
+
+        assert_eq!(description, Some(TaskState::Ready));
+        assert_eq!(*calls.borrow(), ["start", "end", "completed", "panicked", "cancelled"]);
+    }
+}

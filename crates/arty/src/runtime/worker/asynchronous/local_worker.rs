@@ -114,9 +114,7 @@ impl LocalWorker {
 
     fn execute_spawn_hooks(thread: &Thread) -> Option<TaskObservers> {
         let hooks = SPAWN_HOOKS.with_borrow(|hooks| Arc::clone(hooks.as_ref().expect("a running worker retains its installed hooks")));
-        if hooks.is_empty() {
-            return None;
-        }
+        debug_assert!(!hooks.is_empty(), "the scheduler flag tracks installed spawn hooks");
         let mut event = TaskSpawn::new(Some(thread.clone()));
         for hook in hooks.iter() {
             hook.execute(&mut event);
@@ -304,6 +302,7 @@ impl SchedulerContext {
 #[cfg_attr(coverage_nightly, coverage(off))]
 // Public tasks cannot install partial TLS registrations or inspect local queue routing.
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Poll, Wake, Waker};
 
@@ -316,6 +315,7 @@ mod tests {
     use super::*;
     use crate::runtime::config::RuntimeName;
     use crate::runtime::dispatch::{DispatcherCore, WorkerEndpoint};
+    use crate::runtime::hook::{HookFn, registration};
     use crate::runtime::shutdown::Shutdown;
     use crate::runtime::testing::worker_endpoint;
     use crate::runtime::worker::asynchronous::SpawnCommand;
@@ -351,6 +351,76 @@ mod tests {
         let _guard = LOCAL_SPAWN_HOOK.initialize();
 
         assert!(LocalWorker::on_spawn().is_none());
+    }
+
+    #[derive(Clone)]
+    struct SpawnSources(Arc<Mutex<Vec<Option<std::thread::ThreadId>>>>);
+
+    impl ThreadAware for SpawnSources {
+        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+    }
+
+    #[test]
+    fn dispatcher_uses_worker_local_spawn_hooks_for_remote_submission() {
+        let (queued, sources, source_id) = std::thread::spawn(|| {
+            let builder = ThreadBuilder::default();
+            let destination_builder = builder.clone();
+            let source = builder.build(std::thread::current().id());
+            let destination = std::thread::spawn(move || destination_builder.build(std::thread::current().id()))
+                .join()
+                .unwrap();
+            let sources = Arc::new(Mutex::new(Vec::new()));
+            let hook = registration(HookFn::<TaskSpawn, _>::new(SpawnSources(Arc::clone(&sources)), |event, sources| {
+                sources.0.lock().unwrap().push(event.thread().map(Thread::id))
+            }));
+            let shutdown = Shutdown::default();
+            let (source_commands, _source_rx) = crate::runtime::worker::asynchronous::command_channel();
+            let (destination_commands, destination_rx) = crate::runtime::worker::asynchronous::command_channel();
+            let core = DispatcherCore::new(
+                NonEmpty::from_vec(vec![
+                    worker_endpoint(
+                        source_commands,
+                        Waker::noop().clone(),
+                        source.clone(),
+                        Worker::new(Pool::new(RuntimeName::default(), None, None), shutdown.clone()),
+                    ),
+                    worker_endpoint(
+                        destination_commands,
+                        Waker::noop().clone(),
+                        destination.clone(),
+                        Worker::new(Pool::new(RuntimeName::default(), None, None), shutdown.clone()),
+                    ),
+                ])
+                .unwrap(),
+                shutdown,
+                vec![hook.clone()],
+            );
+            let _prime = core.spawn_relocating(&destination, |_| async {});
+            sources.lock().unwrap().clear();
+            let dispatcher = DispatcherClient::new(Arc::clone(&core));
+            let io = crate::io::Io::new(
+                arty_io_host::IoRuntime::new(observed::Sink::noop()),
+                dispatcher.clone(),
+                source.clone(),
+            );
+            let (clock, _clock_driver) = InactiveClock::new_isolated().activate(Waker::noop().clone());
+            let context = Context::new(dispatcher, clock, io, source.clone());
+            let executor = Executor::builder().thread(source.clone()).build();
+            LocalWorker::attach();
+            LocalWorker::install_scheduler(context, executor.tasks(), executor.shutdown(), vec![hook]);
+
+            let _task = core.spawn_relocating(&source, |_| async {});
+            let queued = destination_rx.spawn_receiver().try_recv().is_ok();
+
+            LocalWorker::clear_scheduler();
+            let observed_sources = sources.lock().unwrap().clone();
+            (queued, observed_sources, source.id())
+        })
+        .join()
+        .unwrap();
+
+        assert!(queued);
+        assert_eq!(sources, [Some(source_id)]);
     }
 
     #[test]

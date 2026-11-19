@@ -168,6 +168,7 @@ mod tests {
 
     use std::alloc::System;
     use std::hint::black_box;
+    use std::sync::{Arc, Mutex};
 
     use alloc_tracker::{Allocator, Session};
     use thread_aware::ThreadBuilder;
@@ -189,6 +190,20 @@ mod tests {
         fn poll_start(&mut self) {
             black_box(self.0);
         }
+
+        fn poll_end(&mut self, _outcome: Poll<()>) {}
+    }
+
+    struct RelocationProbe(Arc<Mutex<Option<Option<std::thread::ThreadId>>>>);
+
+    impl ThreadAware for RelocationProbe {
+        fn relocate(&mut self, source: Option<&Thread>, _destination: &Thread) {
+            *self.0.lock().unwrap() = Some(source.map(Thread::id));
+        }
+    }
+
+    impl TaskObserver for RelocationProbe {
+        fn poll_start(&mut self) {}
 
         fn poll_end(&mut self, _outcome: Poll<()>) {}
     }
@@ -229,6 +244,19 @@ mod tests {
             panic!("multiple observers cannot become one observer");
         };
         assert_eq!(observers.0.len(), 2);
+    }
+
+    #[test]
+    fn relocation_uses_the_captured_source_worker() {
+        let source = ThreadBuilder::default().build(std::thread::current().id());
+        let destination = ThreadBuilder::default().build(std::thread::current().id());
+        let observed = Arc::new(Mutex::new(None));
+        let mut event = TaskSpawn::new(Some(source.clone()));
+        event.observe(RelocationProbe(Arc::clone(&observed)));
+
+        let _observer = event.into_observers().unwrap().relocate_to(&destination).into_single().unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), Some(Some(source.id())));
     }
 
     fn observer_allocations(observer_count: usize) -> u64 {

@@ -203,6 +203,14 @@ mod tests {
         }
     }
 
+    struct PanickingCancellation;
+
+    impl crate::TaskInstrumentation for PanickingCancellation {
+        fn cancelled(&mut self) {
+            panic!("rejected instrumentation cancellation");
+        }
+    }
+
     struct StopOnConvert(Shutdown);
 
     impl IntoFuture for StopOnConvert {
@@ -243,6 +251,29 @@ mod tests {
             );
 
             assert_eq!(cancellations.get(), 1);
+            assert!(cancelled.get());
+        }
+    }
+
+    #[test]
+    fn rejected_instrumentation_panics_after_cancellation_delivery() {
+        for stop_before_conversion in [true, false] {
+            let shared = ExecutorShared::new(Waker::noop().clone(), std::thread::current().id(), PanicPolicy::default());
+            if stop_before_conversion {
+                shared.shutdown().trigger(crate::ShutdownCause::default());
+            }
+            let cancelled = Rc::new(Cell::new(false));
+
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                shared.add_task(
+                    StopOnConvert(shared.shutdown().clone()),
+                    PanickingCancellation,
+                    Cancelled(Rc::clone(&cancelled)),
+                );
+            }))
+            .unwrap_err();
+
+            assert_eq!(*panic.downcast::<&str>().unwrap(), "rejected instrumentation cancellation");
             assert!(cancelled.get());
         }
     }

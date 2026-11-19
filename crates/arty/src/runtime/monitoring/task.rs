@@ -307,7 +307,59 @@ pub(crate) fn register_monitored<Body, F, R, T, I, S>(
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{AsyncTaskInfo, TaskInfo, current_task, enter_current};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use arty_executor::TaskInstrumentation;
+    use seismograph_runtime::RuntimeMetadata;
+    use seismograph_runtime::worker::{WorkerMetadata, WorkerRole};
+
+    use super::{AsyncTaskInfo, TaskInfo, TaskMonitor, current_task, enter_current};
+
+    struct Recorder(Rc<RefCell<Vec<&'static str>>>);
+
+    impl TaskInstrumentation for Recorder {
+        fn poll_start(&mut self) {
+            self.0.borrow_mut().push("start");
+        }
+
+        fn poll_end(&mut self, _outcome: std::task::Poll<()>) {
+            self.0.borrow_mut().push("end");
+        }
+
+        fn completed(&mut self) {
+            self.0.borrow_mut().push("completed");
+        }
+
+        fn panicked(&mut self) {
+            self.0.borrow_mut().push("panicked");
+        }
+
+        fn cancelled(&mut self) {
+            self.0.borrow_mut().push("cancelled");
+        }
+    }
+
+    #[test]
+    fn task_monitor_forwards_instrumentation_callbacks() {
+        let runtime = seismograph_runtime::register_runtime(RuntimeMetadata::new("instrumentation-forwarding", 1));
+        let worker = runtime.register_worker(WorkerMetadata::new(WorkerRole::Core));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut monitor = TaskMonitor::<(), _, _> {
+            instrumentation: Recorder(Rc::clone(&calls)),
+            info: AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0),
+            body_size: || 0,
+            marker: std::marker::PhantomData,
+        };
+
+        monitor.poll_start();
+        monitor.poll_end(std::task::Poll::Pending);
+        monitor.completed();
+        monitor.panicked();
+        monitor.cancelled();
+
+        assert_eq!(*calls.borrow(), ["start", "end", "completed", "panicked", "cancelled"]);
+    }
 
     #[test]
     fn current_task_scope_restores_its_parent_after_return_and_panic() {

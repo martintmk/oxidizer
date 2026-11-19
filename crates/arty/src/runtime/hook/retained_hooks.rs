@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -16,8 +15,7 @@ pub(crate) struct ClearedHooks {
 #[derive(derive_more::Debug)]
 pub(crate) struct RetainedHooks {
     registration: Mutex<()>,
-    closed: AtomicBool,
-    has_task_spawn: AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
     task_spawn: ArcSwap<Vec<Arc<ErasedHookFn<TaskSpawn>>>>,
     worker_init: ArcSwap<Vec<Arc<ErasedHookFn<WorkerInit>>>>,
 }
@@ -35,8 +33,7 @@ impl RetainedHooks {
         }
         Self {
             registration: Mutex::new(()),
-            closed: AtomicBool::new(false),
-            has_task_spawn: AtomicBool::new(!task_spawn.is_empty()),
+            closed: std::sync::atomic::AtomicBool::new(false),
             task_spawn: ArcSwap::from_pointee(task_spawn),
             worker_init: ArcSwap::from_pointee(worker_init),
         }
@@ -44,13 +41,12 @@ impl RetainedHooks {
 
     pub(crate) fn push(&self, hook: HookRegistration) -> bool {
         let _registration = self.registration.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
         match hook {
             HookRegistration::TaskSpawn(hook) => {
                 Self::push_to(&self.task_spawn, hook);
-                self.has_task_spawn.store(true, Ordering::Release);
             }
             HookRegistration::WorkerInit(hook) => Self::push_to(&self.worker_init, hook),
             HookRegistration::Panic(_) => {}
@@ -61,17 +57,13 @@ impl RetainedHooks {
     fn push_to<T>(hooks: &ArcSwap<Vec<Arc<T>>>, hook: T) {
         let hook = Arc::new(hook);
         hooks.rcu(move |current| {
-            let mut updated = Vec::with_capacity(current.len().saturating_add(1));
-            updated.extend(current.iter().cloned());
+            let mut updated = current.as_ref().clone();
             updated.push(Arc::clone(&hook));
             Arc::new(updated)
         });
     }
 
     pub(crate) fn execute_task_spawn(&self, create_event: impl FnOnce() -> TaskSpawn) -> Option<TaskObservers> {
-        if !self.has_task_spawn.load(Ordering::Acquire) {
-            return None;
-        }
         let hooks = self.task_spawn.load();
         if hooks.is_empty() {
             return None;
@@ -85,8 +77,7 @@ impl RetainedHooks {
 
     pub(crate) fn clear(&self) -> ClearedHooks {
         let _registration = self.registration.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.closed.store(true, Ordering::Release);
-        self.has_task_spawn.store(false, Ordering::Release);
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
         ClearedHooks {
             _task_spawn: self.task_spawn.swap(Arc::new(Vec::new())),
             _worker_init: self.worker_init.swap(Arc::new(Vec::new())),
@@ -102,7 +93,7 @@ impl RetainedHooks {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use thread_aware::{Thread, ThreadAware};
 

@@ -141,6 +141,43 @@ impl TaskObserver for SpawnSourceObserver {
     fn poll_end(&mut self, _outcome: Poll<()>) {}
 }
 
+#[derive(Default)]
+struct SpawnLifecycle {
+    callback: Option<ThreadId>,
+    source: Option<ThreadId>,
+    relocation: Option<(Option<ThreadId>, ThreadId)>,
+    poll_starts: Vec<ThreadId>,
+    poll_ends: Vec<(ThreadId, Poll<()>)>,
+}
+
+#[derive(Clone)]
+struct SpawnLifecycleProbe {
+    enabled: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<SpawnLifecycle>>,
+}
+
+impl ThreadAware for SpawnLifecycleProbe {
+    fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+}
+
+struct LifecyclePoll(Arc<Mutex<SpawnLifecycle>>);
+
+impl ThreadAware for LifecyclePoll {
+    fn relocate(&mut self, source: Option<&Thread>, destination: &Thread) {
+        self.0.lock().unwrap().relocation = Some((source.map(Thread::id), destination.id()));
+    }
+}
+
+impl TaskObserver for LifecyclePoll {
+    fn poll_start(&mut self) {
+        self.0.lock().unwrap().poll_starts.push(thread::current().id());
+    }
+
+    fn poll_end(&mut self, outcome: Poll<()>) {
+        self.0.lock().unwrap().poll_ends.push((thread::current().id(), outcome));
+    }
+}
+
 struct PollRecorder {
     before: &'static str,
     after: &'static str,
@@ -457,6 +494,83 @@ fn spawn_hook_uses_the_actual_submitting_worker() {
         .collect();
     assert!(relocated.contains(&(None, destination.id(), destination.id())));
     assert!(relocated.contains(&(Some(destination.id()), target.id(), target.id())));
+    runtime.stop().unwrap();
+}
+
+#[test]
+fn worker_originated_spawn_runs_the_complete_hook_lifecycle() {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let lifecycle = Arc::new(Mutex::new(SpawnLifecycle::default()));
+    let runtime = Runtime::builder()
+        .workers(WorkersPolicy::exactly(2))
+        .on(HookFn::<TaskSpawn, _>::new(
+            SpawnLifecycleProbe {
+                enabled: Arc::clone(&enabled),
+                lifecycle: Arc::clone(&lifecycle),
+            },
+            |event, probe| {
+                if !probe.enabled.load(Ordering::Acquire) {
+                    return;
+                }
+                {
+                    let mut lifecycle = probe.lifecycle.lock().unwrap();
+                    lifecycle.callback = Some(thread::current().id());
+                    lifecycle.source = event.thread().map(Thread::id);
+                }
+                event.observe(LifecyclePoll(Arc::clone(&probe.lifecycle)));
+            },
+        ))
+        .build()
+        .unwrap();
+    let (scheduler, source, destination) = runtime
+        .scheduler()
+        .block_on(async |cx| {
+            let destination = cx
+                .control()
+                .workers()
+                .into_iter()
+                .find(|worker| worker.id() != cx.thread().id())
+                .unwrap()
+                .clone();
+            (cx.scheduler().clone(), cx.thread().clone(), destination)
+        })
+        .unwrap();
+
+    let bound = scheduler.clone();
+    let probe = SpawnLifecycleProbe {
+        enabled: Arc::clone(&enabled),
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    scheduler
+        .spawn_at(
+            &source,
+            (bound, destination.clone(), probe),
+            |(bound, destination, probe)| async move {
+                probe.enabled.store(true, Ordering::Release);
+                bound.spawn_at(&destination, (), |()| async {}).await.unwrap();
+                probe.enabled.store(false, Ordering::Release);
+            },
+        )
+        .join()
+        .unwrap();
+
+    let lifecycle = lifecycle.lock().unwrap();
+    assert_eq!(
+        (
+            lifecycle.callback,
+            lifecycle.source,
+            lifecycle.relocation,
+            lifecycle.poll_starts.as_slice(),
+            lifecycle.poll_ends.as_slice(),
+        ),
+        (
+            Some(source.id()),
+            Some(source.id()),
+            Some((Some(source.id()), destination.id())),
+            [destination.id()].as_slice(),
+            [(destination.id(), Poll::Ready(()))].as_slice(),
+        )
+    );
     runtime.stop().unwrap();
 }
 
