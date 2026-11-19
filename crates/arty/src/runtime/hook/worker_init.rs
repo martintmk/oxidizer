@@ -5,8 +5,8 @@ use thread_aware::Thread;
 
 /// An event that runs once on each async worker after the worker initializes.
 ///
-/// Each registered callback runs exactly once on every worker. This includes
-/// workers that start after callback registration.
+/// Arty retains each registered callback. The callback runs once on every
+/// current worker and once on each worker that starts after registration.
 ///
 /// Do not request runtime shutdown from this callback, including through
 /// [`RuntimeControl::request_stop`](crate::runtime::RuntimeControl::request_stop).

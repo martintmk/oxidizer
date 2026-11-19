@@ -6,10 +6,14 @@
 //! This module provides these hooks:
 //!
 //! - [`TaskSpawn`] runs when Arty submits an async task.
-//! - [`WorkerInit`] runs once on each async worker after the worker initializes.
-//!   It also runs on workers that start after registration.
+//! - [`WorkerInit`] [^worker-init-retention] runs once on each async worker after
+//!   the worker initializes.
 //! - [`Panic`] runs when Arty contains a panic from an async task factory or
 //!   task poll. The callback can stop the runtime or keep it running.
+//!
+//! [^worker-init-retention]: [`WorkerInit`] has retained registration semantics.
+//! Arty runs the callback on current workers and on workers that start after
+//! registration.
 //!
 //! Arty clones the data for each worker and relocates it before a callback can
 //! run there. Task-spawn hooks also keep a worker-neutral instance for submissions
