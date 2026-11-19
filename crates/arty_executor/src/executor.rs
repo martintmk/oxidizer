@@ -10,7 +10,7 @@ use std::task;
 use std::thread::ThreadId;
 
 use nm::{Event, Magnitude, MetricsPusher, Push};
-use tick::SimpleClock;
+use tick::{SimpleClock, Stopwatch};
 
 use crate::{
     CycleOutcome, ExecutorBuilder, ExecutorShared, InspectionError, InspectionStatus, PollObserver, Shutdown, ShutdownCause, TaskHandle,
@@ -128,7 +128,7 @@ impl Executor {
     #[must_use]
     pub(crate) fn new(owner_waker: task::Waker, thread_id: ThreadId, panic_policy: crate::PanicPolicy) -> Self {
         let shared = ExecutorShared::new(owner_waker, thread_id, panic_policy);
-        let clock = SimpleClock::new_system().with_fast_instant(true);
+        let stopwatch = Stopwatch::new_coarse(SimpleClock::new_system());
         // Register before creating an executor because its Drop unregisters this thread.
         executor_context::register(thread_id);
         Self {
