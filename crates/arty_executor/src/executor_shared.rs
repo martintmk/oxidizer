@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem;
 use std::ops::ControlFlow;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Waker;
@@ -123,21 +123,32 @@ impl ExecutorShared {
         I: TaskInstrumentation<F::IntoFuture>,
     {
         if self.shutdown().is_triggered() {
-            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(instrumentation))) {
-                discard_task_panic_payload(panic);
-            }
-            completion.cancelled(self.shutdown().cause());
+            Self::reject_task::<F::IntoFuture, _, _>(instrumentation, completion, self.shutdown().cause());
             return;
         }
         let future = future.into_future();
         if self.shutdown().is_triggered() {
-            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(instrumentation))) {
-                discard_task_panic_payload(panic);
-            }
-            completion.cancelled(self.shutdown().cause());
+            Self::reject_task::<F::IntoFuture, _, _>(instrumentation, completion, self.shutdown().cause());
             return;
         }
         self.register_task(allocate_task(&self.inner.task_storage, future, instrumentation, completion));
+    }
+
+    fn reject_task<F, T, I>(mut instrumentation: I, completion: T, cause: crate::ShutdownCause)
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+        T: TaskCompletion<F::Output>,
+        I: TaskInstrumentation<F>,
+    {
+        let callback_panic = catch_unwind(AssertUnwindSafe(|| instrumentation.cancelled())).err();
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(instrumentation))) {
+            discard_task_panic_payload(panic);
+        }
+        completion.cancelled(cause);
+        if let Some(panic) = callback_panic {
+            resume_unwind(panic);
+        }
     }
 
     #[inline]
@@ -169,6 +180,41 @@ impl ExecutorShared {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct Cancelled(Rc<Cell<bool>>);
+
+    impl crate::TaskCompletion<()> for Cancelled {
+        fn completed(self, (): ()) {}
+
+        fn panicked(self, panic: crate::TaskPanicPayload, _cause: Option<crate::ShutdownCause>) {
+            crate::discard_task_panic_payload(panic);
+        }
+
+        fn cancelled(self, _cause: crate::ShutdownCause) {
+            self.0.set(true);
+        }
+    }
+
+    struct CountCancellation(Rc<Cell<usize>>);
+
+    impl<F> crate::TaskInstrumentation<F> for CountCancellation {
+        fn cancelled(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    struct StopOnConvert(Shutdown);
+
+    impl IntoFuture for StopOnConvert {
+        type Output = ();
+        type IntoFuture = std::future::Pending<()>;
+
+        fn into_future(self) -> Self::IntoFuture {
+            self.0.trigger(crate::ShutdownCause::default());
+            std::future::pending()
+        }
+    }
+
     #[test]
     fn borrowed_submission_storage_reports_busy_and_recovers_after_release() {
         let shared = ExecutorShared::new(Waker::noop().clone(), std::thread::current().id(), PanicPolicy::default());
@@ -179,5 +225,25 @@ mod tests {
         let released = shared.inspect_new_tasks(|_| ControlFlow::Continue(()));
 
         assert_eq!((busy, released), (Err(crate::InspectionError::Busy), Ok(())));
+    }
+
+    #[test]
+    fn rejected_tasks_notify_instrumentation_before_and_during_conversion() {
+        for stop_before_conversion in [true, false] {
+            let shared = ExecutorShared::new(Waker::noop().clone(), std::thread::current().id(), PanicPolicy::default());
+            if stop_before_conversion {
+                shared.shutdown().trigger(crate::ShutdownCause::default());
+            }
+            let cancellations = Rc::new(Cell::new(0));
+            let cancelled = Rc::new(Cell::new(false));
+            shared.add_task(
+                StopOnConvert(shared.shutdown().clone()),
+                CountCancellation(Rc::clone(&cancellations)),
+                Cancelled(Rc::clone(&cancelled)),
+            );
+
+            assert_eq!(cancellations.get(), 1);
+            assert!(cancelled.get());
+        }
     }
 }

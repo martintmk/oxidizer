@@ -1,13 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#![allow(clippy::panic, clippy::unwrap_used, reason = "test code")]
+
 use std::cell::{Cell, RefCell};
 use std::future::poll_fn;
 use std::panic::{RefUnwindSafe, UnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
+use std::thread;
 
 use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskInstrumentation, TaskSet, discard_task_panic_payload};
 use static_assertions::assert_not_impl_any;
@@ -84,6 +87,60 @@ fn task_observer_receives_each_poll_outcome() {
 
     assert_eq!(starts.get(), 2);
     assert_eq!(*outcomes.borrow(), [Poll::Pending, Poll::Ready(())]);
+}
+
+struct PanickingCancellation;
+
+impl<F> TaskInstrumentation<F> for PanickingCancellation {
+    fn cancelled(&mut self) {
+        panic!("instrumentation cancellation");
+    }
+}
+
+struct CaptureWaker {
+    waker: std::sync::mpsc::Sender<Waker>,
+    dropped: std::sync::mpsc::Sender<thread::ThreadId>,
+}
+
+impl Future for CaptureWaker {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.waker.send(cx.waker().clone()).unwrap();
+        Poll::Pending
+    }
+}
+
+impl Drop for CaptureWaker {
+    fn drop(&mut self) {
+        self.dropped.send(thread::current().id()).unwrap();
+    }
+}
+
+#[test]
+fn panicking_cancellation_retires_payload_before_remote_waker_release() {
+    let owner = thread::current().id();
+    let (waker_tx, waker_rx) = std::sync::mpsc::channel();
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let mut executor = ExecutorBuilder::new().build();
+    executor
+        .tasks()
+        .task(CaptureWaker {
+            waker: waker_tx,
+            dropped: dropped_tx,
+        })
+        .instrument(PanickingCancellation)
+        .register(DiscardCompletion);
+    _ = executor.execute_cycle();
+    let waker = waker_rx.recv().unwrap();
+    executor.shutdown().trigger(arty_executor::ShutdownCause::default());
+
+    let panic = catch_unwind(std::panic::AssertUnwindSafe(|| executor.execute_cycle())).unwrap_err();
+    assert_eq!(*panic.downcast::<&str>().unwrap(), "instrumentation cancellation");
+    assert_eq!(dropped_rx.recv().unwrap(), owner);
+    drop(executor);
+
+    thread::spawn(move || drop(waker)).join().unwrap();
 }
 
 #[test]

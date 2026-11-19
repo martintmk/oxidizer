@@ -5,7 +5,7 @@ use std::any::Any;
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::fmt::Debug;
 use std::marker::PhantomPinned;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::task;
 
@@ -268,7 +268,7 @@ where
     ) -> task::Poll<()> {
         let payload = maybe_payload.as_mut().expect("a polled task retains its payload");
         let result_target = payload.result_target.take().expect("a polled task retains its result target");
-        payload.instrumentation.panicked();
+        let instrumentation_panic = catch_unwind(AssertUnwindSafe(|| payload.instrumentation.panicked())).err();
 
         wake_signal.retire();
         // SAFETY: The future remains pinned with its task and is destroyed in place.
@@ -283,6 +283,9 @@ where
         }
         let cause = shutdown.is_triggered().then(|| shutdown.cause());
         result_target.panicked(panic, cause);
+        if let Some(panic) = instrumentation_panic {
+            resume_unwind(panic);
+        }
         task::Poll::Ready(())
     }
 
@@ -292,9 +295,12 @@ where
             .result_target
             .take()
             .expect("the result target is present until the task enters a terminal state");
-        payload.instrumentation.completed();
+        let instrumentation_panic = catch_unwind(AssertUnwindSafe(|| payload.instrumentation.completed())).err();
         Self::retire_payload(maybe_payload);
         result_target.completed(result);
+        if let Some(panic) = instrumentation_panic {
+            resume_unwind(panic);
+        }
     }
 
     fn finish_cancelled(maybe_payload: &mut Option<Payload<F, T, I>>, cause: ShutdownCause) {
@@ -305,13 +311,16 @@ where
             .result_target
             .take()
             .expect("the result target is present until the task enters a terminal state");
-        payload.instrumentation.cancelled();
+        let instrumentation_panic = catch_unwind(AssertUnwindSafe(|| payload.instrumentation.cancelled())).err();
         // SAFETY: The future is pinned with Task and destroyed in place.
         let future_panic = unsafe { Pin::new_unchecked(&mut payload.future) }.destroy_pinned().err();
         Self::retire_payload(maybe_payload);
         result_target.cancelled(cause);
         if let Some(panic) = future_panic {
             discard_task_panic_payload(panic);
+        }
+        if let Some(panic) = instrumentation_panic {
+            resume_unwind(panic);
         }
     }
 
