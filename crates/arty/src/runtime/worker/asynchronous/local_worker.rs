@@ -433,6 +433,13 @@ mod tests {
             let queued = destination_rx.spawn_receiver().try_recv().is_ok();
 
             LocalWorker::clear_scheduler();
+            let scheduler_cleared = LocalWorker::with_current(|current| {
+                current.is_some_and(|current| current.scheduler.is_none() && current.spawn_hooks.is_none() && current.panic_hooks.is_none())
+            });
+            assert!(
+                scheduler_cleared,
+                "clear_scheduler must release all worker-local registrations before thread teardown"
+            );
             let observed_sources = sources.lock().unwrap().clone();
             (queued, observed_sources, source.id())
         })

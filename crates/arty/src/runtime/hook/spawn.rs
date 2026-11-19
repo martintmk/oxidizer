@@ -194,11 +194,18 @@ mod tests {
         fn poll_end(&mut self, _outcome: Poll<()>) {}
     }
 
-    struct RelocationProbe(Arc<Mutex<Option<Option<std::thread::ThreadId>>>>);
+    #[derive(Debug, Eq, PartialEq)]
+    enum RelocationSource {
+        NotRelocated,
+        External,
+        Worker(std::thread::ThreadId),
+    }
+
+    struct RelocationProbe(Arc<Mutex<RelocationSource>>);
 
     impl ThreadAware for RelocationProbe {
         fn relocate(&mut self, source: Option<&Thread>, _destination: &Thread) {
-            *self.0.lock().unwrap() = Some(source.map(Thread::id));
+            *self.0.lock().unwrap() = source.map_or(RelocationSource::External, |thread| RelocationSource::Worker(thread.id()));
         }
     }
 
@@ -250,13 +257,13 @@ mod tests {
     fn relocation_uses_the_captured_source_worker() {
         let source = ThreadBuilder::default().build(std::thread::current().id());
         let destination = ThreadBuilder::default().build(std::thread::current().id());
-        let observed = Arc::new(Mutex::new(None));
+        let observed = Arc::new(Mutex::new(RelocationSource::NotRelocated));
         let mut event = TaskSpawn::new(Some(source.clone()));
         event.observe(RelocationProbe(Arc::clone(&observed)));
 
         let _observer = event.into_observers().unwrap().relocate_to(&destination).into_single().unwrap();
 
-        assert_eq!(*observed.lock().unwrap(), Some(Some(source.id())));
+        assert_eq!(*observed.lock().unwrap(), RelocationSource::Worker(source.id()));
     }
 
     fn observer_allocations(observer_count: usize) -> u64 {
