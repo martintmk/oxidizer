@@ -217,7 +217,7 @@ mod tests {
         executor
             .tasks()
             .task(std::future::pending::<()>())
-            .inspect(|_, _| Some(PollTask(seismograph_runtime::allocate_task_id())))
+            .inspect(|_| Some(PollTask(seismograph_runtime::allocate_task_id())))
             .register(sender);
         assert_eq!(capture(&mut executor).tasks.len(), 1);
 

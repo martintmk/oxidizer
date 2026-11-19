@@ -59,9 +59,9 @@ pub trait PollObserver: std::fmt::Debug {
 }
 
 /// Runtime-owned behavior attached to one task.
-pub trait TaskInstrumentation<F>: 'static {
+pub trait TaskInstrumentation: 'static {
     /// Visits a temporary description of the task.
-    fn inspect(&self, _future: &F, _state: TaskState, _visitor: &mut dyn FnMut(&dyn Any)) {}
+    fn inspect(&self, _state: TaskState, _visitor: &mut dyn FnMut(&dyn Any)) {}
 
     /// Runs immediately before the executor polls the task.
     fn poll_start(&mut self) {}
@@ -79,7 +79,7 @@ pub trait TaskInstrumentation<F>: 'static {
     fn cancelled(&mut self) {}
 }
 
-impl<F> TaskInstrumentation<F> for () {}
+impl TaskInstrumentation for () {}
 
 pub(crate) struct InspectWith<I, J, D> {
     instrumentation: I,
@@ -97,14 +97,14 @@ impl<I, J, D> InspectWith<I, J, D> {
     }
 }
 
-impl<F, I, J, D> TaskInstrumentation<F> for InspectWith<I, J, D>
+impl<I, J, D> TaskInstrumentation for InspectWith<I, J, D>
 where
-    I: TaskInstrumentation<F>,
-    J: Fn(&F, TaskState) -> Option<D> + 'static,
+    I: TaskInstrumentation,
+    J: Fn(TaskState) -> Option<D> + 'static,
     D: 'static,
 {
-    fn inspect(&self, future: &F, state: TaskState, visitor: &mut dyn FnMut(&dyn Any)) {
-        if let Some(description) = (self.inspect)(future, state) {
+    fn inspect(&self, state: TaskState, visitor: &mut dyn FnMut(&dyn Any)) {
+        if let Some(description) = (self.inspect)(state) {
             visitor(&description);
         }
     }

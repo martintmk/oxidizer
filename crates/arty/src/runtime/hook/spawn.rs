@@ -127,7 +127,7 @@ impl PollObservers {
     }
 }
 
-impl<F> arty_executor::TaskInstrumentation<F> for Box<dyn TaskObserver> {
+impl arty_executor::TaskInstrumentation for Box<dyn TaskObserver> {
     fn poll_start(&mut self) {
         TaskObserver::poll_start(self.as_mut());
     }
@@ -137,7 +137,7 @@ impl<F> arty_executor::TaskInstrumentation<F> for Box<dyn TaskObserver> {
     }
 }
 
-impl<F> arty_executor::TaskInstrumentation<F> for PollObservers {
+impl arty_executor::TaskInstrumentation for PollObservers {
     fn poll_start(&mut self) {
         Self::poll_start(self);
     }

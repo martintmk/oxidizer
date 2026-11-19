@@ -222,13 +222,13 @@ struct TaskMonitor<Body, I, S> {
     marker: std::marker::PhantomData<fn() -> Body>,
 }
 
-impl<Body, F, I, S> TaskInstrumentation<F> for TaskMonitor<Body, I, S>
+impl<Body, I, S> TaskInstrumentation for TaskMonitor<Body, I, S>
 where
     Body: 'static,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
     S: Fn() -> usize + 'static,
 {
-    fn inspect(&self, _future: &F, state: TaskState, visitor: &mut dyn FnMut(&dyn std::any::Any)) {
+    fn inspect(&self, state: TaskState, visitor: &mut dyn FnMut(&dyn std::any::Any)) {
         match state {
             TaskState::Ready | TaskState::Waiting => {
                 let activity = if state == TaskState::Ready {
@@ -288,7 +288,7 @@ pub(crate) fn register_monitored<Body, F, R, T, I, S>(
     F: IntoFuture<Output = R> + 'static,
     R: 'static,
     T: TaskCompletion<R>,
-    I: TaskInstrumentation<F::IntoFuture>,
+    I: TaskInstrumentation,
     S: Fn() -> usize + 'static,
 {
     let Some(events) = current_events() else {

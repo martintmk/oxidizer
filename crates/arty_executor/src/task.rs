@@ -37,7 +37,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
     /// `None` after the task completes or the executor abandons it during shutdown.
     ///
@@ -74,7 +74,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
 }
 
@@ -84,7 +84,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
 }
 
@@ -93,7 +93,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
     fn new(future: F, result_target: T, instrumentation: I) -> Self {
         Self {
@@ -120,7 +120,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
     pool.alloc_arc_pin_with(|| Task::new(future, completion, instrumentation))
 }
@@ -152,16 +152,13 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
     fn inspect(&self, state: TaskState, visitor: &mut dyn FnMut(&dyn Any)) {
         // SAFETY: Inspection runs on the owner between cycles or immediately before polling.
-        // The shared future reference ends before a poll or retirement can borrow its payload.
         let payload = unsafe { &*self.payload.get() };
-        if let Some(payload) = payload
-            && let Some(future) = &payload.future.inner
-        {
-            payload.instrumentation.inspect(future, state, visitor);
+        if let Some(payload) = payload {
+            payload.instrumentation.inspect(state, visitor);
         }
     }
 
@@ -252,7 +249,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
     fn pinned_wake_signal(self: Pin<&Self>) -> Pin<&WakeSignal> {
         let signal = self.get_ref().wake_signal.get().expect("task must be initialized before poll()");
@@ -359,7 +356,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: TaskInstrumentation<F>,
+    I: TaskInstrumentation,
 {
     /// The future that will be polled by the executor to progress the task.
     future: FutureStorage<F>,
@@ -418,7 +415,7 @@ impl<F: Future> FutureStorage<F> {
         cx: &mut task::Context<'_>,
     ) -> Result<task::Poll<F::Output>, TaskPanicPayload>
     where
-        I: TaskInstrumentation<F>,
+        I: TaskInstrumentation,
     {
         instrumentation.poll_start();
         let outcome = {

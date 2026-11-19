@@ -49,7 +49,7 @@ struct PollOutcomes {
     outcomes: Rc<RefCell<Vec<Poll<()>>>>,
 }
 
-impl<F> TaskInstrumentation<F> for PollOutcomes {
+impl TaskInstrumentation for PollOutcomes {
     fn poll_start(&mut self) {
         self.starts.set(self.starts.get() + 1);
     }
@@ -91,7 +91,7 @@ fn task_observer_receives_each_poll_outcome() {
 
 struct PanickingCancellation;
 
-impl<F> TaskInstrumentation<F> for PanickingCancellation {
+impl TaskInstrumentation for PanickingCancellation {
     fn cancelled(&mut self) {
         panic!("instrumentation cancellation");
     }

@@ -120,7 +120,7 @@ impl ExecutorShared {
         F: IntoFuture + 'static,
         F::Output: 'static,
         T: TaskCompletion<F::Output>,
-        I: TaskInstrumentation<F::IntoFuture>,
+        I: TaskInstrumentation,
     {
         if self.shutdown().is_triggered() {
             Self::reject_task::<F::IntoFuture, _, _>(instrumentation, completion, self.shutdown().cause());
@@ -139,7 +139,7 @@ impl ExecutorShared {
         F: Future + 'static,
         F::Output: 'static,
         T: TaskCompletion<F::Output>,
-        I: TaskInstrumentation<F>,
+        I: TaskInstrumentation,
     {
         let callback_panic = catch_unwind(AssertUnwindSafe(|| instrumentation.cancelled())).err();
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(instrumentation))) {
@@ -197,7 +197,7 @@ mod tests {
 
     struct CountCancellation(Rc<Cell<usize>>);
 
-    impl<F> crate::TaskInstrumentation<F> for CountCancellation {
+    impl crate::TaskInstrumentation for CountCancellation {
         fn cancelled(&mut self) {
             self.0.set(self.0.get() + 1);
         }

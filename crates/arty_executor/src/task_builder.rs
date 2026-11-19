@@ -30,12 +30,11 @@ impl<'a, F> TaskBuilder<'a, F> {
 
 impl<'a, F, I> TaskBuilder<'a, F, I> {
     /// Adds a callback that describes the converted future during inspection.
-    pub fn inspect<D, J>(self, inspect: J) -> TaskBuilder<'a, F, impl TaskInstrumentation<F::IntoFuture> + use<F, I, D, J>>
+    pub fn inspect<D, J>(self, inspect: J) -> TaskBuilder<'a, F, impl TaskInstrumentation + use<F, I, D, J>>
     where
-        F: IntoFuture,
-        I: TaskInstrumentation<F::IntoFuture>,
+        I: TaskInstrumentation,
         D: 'static,
-        J: Fn(&F::IntoFuture, crate::TaskState) -> Option<D> + 'static,
+        J: Fn(crate::TaskState) -> Option<D> + 'static,
     {
         TaskBuilder {
             shared: self.shared,
@@ -47,8 +46,7 @@ impl<'a, F, I> TaskBuilder<'a, F, I> {
     /// Sets the runtime-owned behavior attached to this task.
     pub fn instrument<Q>(self, instrumentation: Q) -> TaskBuilder<'a, F, Q>
     where
-        F: IntoFuture,
-        Q: TaskInstrumentation<F::IntoFuture>,
+        Q: TaskInstrumentation,
     {
         TaskBuilder {
             shared: self.shared,
@@ -62,7 +60,7 @@ impl<F, I> TaskBuilder<'_, F, I>
 where
     F: IntoFuture + 'static,
     F::Output: 'static,
-    I: TaskInstrumentation<F::IntoFuture>,
+    I: TaskInstrumentation,
 {
     /// Registers the task and its completion target.
     ///

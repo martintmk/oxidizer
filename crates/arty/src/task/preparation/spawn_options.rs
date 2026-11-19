@@ -79,7 +79,7 @@ where
         F: IntoFuture<Output = R> + 'static,
         R: 'static,
         T: TaskCompletion<R>,
-        I: TaskInstrumentation<F::IntoFuture>,
+        I: TaskInstrumentation,
     {
         #[cfg(any(test, feature = "monitor"))]
         crate::runtime::monitoring::register_monitored::<Body, _, _, _, _, _>(

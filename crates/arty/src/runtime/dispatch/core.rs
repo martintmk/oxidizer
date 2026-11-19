@@ -308,8 +308,7 @@ impl DispatcherCore {
         if matches!(self.shutdown().state(), ShutdownState::Started) {
             return false;
         }
-        self.retained_hooks.push(hook);
-        matches!(self.shutdown().state(), ShutdownState::Running)
+        self.retained_hooks.push(hook)
     }
 
     fn runtime_shutting_down_error(&self) -> Error {
