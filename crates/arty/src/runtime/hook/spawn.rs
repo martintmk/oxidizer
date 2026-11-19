@@ -39,14 +39,14 @@ pub trait TaskObserver: ThreadAware + 'static {
 /// rejects before registration. The callback must not panic.
 #[derive(derive_more::Debug)]
 pub struct TaskSpawn {
-    pub(super) thread: Option<Thread>,
+    pub(super) origin: Option<Thread>,
     #[debug(ignore)]
     pub(super) observers: Option<TaskObservers>,
 }
 
 impl TaskSpawn {
-    pub(crate) fn new(thread: Option<Thread>) -> Self {
-        Self { observers: None, thread }
+    pub(crate) fn new(origin: Option<Thread>) -> Self {
+        Self { observers: None, origin }
     }
 
     pub(crate) fn into_observers(self) -> Option<TaskObservers> {
@@ -57,8 +57,8 @@ impl TaskSpawn {
     ///
     /// Returns `None` when the submission originated outside a runtime worker.
     #[must_use]
-    pub fn thread(&self) -> Option<&Thread> {
-        self.thread.as_ref()
+    pub fn origin(&self) -> Option<&Thread> {
+        self.origin.as_ref()
     }
 
     /// Adds a poll observer to the task.
@@ -71,7 +71,7 @@ impl TaskSpawn {
         let observer = Box::new(observer) as Box<dyn TaskObserver>;
         self.observers = Some(match self.observers.take() {
             Some(observers) => observers.push(observer),
-            None => TaskObservers::new(self.thread.clone(), observer),
+            None => TaskObservers::new(self.origin.clone(), observer),
         });
     }
 }

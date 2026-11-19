@@ -389,7 +389,7 @@ mod tests {
                 .unwrap();
             let sources = Arc::new(Mutex::new(Vec::new()));
             let hook = registration(HookFn::<TaskSpawn, _>::new(SpawnSources(Arc::clone(&sources)), |event, sources| {
-                sources.0.lock().unwrap().push(event.thread().map(Thread::id))
+                sources.0.lock().unwrap().push(event.origin().map(Thread::id));
             }));
             let shutdown = Shutdown::default();
             let (source_commands, _source_rx) = crate::runtime::worker::asynchronous::command_channel();

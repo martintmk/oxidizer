@@ -421,7 +421,7 @@ fn spawn_hook_covers_runtime_local_relocating_and_specific_worker_submissions() 
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(2))
         .on(HookFn::<TaskSpawn, _>::new(PanicCount(Arc::clone(&calls)), |event, count| {
-            assert!(event.thread().is_none());
+            assert!(event.origin().is_none());
             count.0.fetch_add(1, Ordering::SeqCst);
         }))
         .build()
@@ -454,7 +454,7 @@ fn spawn_hook_uses_the_actual_submitting_worker() {
                 observers: observed_observer,
             },
             |event, probe| {
-                let source = event.thread().map(Thread::id);
+                let source = event.origin().map(Thread::id);
                 probe.events.send(source).unwrap();
                 event.observe(SpawnSourceObserver {
                     source,
@@ -515,7 +515,7 @@ fn worker_originated_spawn_runs_the_complete_hook_lifecycle() {
                 {
                     let mut lifecycle = probe.lifecycle.lock().unwrap();
                     lifecycle.callback = Some(thread::current().id());
-                    lifecycle.source = event.thread().map(Thread::id);
+                    lifecycle.source = event.origin().map(Thread::id);
                 }
                 event.observe(LifecyclePoll(Arc::clone(&probe.lifecycle)));
             },
@@ -671,7 +671,7 @@ fn detached_scheduler_relocates_and_starts_observer_before_factory() {
                     began: Arc::clone(&began),
                 },
                 |event, probe| {
-                    assert!(event.thread().is_none());
+                    assert!(event.origin().is_none());
                     probe.factory_created.store(false, Ordering::Release);
                     event.observe(RelocatedPoll {
                         factory_created: Arc::clone(&probe.factory_created),
@@ -733,7 +733,7 @@ fn control_registration_precedes_later_task_submissions() {
             destinations: Arc::clone(&destinations),
         },
         |event, probe| {
-            assert!(event.thread().is_none());
+            assert!(event.origin().is_none());
             probe.calls.fetch_add(1, Ordering::SeqCst);
         },
     ));

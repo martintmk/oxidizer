@@ -160,7 +160,7 @@ fn monitored_tasks_forward_poll_observers() {
         .workers(WorkersPolicy::exactly(1))
         .on(Panic::IGNORE)
         .on(HookFn::<TaskSpawn, _>::new(PollObservation(observed), |event, observed| {
-            if event.thread().is_some() {
+            if event.origin().is_some() {
                 event.observe(MonitoredPollObserver {
                     destination: None,
                     observed: observed.clone(),
