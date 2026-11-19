@@ -53,9 +53,9 @@ pub trait PollObserver: std::fmt::Debug {
     /// Receives a description immediately before the task is polled.
     fn poll_started(&self, description: &dyn Any);
     /// Finishes an observed poll, including a task that completed.
-    fn poll_finished(&self, completed: bool);
+    fn poll_finished(&self);
     /// Reports an instrumentation panic without preventing the task from running.
-    fn inspection_failed(&self, error: InspectionError);
+    fn inspection_failed(&self);
 }
 
 /// Runtime-owned behavior attached to one task.

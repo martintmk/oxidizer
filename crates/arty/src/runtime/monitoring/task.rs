@@ -50,14 +50,7 @@ pub(crate) fn enter_current(task: TaskId) -> CurrentTask {
     CurrentTask(CURRENT.with(|slot| slot.replace(Some(task))))
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "descriptions are transient stack values; boxing snapshots would allocate during native inspection"
-)]
-pub(crate) enum Description {
-    Snapshot(Task),
-    Poll(TaskId),
-}
+pub(crate) struct PollTask(pub(crate) TaskId);
 
 fn descriptor<T: 'static>() -> TypeDescriptorId {
     TYPES.with_borrow_mut(|types| {
@@ -236,12 +229,21 @@ where
     S: Fn() -> usize + 'static,
 {
     fn inspect(&self, _future: &F, state: TaskState, visitor: &mut dyn FnMut(&dyn std::any::Any)) {
-        let description = seismograph::recorder::without_recording(|| match state {
-            TaskState::Ready => Description::Snapshot(self.info.describe::<Body>(TaskActivityState::Ready, (self.body_size)())),
-            TaskState::Waiting => Description::Snapshot(self.info.describe::<Body>(TaskActivityState::Waiting, (self.body_size)())),
-            TaskState::Running => Description::Poll(self.info.id()),
-        });
-        visitor(&description);
+        match state {
+            TaskState::Ready | TaskState::Waiting => {
+                let activity = if state == TaskState::Ready {
+                    TaskActivityState::Ready
+                } else {
+                    TaskActivityState::Waiting
+                };
+                let task = seismograph::recorder::without_recording(|| self.info.describe::<Body>(activity, (self.body_size)()));
+                visitor(&task);
+            }
+            TaskState::Running => {
+                let task = seismograph::recorder::without_recording(|| PollTask(self.info.id()));
+                visitor(&task);
+            }
+        }
     }
 
     fn poll_start(&mut self) {
@@ -256,18 +258,21 @@ where
         if let Some(id) = self.info.terminal_id() {
             self.info.events.completed(id);
         }
+        self.instrumentation.completed();
     }
 
     fn panicked(&mut self) {
         if let Some(id) = self.info.terminal_id() {
             self.info.events.panicked(id);
         }
+        self.instrumentation.panicked();
     }
 
     fn cancelled(&mut self) {
         if let Some(id) = self.info.terminal_id() {
             self.info.events.canceled(id);
         }
+        self.instrumentation.cancelled();
     }
 }
 

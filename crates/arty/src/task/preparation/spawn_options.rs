@@ -48,10 +48,6 @@ where
     Body: 'static,
     S: Fn() -> usize + 'static,
 {
-    #[cfg_attr(
-        not(any(test, feature = "monitor")),
-        expect(clippy::unused_self, reason = "Submission metadata is empty when monitoring is compiled out.")
-    )]
     pub(crate) fn observed_by(mut self, observers: Option<TaskObservers>) -> Self {
         self.observers = observers;
         self
@@ -74,6 +70,10 @@ where
         }
     }
 
+    #[cfg_attr(
+        not(any(test, feature = "monitor")),
+        expect(clippy::unused_self, reason = "Submission metadata is empty when monitoring is compiled out.")
+    )]
     fn register_with<F, R, T, I>(self, tasks: &TaskSet, future: F, completion: T, instrumentation: I)
     where
         F: IntoFuture<Output = R> + 'static,
@@ -108,7 +108,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::Shutdown;
-    use crate::runtime::monitoring::{Description, enter_current, set_events};
+    use crate::runtime::monitoring::{enter_current, set_events};
     use crate::task::handle::JoinHandlePool;
 
     #[test]
@@ -135,11 +135,7 @@ mod tests {
         let mut snapshots = Vec::new();
 
         let status = executor
-            .inspect(1, |description: &Description| {
-                if let Description::Snapshot(task) = description {
-                    snapshots.push(task.clone());
-                }
-            })
+            .inspect(1, |task: &seismograph_runtime::snapshot::Task| snapshots.push(task.clone()))
             .unwrap();
 
         assert_eq!(status, InspectionStatus::Complete);

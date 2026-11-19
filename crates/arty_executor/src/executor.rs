@@ -108,12 +108,12 @@ impl ObservePoll for &dyn PollObserver {
                 // #[gamma::skip(assign_value.default, reason = "The assigned bool is false, which is exactly bool::default().")]
                 observed = false;
                 discard_task_panic_payload(panic);
-                self.inspection_failed(InspectionError::Panicked);
+                self.inspection_failed();
             }
         }
         let outcome = task.poll(shared);
         if observed {
-            self.poll_finished(outcome.is_ready());
+            self.poll_finished();
         }
         outcome
     }

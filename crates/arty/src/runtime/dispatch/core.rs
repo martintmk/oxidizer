@@ -305,13 +305,11 @@ impl DispatcherCore {
     }
 
     fn retain_hook(&self, hook: HookRegistration) -> bool {
-        let mut retained = self.retained_hooks.lock_result().expect(ERR_POISONED_HOOKS);
-        if matches!(self.shutdown().state(), ShutdownState::Running) {
-            retained.push(hook);
-            true
-        } else {
-            false
+        if matches!(self.shutdown().state(), ShutdownState::Started) {
+            return false;
         }
+        self.retained_hooks.push(hook);
+        matches!(self.shutdown().state(), ShutdownState::Running)
     }
 
     fn runtime_shutting_down_error(&self) -> Error {
@@ -525,7 +523,7 @@ mod tests {
 
         dispatcher.stop_inner(ShutdownCause::default());
         assert!(!dispatcher.retain_hook(registration(HookFn::<WorkerInit, _>::new((), |_event, ()| {}))));
-        assert_eq!(dispatcher.retained_hooks.lock_result().unwrap().len(), 2);
+        assert_eq!(dispatcher.retained_hooks.len(), 2);
         dispatcher.release_retained_hooks();
         assert_eq!(dispatcher.retained_hooks.len(), 0);
     }
@@ -539,7 +537,7 @@ mod tests {
 
         dispatcher.register_hook(hook);
 
-        assert!(dispatcher.retained_hooks.lock_result().unwrap().is_empty());
+        assert_eq!(dispatcher.retained_hooks.len(), 0);
         assert!(matches!(worker_rx.system_receiver().try_recv().unwrap(), SystemCommand::Shutdown));
         worker_rx.system_receiver().try_recv().unwrap_err();
     }

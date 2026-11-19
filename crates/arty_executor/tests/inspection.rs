@@ -444,10 +444,10 @@ fn observer_panics_propagate_and_live_active_tasks_remain_inspectable() {
         fn poll_started(&self, _: &dyn Any) {
             std::panic::panic_any(71_u32);
         }
-        fn poll_finished(&self, _: bool) {
+        fn poll_finished(&self) {
             panic!("no poll started");
         }
-        fn inspection_failed(&self, _: InspectionError) {
+        fn inspection_failed(&self) {
             panic!("observer failures must propagate");
         }
     }
@@ -478,10 +478,10 @@ fn a_woken_pending_task_is_inspected_once_after_an_observer_panics() {
         fn poll_started(&self, _: &dyn Any) {
             std::panic::panic_any(71_u32);
         }
-        fn poll_finished(&self, _: bool) {
+        fn poll_finished(&self) {
             panic!("no observed poll completed");
         }
-        fn inspection_failed(&self, _: InspectionError) {
+        fn inspection_failed(&self) {
             panic!("observer failures must propagate");
         }
     }
@@ -720,13 +720,11 @@ impl PollObserver for Observer {
         self.starts.set(self.starts.get() + 1);
     }
 
-    fn poll_finished(&self, completed: bool) {
-        assert!(completed);
+    fn poll_finished(&self) {
         self.finishes.set(self.finishes.get() + 1);
     }
 
-    fn inspection_failed(&self, error: InspectionError) {
-        assert_eq!(error, InspectionError::Panicked);
+    fn inspection_failed(&self) {
         self.errors.set(self.errors.get() + 1);
     }
 }
@@ -828,10 +826,10 @@ fn a_panicking_description_drop_cancels_the_started_observation() {
         fn poll_started(&self, _: &dyn Any) {
             self.0.borrow_mut().push("started");
         }
-        fn poll_finished(&self, _: bool) {
+        fn poll_finished(&self) {
             self.0.borrow_mut().push("finished");
         }
-        fn inspection_failed(&self, _: InspectionError) {
+        fn inspection_failed(&self) {
             self.0.borrow_mut().push("failed");
         }
     }

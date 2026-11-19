@@ -13,6 +13,12 @@ pub(crate) enum HookRegistration {
     WorkerInit(ErasedHookFn<WorkerInit>),
 }
 
+impl HookRegistration {
+    pub(crate) const fn is_retained(&self) -> bool {
+        matches!(self, Self::TaskSpawn(_) | Self::WorkerInit(_))
+    }
+}
+
 impl From<ErasedHookFn<Panic>> for HookRegistration {
     fn from(hook: ErasedHookFn<Panic>) -> Self {
         Self::Panic(hook)
