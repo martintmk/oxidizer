@@ -136,10 +136,15 @@ impl LocalWorker {
             HookRegistration::TaskSpawn(hook) => {
                 let destination = Self::with_scheduler(|current| {
                     let current = current.expect("a running worker retains its scheduler while processing hook registration");
-                    current.has_spawn_hooks.set(true);
                     current.thread.clone()
                 });
                 LOCAL_SPAWN_HOOK.install(hook, source, &destination);
+                Self::with_scheduler(|current| {
+                    current
+                        .expect("a running worker retains its scheduler while processing hook registration")
+                        .has_spawn_hooks
+                        .set(true);
+                });
             }
             HookRegistration::Panic(hook) => {
                 let destination = Self::with_scheduler(|current| {
@@ -303,7 +308,7 @@ impl SchedulerContext {
 // Public tasks cannot install partial TLS registrations or inspect local queue routing.
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Poll, Wake, Waker};
 
     use arty_executor::Executor;
@@ -331,6 +336,19 @@ mod tests {
 
         fn wake_by_ref(self: &std::sync::Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReentrantSpawnProbe {
+        relocation_saw_no_observers: Arc<AtomicBool>,
+        callbacks: Arc<AtomicUsize>,
+    }
+
+    impl ThreadAware for ReentrantSpawnProbe {
+        fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {
+            self.relocation_saw_no_observers
+                .store(LocalWorker::on_spawn().is_none(), Ordering::Release);
         }
     }
 
@@ -424,11 +442,60 @@ mod tests {
     }
 
     #[test]
-    fn empty_spawn_hook_snapshots_skip_event_creation() {
-        let _guard = LOCAL_SPAWN_HOOK.initialize();
-        let thread = ThreadBuilder::default().build(std::thread::current().id());
+    fn spawn_hook_flag_changes_after_first_hook_installation() {
+        let (relocation_saw_no_observers, callbacks) = std::thread::spawn(|| {
+            let thread = ThreadBuilder::default().build(std::thread::current().id());
+            let shutdown = Shutdown::default();
+            let (commands, _command_rx) = crate::runtime::worker::asynchronous::command_channel();
+            let core = test_dispatcher(
+                NonEmpty::new(worker_endpoint(
+                    commands,
+                    Waker::noop().clone(),
+                    thread.clone(),
+                    Worker::new(Pool::new(RuntimeName::default(), None, None), shutdown.clone()),
+                )),
+                shutdown,
+            );
+            let dispatcher = DispatcherClient::new(core);
+            let io = crate::io::Io::new(
+                arty_io_host::IoRuntime::new(observed::Sink::noop()),
+                dispatcher.clone(),
+                thread.clone(),
+            );
+            let (clock, _clock_driver) = InactiveClock::new_isolated().activate(Waker::noop().clone());
+            let context = Context::new(dispatcher, clock, io, thread.clone());
+            let executor = Executor::builder().thread(thread).build();
+            let relocation_saw_no_observers = Arc::new(AtomicBool::new(false));
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            LocalWorker::attach();
+            LocalWorker::install_scheduler(context, executor.tasks(), executor.shutdown(), Vec::new());
 
-        assert!(LocalWorker::execute_spawn_hooks(&thread).is_none());
+            assert!(LocalWorker::on_spawn().is_none());
+            LocalWorker::install_hook(
+                registration(HookFn::<TaskSpawn, _>::new(
+                    ReentrantSpawnProbe {
+                        relocation_saw_no_observers: Arc::clone(&relocation_saw_no_observers),
+                        callbacks: Arc::clone(&callbacks),
+                    },
+                    |_event, probe| {
+                        probe.callbacks.fetch_add(1, Ordering::Relaxed);
+                    },
+                )),
+                None,
+            );
+            assert!(LocalWorker::on_spawn().is_none());
+
+            LocalWorker::clear_scheduler();
+            (
+                relocation_saw_no_observers.load(Ordering::Acquire),
+                callbacks.load(Ordering::Relaxed),
+            )
+        })
+        .join()
+        .unwrap();
+
+        assert!(relocation_saw_no_observers);
+        assert_eq!(callbacks, 1);
     }
 
     #[test]
