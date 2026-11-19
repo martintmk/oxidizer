@@ -186,7 +186,7 @@ mod tests {
         let parent = seismograph_runtime::allocate_task_id();
         {
             let _parent = crate::runtime::monitoring::task::enter_current(parent);
-            crate::task::preparation::TaskSpawnOptions::<()>::capture().register(
+            crate::task::preparation::TaskSpawnOptions::new::<()>().register(
                 &thread,
                 &executor.tasks(),
                 std::future::pending::<()>(),

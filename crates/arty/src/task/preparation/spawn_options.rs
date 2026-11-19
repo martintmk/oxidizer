@@ -1,63 +1,50 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::marker::PhantomData;
-
 use arty_executor::{TaskCompletion, TaskInstrumentation, TaskSet};
 
 use crate::core::Thread;
 use crate::runtime::hook::TaskObservers;
 /// Captures submission metadata before a task crosses threads.
-pub(crate) struct TaskSpawnOptions<Body, S = ()> {
+pub(crate) struct TaskSpawnOptions {
     #[cfg(any(test, feature = "monitor"))]
     parent: Option<seismograph::recorder::runtime::TaskId>,
     #[cfg(any(test, feature = "monitor"))]
-    body_size: S,
-    marker: PhantomData<fn() -> (Body, S)>,
+    describe_type: fn() -> seismograph::recorder::runtime::TypeDescriptorId,
+    #[cfg(any(test, feature = "monitor"))]
+    future_size: usize,
     observers: Option<TaskObservers>,
 }
 
-impl<Body: 'static> TaskSpawnOptions<Body> {
-    pub(crate) fn capture() -> TaskSpawnOptions<Body, impl Fn() -> usize + Send> {
-        // A function item stores no bytes; only erased scoped futures carry a size.
-        TaskSpawnOptions::new(size_of::<Body>)
+impl TaskSpawnOptions {
+    pub(crate) fn new<Body: 'static>() -> Self {
+        Self::with_future_size::<Body>(size_of::<Body>())
     }
 
-    pub(crate) fn with_body_size(body_size: usize) -> TaskSpawnOptions<Body, impl Fn() -> usize + Send> {
-        TaskSpawnOptions::new(move || body_size)
-    }
-}
-
-impl<Body, S> TaskSpawnOptions<Body, S> {
-    fn new(body_size: S) -> Self {
+    pub(crate) fn with_future_size<Body: 'static>(future_size: usize) -> Self {
         #[cfg(not(any(test, feature = "monitor")))]
-        drop(body_size);
+        let _ = future_size;
         Self {
             #[cfg(any(test, feature = "monitor"))]
             parent: crate::runtime::monitoring::current_task(),
             #[cfg(any(test, feature = "monitor"))]
-            body_size,
-            marker: PhantomData,
+            describe_type: crate::runtime::monitoring::descriptor::<Body>,
+            #[cfg(any(test, feature = "monitor"))]
+            future_size,
             observers: None,
         }
     }
-}
 
-impl<Body, S> TaskSpawnOptions<Body, S>
-where
-    Body: 'static,
-    S: Fn() -> usize + 'static,
-{
     pub(crate) fn observed_by(mut self, observers: Option<TaskObservers>) -> Self {
         self.observers = observers;
         self
     }
 
-    pub(crate) fn register<F, R, T>(mut self, destination: &Thread, tasks: &TaskSet, future: F, completion: T)
+    pub(crate) fn register<F, T>(mut self, destination: &Thread, tasks: &TaskSet, future: F, completion: T)
     where
-        F: IntoFuture<Output = R> + 'static,
-        R: 'static,
-        T: TaskCompletion<R>,
+        F: IntoFuture + 'static,
+        F::Output: 'static,
+        T: TaskCompletion<F::Output>,
     {
         let Some(observers) = self.observers.take() else {
             self.register_with(tasks, future, completion, ());
@@ -74,21 +61,22 @@ where
         not(any(test, feature = "monitor")),
         expect(clippy::unused_self, reason = "Submission metadata is empty when monitoring is compiled out.")
     )]
-    fn register_with<F, R, T, I>(self, tasks: &TaskSet, future: F, completion: T, instrumentation: I)
+    fn register_with<F, T, I>(self, tasks: &TaskSet, future: F, completion: T, instrumentation: I)
     where
-        F: IntoFuture<Output = R> + 'static,
-        R: 'static,
-        T: TaskCompletion<R>,
+        F: IntoFuture + 'static,
+        F::Output: 'static,
+        T: TaskCompletion<F::Output>,
         I: TaskInstrumentation,
     {
         #[cfg(any(test, feature = "monitor"))]
-        crate::runtime::monitoring::register_monitored::<Body, _, _, _, _, _>(
+        crate::runtime::monitoring::register_monitored(
             tasks,
             future,
             completion,
             instrumentation,
             self.parent,
-            self.body_size,
+            self.describe_type,
+            self.future_size,
         );
         // #[gamma::skip(stmt.delete_call, reason = "This branch is absent from Gamma's all-features builds; runtime-only integration tests exercise it.")]
         #[cfg(not(any(test, feature = "monitor")))]
@@ -121,7 +109,7 @@ mod tests {
         let parent = seismograph_runtime::allocate_task_id();
         let options = {
             let _parent = enter_current(parent);
-            TaskSpawnOptions::<ErasedFuture>::with_body_size(37)
+            TaskSpawnOptions::with_future_size::<ErasedFuture>(37)
         };
         let _other_parent = enter_current(seismograph_runtime::allocate_task_id());
         set_events(Some(worker.handle().task_events()));

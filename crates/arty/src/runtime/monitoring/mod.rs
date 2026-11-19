@@ -35,8 +35,8 @@ pub(crate) use blocking::{BlockingJob, BlockingPoolMonitoring, BlockingTaskEvent
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) use runtime::RuntimeDiagnostics;
 #[cfg(any(test, feature = "monitor"))]
-pub(crate) use task::register_monitored;
-#[cfg(any(test, feature = "monitor"))]
 pub(crate) use task::{TaskInfo, current_task};
+#[cfg(any(test, feature = "monitor"))]
+pub(crate) use task::{descriptor, register_monitored};
 #[cfg(test)]
 pub(crate) use task::{enter_current, set_events};

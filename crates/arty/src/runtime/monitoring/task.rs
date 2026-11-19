@@ -52,7 +52,7 @@ pub(crate) fn enter_current(task: TaskId) -> CurrentTask {
 
 pub(crate) struct PollTask(pub(crate) TaskId);
 
-fn descriptor<T: 'static>() -> TypeDescriptorId {
+pub(crate) fn descriptor<T: 'static>() -> TypeDescriptorId {
     TYPES.with_borrow_mut(|types| {
         *types
             .entry(TypeId::of::<T>())
@@ -184,8 +184,8 @@ struct AsyncTaskInfo {
 }
 
 impl AsyncTaskInfo {
-    fn new<T: 'static>(events: EventContext, parent: Option<TaskId>, body_size: usize) -> Self {
-        let spawn = events.spawned_with(descriptor::<T>, parent, body_size);
+    fn new(describe_type: fn() -> TypeDescriptorId, events: EventContext, parent: Option<TaskId>, body_size: usize) -> Self {
+        let spawn = events.spawned_with(describe_type, parent, body_size);
         Self {
             events,
             parent,
@@ -198,8 +198,8 @@ impl AsyncTaskInfo {
         *self.identity.get_or_init(seismograph_runtime::allocate_task_id)
     }
 
-    fn describe<T: 'static>(&self, state: TaskActivityState, body_size: usize) -> Task {
-        let mut task = Task::new(self.id(), descriptor::<T>(), state);
+    fn describe(&self, descriptor: TypeDescriptorId, state: TaskActivityState, body_size: usize) -> Task {
+        let mut task = Task::new(self.id(), descriptor, state);
         task.parent = self.parent;
         task.spawned_at = self.spawned_at;
         task.future_size_bytes = Some(u64::try_from(body_size).expect("a task body fits the platform address space"));
@@ -215,18 +215,16 @@ impl AsyncTaskInfo {
 }
 
 #[derive(Debug)]
-struct TaskMonitor<Body, I, S> {
+struct TaskMonitor<I> {
     instrumentation: I,
     info: AsyncTaskInfo,
-    body_size: S,
-    marker: std::marker::PhantomData<fn() -> Body>,
+    describe_type: fn() -> TypeDescriptorId,
+    body_size: usize,
 }
 
-impl<Body, I, S> TaskInstrumentation for TaskMonitor<Body, I, S>
+impl<I> TaskInstrumentation for TaskMonitor<I>
 where
-    Body: 'static,
     I: TaskInstrumentation,
-    S: Fn() -> usize + 'static,
 {
     fn inspect(&self, state: TaskState, visitor: &mut dyn FnMut(&dyn std::any::Any)) {
         match state {
@@ -236,7 +234,8 @@ where
                 } else {
                     TaskActivityState::Waiting
                 };
-                let task = seismograph::recorder::without_recording(|| self.info.describe::<Body>(activity, (self.body_size)()));
+                let task =
+                    seismograph::recorder::without_recording(|| self.info.describe((self.describe_type)(), activity, self.body_size));
                 visitor(&task);
             }
             TaskState::Running => {
@@ -276,30 +275,29 @@ where
     }
 }
 
-pub(crate) fn register_monitored<Body, F, R, T, I, S>(
+pub(crate) fn register_monitored<F, T, I>(
     tasks: &TaskSet,
     future: F,
     completion: T,
     instrumentation: I,
     parent: Option<TaskId>,
-    body_size: S,
+    describe_type: fn() -> TypeDescriptorId,
+    body_size: usize,
 ) where
-    Body: 'static,
-    F: IntoFuture<Output = R> + 'static,
-    R: 'static,
-    T: TaskCompletion<R>,
+    F: IntoFuture + 'static,
+    F::Output: 'static,
+    T: TaskCompletion<F::Output>,
     I: TaskInstrumentation,
-    S: Fn() -> usize + 'static,
 {
     let Some(events) = current_events() else {
         tasks.task(future).instrument(instrumentation).register(completion);
         return;
     };
-    let monitor = TaskMonitor::<Body, _, _> {
+    let monitor = TaskMonitor {
         instrumentation,
-        info: AsyncTaskInfo::new::<Body>(events, parent, body_size()),
+        info: AsyncTaskInfo::new(describe_type, events, parent, body_size),
+        describe_type,
         body_size,
-        marker: std::marker::PhantomData,
     };
     tasks.task(future).instrument(monitor).register(completion);
 }
@@ -345,11 +343,11 @@ mod tests {
         let runtime = seismograph_runtime::register_runtime(RuntimeMetadata::new("instrumentation-forwarding", 1));
         let worker = runtime.register_worker(WorkerMetadata::new(WorkerRole::Core));
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let mut monitor = TaskMonitor::<(), _, _> {
+        let mut monitor = TaskMonitor {
             instrumentation: Recorder(Rc::clone(&calls)),
-            info: AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0),
-            body_size: || 0,
-            marker: std::marker::PhantomData,
+            info: AsyncTaskInfo::new(super::descriptor::<()>, worker.handle().task_events(), None, 0),
+            describe_type: super::descriptor::<()>,
+            body_size: 0,
         };
 
         monitor.poll_start();
@@ -419,7 +417,7 @@ mod tests {
         let completion = crate::task::handle::JoinHandlePool::new(crate::runtime::shutdown::Shutdown::default());
         let (_handle, sender) = completion.handle();
 
-        super::register_monitored::<(), _, _, _, _, _>(&executor.tasks(), future, sender, (), None, || 0);
+        super::register_monitored(&executor.tasks(), future, sender, (), None, super::descriptor::<()>, 0);
         let _ = executor.execute_cycle();
 
         assert!(ran.get());

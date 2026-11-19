@@ -147,11 +147,11 @@ impl Scheduler {
         self.dispatcher.spawn_on_worker(self.binding.worker_index, future_factory)
     }
 
-    fn spawn_on_current_worker<FF, F, R>(&self, future_factory: FF) -> Result<JoinHandle<R>, FF>
+    fn spawn_on_current_worker<FF, F>(&self, future_factory: FF) -> Result<JoinHandle<F::Output>, FF>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
     {
         asynchronous::LocalWorker::with_scheduler(|current| {
             let Some(current) = current else {

@@ -794,17 +794,17 @@ mod tests {
     }
 
     trait TestTaskSetExt {
-        fn add_test<F, R>(&self, future: F)
+        fn add_test<F>(&self, future: F)
         where
-            F: IntoFuture<Output = R> + 'static,
-            R: 'static;
+            F: IntoFuture + 'static,
+            F::Output: 'static;
     }
 
     impl TestTaskSetExt for TaskSet {
-        fn add_test<F, R>(&self, future: F)
+        fn add_test<F>(&self, future: F)
         where
-            F: IntoFuture<Output = R> + 'static,
-            R: 'static,
+            F: IntoFuture + 'static,
+            F::Output: 'static,
         {
             self.task(future).register(DiscardCompletion);
         }
@@ -1378,9 +1378,10 @@ mod tests {
                 })))
                 .unwrap();
         }
-        let join = worker_context(&worker)
-            .dispatcher()
-            .spawn(|_| async {}, crate::task::preparation::TaskSpawnOptions::capture());
+        let join = worker_context(&worker).dispatcher().spawn(
+            |_| std::future::ready(()),
+            crate::task::preparation::TaskSpawnOptions::new::<std::future::Ready<()>>(),
+        );
         commands.system_sender().send(SystemCommand::Shutdown).unwrap();
 
         assert!(worker.execute_step().is_break());
@@ -1488,7 +1489,7 @@ mod tests {
         );
         let polled = std::rc::Rc::new(std::cell::Cell::new(false));
         let completed = std::rc::Rc::clone(&polled);
-        crate::task::preparation::TaskSpawnOptions::<()>::capture().register(
+        crate::task::preparation::TaskSpawnOptions::new::<()>().register(
             worker_context(&worker).thread(),
             &worker.tasks,
             async move {
@@ -2160,7 +2161,7 @@ mod tests {
                     std::future::ready(())
                 }
             },
-            crate::task::preparation::TaskSpawnOptions::capture(),
+            crate::task::preparation::TaskSpawnOptions::new::<std::future::Ready<()>>(),
         );
 
         assert!(worker.execute_step().is_break());

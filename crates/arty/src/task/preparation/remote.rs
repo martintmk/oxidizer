@@ -84,16 +84,15 @@ impl RemoteFutureFactory {
     }
 }
 
-pub(crate) fn prepare_remote<FF, F, R, S>(
+pub(crate) fn prepare_remote<FF, F>(
     result_pool: &JoinHandlePool,
     future_factory: FF,
-    options: TaskSpawnOptions<F, S>,
-) -> (RemoteFutureFactory, JoinHandle<R>)
+    options: TaskSpawnOptions,
+) -> (RemoteFutureFactory, JoinHandle<F::Output>)
 where
     FF: FnOnce(Context) -> F + Send + 'static,
-    F: Future<Output = R> + 'static,
-    R: Send + 'static,
-    S: Fn() -> usize + Send + 'static,
+    F: Future + 'static,
+    F::Output: Send + 'static,
 {
     let (handle, result_tx) = result_pool.handle();
     let future_factory = TaskFactory::new(future_factory);

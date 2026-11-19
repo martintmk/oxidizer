@@ -15,8 +15,8 @@ use futures::executor::block_on;
 use super::*;
 use crate::runtime::monitoring::BlockingTaskMonitoring;
 use crate::runtime::{Runtime, Shutdown, WorkersPolicy};
-use crate::task::Context;
 use crate::task::handle::JoinHandlePool;
+use crate::task::{Context, JoinHandle};
 
 fn test_context() -> (Runtime, Context) {
     let runtime = Runtime::builder().workers(WorkersPolicy::exactly(1)).build().unwrap();
@@ -24,25 +24,30 @@ fn test_context() -> (Runtime, Context) {
     (runtime, cx)
 }
 
+fn prepare_remote_for_test<FF, F>(result_pool: &JoinHandlePool, future_factory: FF) -> (RemoteFutureFactory, JoinHandle<F::Output>)
+where
+    FF: FnOnce(Context) -> F + Send + 'static,
+    F: Future + 'static,
+    F::Output: Send + 'static,
+{
+    prepare_remote(result_pool, future_factory, TaskSpawnOptions::new::<F>())
+}
+
 #[test]
 fn remote_factory_defers_future_creation_until_polling() {
     let invoked = Arc::new(AtomicBool::new(false));
     let factory_invoked = Arc::clone(&invoked);
     let result_pool = JoinHandlePool::new(Shutdown::default());
-    let (factory, handle) = prepare_remote(
-        &result_pool,
-        move |_| {
-            // This test polls and observes the factory on one thread; no synchronization is needed.
-            factory_invoked.store(true, Ordering::Relaxed);
-            async {
-                // Retain an Rc across await so the factory-produced future remains non-Send.
-                let value = Rc::new(42);
-                std::future::ready(()).await;
-                *value
-            }
-        },
-        TaskSpawnOptions::capture(),
-    );
+    let (factory, handle) = prepare_remote_for_test(&result_pool, move |_| {
+        // This test polls and observes the factory on one thread; no synchronization is needed.
+        factory_invoked.store(true, Ordering::Relaxed);
+        async {
+            // Retain an Rc across await so the factory-produced future remains non-Send.
+            let value = Rc::new(42);
+            std::future::ready(()).await;
+            *value
+        }
+    });
 
     let mut executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
     let (_runtime, cx) = test_context();
@@ -93,11 +98,7 @@ fn remote_factory_panic_is_delivered_to_joiner() {
     struct Payload(u32);
 
     let result_pool = JoinHandlePool::new(Shutdown::default());
-    let (factory, handle) = prepare_remote(
-        &result_pool,
-        |_| -> std::future::Ready<()> { panic_any(Payload(42)) },
-        TaskSpawnOptions::capture(),
-    );
+    let (factory, handle) = prepare_remote_for_test(&result_pool, |_| -> std::future::Ready<()> { panic_any(Payload(42)) });
     let mut executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
     let (_runtime, cx) = test_context();
     factory.register(cx, &executor.tasks());
@@ -127,7 +128,7 @@ fn discarded_remote_factory_reports_the_shutdown_cause() {
     let shutdown = Shutdown::default();
     shutdown.begin(arty_executor::ShutdownError::new(std::io::Error::other("queued shutdown")).into());
     let result_pool = JoinHandlePool::new(shutdown);
-    let (factory, handle) = prepare_remote(&result_pool, |_| async { 42 }, TaskSpawnOptions::capture());
+    let (factory, handle) = prepare_remote_for_test(&result_pool, |_| async { 42 });
 
     drop(factory);
 

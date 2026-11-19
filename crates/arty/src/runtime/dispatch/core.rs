@@ -177,21 +177,20 @@ impl DispatcherCore {
         WorkerIndex(self.next_async_worker_index.fetch_add(1, Ordering::Relaxed) % self.worker_endpoints.len())
     }
 
-    pub(crate) fn spawn<FF, F, R, S>(&self, future_factory: FF, options: TaskSpawnOptions<F, S>) -> JoinHandle<R>
+    pub(crate) fn spawn<FF, F>(&self, future_factory: FF, options: TaskSpawnOptions) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
-        S: Fn() -> usize + Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
     {
         self.enqueue(self.next_worker_index(), future_factory, options)
     }
 
-    pub(crate) fn spawn_relocating<FF, F, R>(&self, source: &Thread, future_factory: FF) -> JoinHandle<R>
+    pub(crate) fn spawn_relocating<FF, F>(&self, source: &Thread, future_factory: FF) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: ThreadAware + 'static,
+        F: Future + 'static,
+        F::Output: ThreadAware + 'static,
     {
         let worker_index = self.next_worker_index();
         let endpoint = &self.worker_endpoints[usize::from(worker_index)];
@@ -220,11 +219,11 @@ impl DispatcherCore {
         self.spawn_relocating_on_worker(worker_index, future_factory)
     }
 
-    pub(crate) fn spawn_at_worker_relocating<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
+    pub(crate) fn spawn_at_worker_relocating<FF, F>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: ThreadAware + 'static,
+        F: Future + 'static,
+        F::Output: ThreadAware + 'static,
     {
         self.spawn_relocating_on_worker(worker_index, future_factory)
     }
@@ -341,33 +340,32 @@ impl DispatcherCore {
             .wake_by_ref();
     }
 
-    pub(crate) fn spawn_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
+    pub(crate) fn spawn_on_worker<FF, F>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
     {
-        self.enqueue(worker_index, future_factory, TaskSpawnOptions::capture())
+        self.enqueue(worker_index, future_factory, TaskSpawnOptions::new::<F>())
     }
 
     /// Records the execution worker so a successful result can relocate when its join is polled.
-    fn spawn_relocating_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
+    fn spawn_relocating_on_worker<FF, F>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: ThreadAware + 'static,
+        F: Future + 'static,
+        F::Output: ThreadAware + 'static,
     {
         let source = self.worker_endpoints[usize::from(worker_index)].thread.clone();
-        self.enqueue(worker_index, future_factory, TaskSpawnOptions::capture())
+        self.enqueue(worker_index, future_factory, TaskSpawnOptions::new::<F>())
             .relocate_result_from(source)
     }
 
-    fn enqueue<FF, F, R, S>(&self, worker_index: WorkerIndex, future_factory: FF, options: TaskSpawnOptions<F, S>) -> JoinHandle<R>
+    fn enqueue<FF, F>(&self, worker_index: WorkerIndex, future_factory: FF, options: TaskSpawnOptions) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
-        S: Fn() -> usize + Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
     {
         if let Some(join_handle) = JoinHandle::try_from_shutdown(self.shutdown()) {
             drop(future_factory);
@@ -466,6 +464,15 @@ mod tests {
             },
             command_rx,
         )
+    }
+
+    fn spawn_for_test<FF, F>(dispatcher: &DispatcherCore, future_factory: FF) -> JoinHandle<F::Output>
+    where
+        FF: FnOnce(Context) -> F + Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
+    {
+        dispatcher.spawn(future_factory, TaskSpawnOptions::new::<F>())
     }
 
     #[test]
@@ -571,14 +578,14 @@ mod tests {
 
         let dispatcher = DispatcherCore::new(NonEmpty::new(worker), Shutdown::default(), Vec::new());
 
-        dispatcher.spawn(
+        spawn_for_test(
+            &dispatcher,
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskSpawnOptions::capture(),
         );
 
-        dispatcher.spawn(
+        spawn_for_test(
+            &dispatcher,
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskSpawnOptions::capture(),
         );
 
         assert_eq!(drain_spawn(&worker_rx).len(), 2);
@@ -596,14 +603,14 @@ mod tests {
 
         let dispatcher = DispatcherCore::new(NonEmpty::from_vec(vec![worker1, worker2]).unwrap(), Shutdown::default(), Vec::new());
 
-        dispatcher.spawn(
+        spawn_for_test(
+            &dispatcher,
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskSpawnOptions::capture(),
         );
 
-        dispatcher.spawn(
+        spawn_for_test(
+            &dispatcher,
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskSpawnOptions::capture(),
         );
 
         assert_eq!(drain_spawn(&worker1_rx).len(), 1);
@@ -619,9 +626,9 @@ mod tests {
         let dispatcher = DispatcherCore::new(NonEmpty::from_vec(vec![worker1, worker2]).unwrap(), Shutdown::default(), Vec::new());
 
         for _ in 0..4 {
-            dispatcher.spawn(
+            spawn_for_test(
+                &dispatcher,
                 |_| async move { unreachable!("we do not expect the task to be executed") },
-                TaskSpawnOptions::capture(),
             );
         }
 
@@ -693,7 +700,7 @@ mod tests {
         let dispatcher = DispatcherCore::new(NonEmpty::new(endpoint(&threads[0]).0), Shutdown::default(), Vec::new());
         dispatcher.stop_inner(ShutdownError::new(Error::worker_panicked()).into());
 
-        let mut join = pin!(dispatcher.spawn(|_| async {}, TaskSpawnOptions::capture()));
+        let mut join = pin!(spawn_for_test(&dispatcher, |_| async {}));
         let Poll::Ready(Err(error)) = join.as_mut().poll(&mut task::Context::from_waker(Waker::noop())) else {
             panic!("shutdown rejection must be immediately ready");
         };
@@ -789,7 +796,7 @@ mod tests {
         // Close the command channel.
         drop(command_rx);
 
-        let join_handle = dispatcher.spawn(|_| async move {}, TaskSpawnOptions::capture());
+        let join_handle = spawn_for_test(&dispatcher, |_| async move {});
         let join_handle = pin!(join_handle);
 
         let mut cx = task::Context::from_waker(Waker::noop());

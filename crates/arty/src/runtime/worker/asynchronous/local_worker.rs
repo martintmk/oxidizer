@@ -272,11 +272,11 @@ impl SchedulerContext {
         &self.tasks
     }
 
-    pub(crate) fn spawn<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
+    pub(crate) fn spawn<FF, F>(&self, future_factory: FF) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
     {
         if self.has_spawn_hooks.get() {
             return self.spawn_observed(future_factory);
@@ -284,21 +284,21 @@ impl SchedulerContext {
 
         let (handle, result_tx) = self.results.handle();
         let inner = DeferredTaskFactory::new(future_factory, self.context.clone());
-        TaskSpawnOptions::<F>::capture().register(&self.thread, &self.tasks, inner, result_tx);
+        TaskSpawnOptions::new::<F>().register(&self.thread, &self.tasks, inner, result_tx);
         handle
     }
 
     #[cold]
-    fn spawn_observed<FF, F, R>(&self, future_factory: FF) -> JoinHandle<R>
+    fn spawn_observed<FF, F>(&self, future_factory: FF) -> JoinHandle<F::Output>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
+        F: Future + 'static,
+        F::Output: Send + 'static,
     {
         let (handle, result_tx) = self.results.handle();
         let observers = LocalWorker::execute_spawn_hooks(&self.thread);
         let inner = DeferredTaskFactory::new(future_factory, self.context.clone());
-        TaskSpawnOptions::<F>::capture()
+        TaskSpawnOptions::new::<F>()
             .observed_by(observers)
             .register(&self.thread, &self.tasks, inner, result_tx);
         handle

@@ -226,8 +226,8 @@ mod tests {
         let result_pool = crate::task::handle::JoinHandlePool::new(crate::runtime::shutdown::Shutdown::default());
         let (factory, join) = prepare_remote(
             &result_pool,
-            |_| async { 42 },
-            crate::task::preparation::TaskSpawnOptions::capture(),
+            |_| std::future::ready(42),
+            crate::task::preparation::TaskSpawnOptions::new::<std::future::Ready<i32>>(),
         );
         let mut join = pin!(join);
         let wake = Arc::new(PanicWake(AtomicBool::new(false)));

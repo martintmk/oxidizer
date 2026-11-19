@@ -32,10 +32,10 @@ struct ScopedStorage<T> {
 }
 
 impl<FF> ScopedStorage<FF> {
-    fn into_future<F, R>(self, cx: Context) -> ScopedStorage<impl Future<Output = R>>
+    fn into_future<F>(self, cx: Context) -> ScopedStorage<impl Future<Output = F::Output>>
     where
         FF: FnOnce(Context) -> F,
-        F: Future<Output = R>,
+        F: Future,
     {
         let Self { inner, completion } = self;
         ScopedStorage {
@@ -135,9 +135,8 @@ impl RuntimeScheduler {
         // is destroyed. The final sender is dropped after those fields, including on
         // cancellation or panic. Receiving the result alone is not a destruction guarantee.
         let factory = unsafe { std::mem::transmute::<BoxedFutureFactory<'a, R>, BoxedFutureFactory<'static, R>>(factory) };
-        let task = self
-            .dispatcher
-            .spawn(factory, crate::task::preparation::TaskSpawnOptions::with_body_size(size_of::<F>()));
+        let options = crate::task::preparation::TaskSpawnOptions::with_future_size::<LocalBoxFuture<'static, R>>(size_of::<F>());
+        let task = self.dispatcher.spawn(factory, options);
         futures::executor::block_on(task).map_err(Error::new)
     }
 
@@ -199,7 +198,7 @@ impl RuntimeScheduler {
                 data.relocate(None, cx.thread());
                 future_factory(cx, data)
             },
-            crate::task::preparation::TaskSpawnOptions::capture(),
+            crate::task::preparation::TaskSpawnOptions::new::<F>(),
         )
     }
 
