@@ -46,7 +46,6 @@ mod task;
 mod task_builder;
 mod task_handle;
 mod task_list;
-mod task_observer;
 mod task_set;
 mod wake;
 
@@ -62,10 +61,8 @@ pub(crate) use task::*;
 pub use task_builder::*;
 pub(crate) use task_handle::*;
 pub(crate) use task_list::*;
-pub use task_observer::TaskObserver;
 pub use task_set::*;
 
 mod inspection;
-#[cfg(feature = "inspection")]
-pub use inspection::{InspectionError, InspectionStatus, PollObserver, TaskState};
+pub use inspection::{InspectionError, InspectionStatus, PollObserver, TaskInstrumentation, TaskState};
 pub(crate) use wake::*;

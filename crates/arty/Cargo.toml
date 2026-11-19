@@ -39,7 +39,6 @@ macros = ["rt", "dep:arty_macros"]
 monitor = [
     "dep:seismograph",
     "dep:seismograph_runtime",
-    "arty_executor?/inspection",
     "seismograph/monitor",
     "performables?/seismograph",
 ]
@@ -91,7 +90,7 @@ tick = { workspace = true }
 [dev-dependencies]
 alloc_tracker = { workspace = true }
 arc-swap = { workspace = true }
-arty_executor = { path = "../arty_executor", features = ["inspection"] }
+arty_executor = { path = "../arty_executor" }
 arty_io_host = { path = "../arty_io_host" }
 arty_macros = { path = "../arty_macros" }
 bolero = { workspace = true, features = ["std"] }

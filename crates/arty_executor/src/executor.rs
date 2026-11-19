@@ -1,13 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#[cfg(feature = "inspection")]
-use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
-#[cfg(feature = "inspection")]
 use std::ops::ControlFlow;
-#[cfg(feature = "inspection")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::task;
@@ -17,10 +13,9 @@ use nm::{Event, Magnitude, MetricsPusher, Push};
 use tick::SimpleClock;
 
 use crate::{
-    CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskSet, TypeErasedTask, executor_context,
+    CycleOutcome, ExecutorBuilder, ExecutorShared, InspectionError, InspectionStatus, PollObserver, Shutdown, ShutdownCause, TaskHandle,
+    TaskList, TaskPtr, TaskSet, TaskState, TypeErasedTask, discard_task_panic_payload, executor_context,
 };
-#[cfg(feature = "inspection")]
-use crate::{InspectionError, InspectionStatus, PollObserver, TaskPtr, TaskState, discard_task_panic_payload};
 
 /// An async task executor that runs on one thread.
 ///
@@ -91,7 +86,6 @@ impl ObservePoll for () {
     }
 }
 
-#[cfg(feature = "inspection")]
 impl ObservePoll for &dyn PollObserver {
     fn poll(self, task: Pin<&dyn TypeErasedTask>, shared: &ExecutorShared) -> task::Poll<()> {
         let mut observed = false;
@@ -196,7 +190,6 @@ impl Executor {
     /// Observer panics propagate. An inspector panic is reported through
     /// [`PollObserver::inspection_failed`](crate::PollObserver::inspection_failed)
     /// and does not prevent the affected task from running.
-    #[cfg(feature = "inspection")]
     #[must_use]
     pub fn execute_cycle_observed(&mut self, observer: &dyn PollObserver) -> CycleOutcome {
         self.execute_cycle_with(observer)
@@ -224,7 +217,6 @@ impl Executor {
     ///
     /// Returns an error for a zero limit, borrowed submission storage, or a panic
     /// from a task inspector or the visitor.
-    #[cfg(feature = "inspection")]
     #[expect(
         clippy::needless_pass_by_ref_mut,
         reason = "exclusive owner access prevents inspection from overlapping a poll"

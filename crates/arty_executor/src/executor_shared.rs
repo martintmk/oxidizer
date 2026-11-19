@@ -4,7 +4,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::mem;
-#[cfg(feature = "inspection")]
 use std::ops::ControlFlow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -15,10 +14,9 @@ use std::thread::ThreadId;
 use performables::sync::channel;
 use plurality::{Arc as PoolArc, MultiPool};
 
-use crate::inspection::CompletionInspector;
 use crate::wake::RemoteWake;
 use crate::{
-    PanicPolicy, Shutdown, TaskCompletion, TaskHandle, TaskObserver, TypeErasedTask, WakeShared, WakeSignal, allocate_task,
+    PanicPolicy, Shutdown, TaskCompletion, TaskHandle, TaskInstrumentation, TypeErasedTask, WakeShared, WakeSignal, allocate_task,
     discard_task_panic_payload,
 };
 
@@ -41,7 +39,6 @@ struct ExecutorSharedInner {
 }
 
 impl ExecutorShared {
-    #[cfg(feature = "inspection")]
     pub(crate) fn inspect_new_tasks(&self, mut visit: impl FnMut(&TaskHandle) -> ControlFlow<()>) -> Result<(), crate::InspectionError> {
         let tasks = self.inner.new_tasks.try_borrow().map_err(|_borrow| crate::InspectionError::Busy)?;
         for task in tasks.iter() {
@@ -118,16 +115,15 @@ impl ExecutorShared {
         self.shutdown().is_triggered() && self.inner.task_count.get() == 0
     }
 
-    pub(crate) fn add_task<F, T, I, O>(&self, future: F, observer: O, completion: T, inspector: I)
+    pub(crate) fn add_task<F, T, I>(&self, future: F, instrumentation: I, completion: T)
     where
         F: IntoFuture + 'static,
         F::Output: 'static,
         T: TaskCompletion<F::Output>,
-        I: CompletionInspector<F::IntoFuture, T>,
-        O: TaskObserver,
+        I: TaskInstrumentation<F::IntoFuture>,
     {
         if self.shutdown().is_triggered() {
-            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(inspector))) {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(instrumentation))) {
                 discard_task_panic_payload(panic);
             }
             completion.cancelled(self.shutdown().cause());
@@ -135,13 +131,13 @@ impl ExecutorShared {
         }
         let future = future.into_future();
         if self.shutdown().is_triggered() {
-            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(inspector))) {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(instrumentation))) {
                 discard_task_panic_payload(panic);
             }
             completion.cancelled(self.shutdown().cause());
             return;
         }
-        self.register_task(allocate_task(&self.inner.task_storage, future, observer, completion, inspector));
+        self.register_task(allocate_task(&self.inner.task_storage, future, instrumentation, completion));
     }
 
     #[inline]
@@ -168,7 +164,7 @@ impl ExecutorShared {
     }
 }
 
-#[cfg(all(test, feature = "inspection"))]
+#[cfg(test)]
 // Public submission does not expose a mutable borrow of the pending-task queue.
 mod tests {
     use super::*;

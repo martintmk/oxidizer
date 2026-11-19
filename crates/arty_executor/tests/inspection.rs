@@ -28,7 +28,7 @@ impl<R: 'static> TaskCompletion<R> for Completion {
 
 #[derive(Debug)]
 struct InspectedCompletion {
-    inspections: Cell<u32>,
+    inspections: Rc<Cell<u32>>,
     outcome: Rc<Cell<Option<(&'static str, u32)>>>,
 }
 
@@ -51,16 +51,19 @@ impl TaskCompletion<()> for InspectedCompletion {
 fn inspect_completion(future: impl Future<Output = ()> + 'static, poll: bool) -> (Vec<u32>, Option<(&'static str, u32)>) {
     let mut executor = Executor::builder().build();
     let outcome = Rc::new(Cell::new(None));
-    executor.tasks().task(future).register_with_inspection(
-        InspectedCompletion {
-            inspections: Cell::new(0),
+    let inspections = Rc::new(Cell::new(0));
+    let inspected = Rc::clone(&inspections);
+    executor
+        .tasks()
+        .task(future)
+        .inspect(move |_, _| {
+            inspected.set(inspected.get() + 1);
+            Some(inspected.get())
+        })
+        .register(InspectedCompletion {
+            inspections,
             outcome: Rc::clone(&outcome),
-        },
-        |_, completion, _| {
-            completion.inspections.set(completion.inspections.get() + 1);
-            Some(completion.inspections.get())
-        },
-    );
+        });
     let mut descriptions = Vec::new();
     executor.inspect(1, |value: &u32| descriptions.push(*value)).unwrap();
     if poll {
@@ -95,13 +98,14 @@ fn inspection_borrows_the_target_that_receives_cancellation() {
 fn ordinary_cycles_do_not_inspect_the_completion_target() {
     let mut executor = Executor::builder().build();
     let outcome = Rc::new(Cell::new(None));
-    executor.tasks().task(std::future::ready(())).register_with_inspection(
-        InspectedCompletion {
-            inspections: Cell::new(0),
+    executor
+        .tasks()
+        .task(std::future::ready(()))
+        .inspect(|_, _| -> Option<()> { panic!("ordinary cycles must not inspect task metadata") })
+        .register(InspectedCompletion {
+            inspections: Rc::new(Cell::new(0)),
             outcome: Rc::clone(&outcome),
-        },
-        |_, _, _| -> Option<()> { panic!("ordinary cycles must not inspect completion metadata") },
-    );
+        });
     let _ = executor.execute_cycle();
 
     assert_eq!(outcome.get(), Some(("completed", 0)));
@@ -111,16 +115,19 @@ fn ordinary_cycles_do_not_inspect_the_completion_target() {
 fn completion_inspection_can_decline_without_losing_the_result() {
     let mut executor = Executor::builder().build();
     let outcome = Rc::new(Cell::new(None));
-    executor.tasks().task(std::future::ready(())).register_with_inspection(
-        InspectedCompletion {
-            inspections: Cell::new(0),
-            outcome: Rc::clone(&outcome),
-        },
-        |_, completion, _| {
-            completion.inspections.set(completion.inspections.get() + 1);
+    let inspections = Rc::new(Cell::new(0));
+    let inspected = Rc::clone(&inspections);
+    executor
+        .tasks()
+        .task(std::future::ready(()))
+        .inspect(move |_, _| {
+            inspected.set(inspected.get() + 1);
             None::<u32>
-        },
-    );
+        })
+        .register(InspectedCompletion {
+            inspections,
+            outcome: Rc::clone(&outcome),
+        });
     let mut descriptions = Vec::new();
     assert_eq!(
         executor.inspect(1, |value: &u32| descriptions.push(*value)).unwrap(),
@@ -382,7 +389,7 @@ fn invalid_limits_and_panicking_visitors_report_errors() {
 
     assert_eq!((invalid, failed), (InspectionError::InvalidLimit, InspectionError::Panicked));
     assert_eq!(invalid.to_string(), "the task inspection limit must be greater than zero");
-    assert_eq!(failed.to_string(), "the task inspector or visitor panicked");
+    assert_eq!(failed.to_string(), "the task instrumentation or visitor panicked");
     assert_eq!(InspectionError::Busy.to_string(), "native task storage is busy");
 }
 
@@ -741,17 +748,20 @@ fn observed_polls_pair_callbacks_only_for_described_tasks() {
 fn observed_polls_borrow_the_completion_target() {
     let mut executor = Executor::builder().build();
     let outcome = Rc::new(Cell::new(None));
-    executor.tasks().task(std::future::ready(())).register_with_inspection(
-        InspectedCompletion {
-            inspections: Cell::new(41),
-            outcome: Rc::clone(&outcome),
-        },
-        |_, completion, state| {
+    let inspections = Rc::new(Cell::new(41));
+    let inspected = Rc::clone(&inspections);
+    executor
+        .tasks()
+        .task(std::future::ready(()))
+        .inspect(move |_, state| {
             assert_eq!(state, TaskState::Running);
-            completion.inspections.set(completion.inspections.get() + 1);
-            Some(completion.inspections.get())
-        },
-    );
+            inspected.set(inspected.get() + 1);
+            Some(inspected.get())
+        })
+        .register(InspectedCompletion {
+            inspections,
+            outcome: Rc::clone(&outcome),
+        });
     let observer = Observer::default();
 
     let _ = executor.execute_cycle_observed(&observer);
@@ -766,13 +776,14 @@ fn rejected_tasks_cancel_the_completion_target_without_inspecting_it() {
     executor.shutdown().trigger(ShutdownCause::default());
     let outcome = Rc::new(Cell::new(None));
 
-    executor.tasks().task(std::future::pending::<()>()).register_with_inspection(
-        InspectedCompletion {
-            inspections: Cell::new(7),
+    executor
+        .tasks()
+        .task(std::future::pending::<()>())
+        .inspect(|_, _| -> Option<()> { panic!("a stopped executor must not inspect rejected tasks") })
+        .register(InspectedCompletion {
+            inspections: Rc::new(Cell::new(7)),
             outcome: Rc::clone(&outcome),
-        },
-        |_, _, _| -> Option<()> { panic!("a stopped executor must not inspect rejected tasks") },
-    );
+        });
 
     assert_eq!(outcome.get(), Some(("cancelled", 7)));
 }

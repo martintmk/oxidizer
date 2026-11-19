@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use crate::inspection::Inspector;
-use crate::{ExecutorShared, TaskCompletion, TaskObserver};
+use crate::{ExecutorShared, TaskCompletion, TaskInstrumentation};
 
 /// Configures a task before registering it with an executor.
 ///
@@ -11,14 +10,12 @@ use crate::{ExecutorShared, TaskCompletion, TaskObserver};
 /// without registering a task.
 #[derive(derive_more::Debug)]
 #[must_use = "call register to submit the task"]
-pub struct TaskBuilder<'a, F, I = (), O = ()> {
+pub struct TaskBuilder<'a, F, I = ()> {
     shared: &'a ExecutorShared,
     #[debug(skip)]
     future: F,
     #[debug(skip)]
-    inspector: I,
-    #[debug(skip)]
-    observer: O,
+    instrumentation: I,
 }
 
 impl<'a, F> TaskBuilder<'a, F> {
@@ -26,53 +23,46 @@ impl<'a, F> TaskBuilder<'a, F> {
         Self {
             shared,
             future,
-            inspector: (),
-            observer: (),
+            instrumentation: (),
         }
     }
 }
 
-impl<'a, F, I, O> TaskBuilder<'a, F, I, O> {
-    /// Sets a callback that describes the converted future during explicit inspection.
-    ///
-    /// The callback is stored with the future without a separate task allocation.
-    /// Ordinary execution cycles do not call it. Calling this method again replaces
-    /// the previous callback.
-    #[cfg(feature = "inspection")]
-    pub fn inspect<D, J>(self, inspect: J) -> TaskBuilder<'a, F, impl Inspector<F::IntoFuture> + use<F, I, O, D, J>, O>
+impl<'a, F, I> TaskBuilder<'a, F, I> {
+    /// Adds a callback that describes the converted future during inspection.
+    pub fn inspect<D, J>(self, inspect: J) -> TaskBuilder<'a, F, impl TaskInstrumentation<F::IntoFuture> + use<F, I, D, J>>
     where
         F: IntoFuture,
+        I: TaskInstrumentation<F::IntoFuture>,
         D: 'static,
         J: Fn(&F::IntoFuture, crate::TaskState) -> Option<D> + 'static,
     {
         TaskBuilder {
             shared: self.shared,
             future: self.future,
-            inspector: crate::inspection::InspectWith::new(inspect),
-            observer: self.observer,
+            instrumentation: crate::inspection::InspectWith::new(self.instrumentation, inspect),
         }
     }
 
-    /// Sets the value that observes each top-level task poll.
-    ///
-    /// The observer runs on the executor thread. It must always return normally.
-    /// Calling this method again replaces the previous observer.
-    pub fn observe<Q: TaskObserver>(self, observer: Q) -> TaskBuilder<'a, F, I, Q> {
+    /// Sets the runtime-owned behavior attached to this task.
+    pub fn instrument<Q>(self, instrumentation: Q) -> TaskBuilder<'a, F, Q>
+    where
+        F: IntoFuture,
+        Q: TaskInstrumentation<F::IntoFuture>,
+    {
         TaskBuilder {
             shared: self.shared,
             future: self.future,
-            inspector: self.inspector,
-            observer,
+            instrumentation,
         }
     }
 }
 
-impl<F, I, O> TaskBuilder<'_, F, I, O>
+impl<F, I> TaskBuilder<'_, F, I>
 where
     F: IntoFuture + 'static,
     F::Output: 'static,
-    I: Inspector<F::IntoFuture>,
-    O: TaskObserver,
+    I: TaskInstrumentation<F::IntoFuture>,
 {
     /// Registers the task and its completion target.
     ///
@@ -83,33 +73,6 @@ where
     /// Registration does not wake the executor owner. The caller must arrange an
     /// [`execute_cycle`](crate::Executor::execute_cycle) after registration.
     pub fn register(self, completion: impl TaskCompletion<F::Output>) {
-        self.shared.add_task(
-            self.future,
-            self.observer,
-            completion,
-            crate::inspection::FutureInspector(self.inspector),
-        );
-    }
-}
-
-impl<F, I, O> TaskBuilder<'_, F, I, O>
-where
-    F: IntoFuture + 'static,
-    F::Output: 'static,
-    O: TaskObserver,
-{
-    /// Registers a task whose inspector borrows its future and completion target.
-    ///
-    /// The callback replaces any configured inspector. It runs only during
-    /// explicit inspection or observed polls.
-    #[cfg(feature = "inspection")]
-    pub fn register_with_inspection<T, D, J>(self, completion: T, inspect: J)
-    where
-        T: TaskCompletion<F::Output>,
-        D: 'static,
-        J: Fn(&F::IntoFuture, &T, crate::TaskState) -> Option<D> + 'static,
-    {
-        self.shared
-            .add_task(self.future, self.observer, completion, crate::inspection::InspectWith::new(inspect));
+        self.shared.add_task(self.future, self.instrumentation, completion);
     }
 }

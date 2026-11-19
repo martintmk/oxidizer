@@ -3,7 +3,7 @@
 
 use std::marker::PhantomData;
 
-use arty_executor::{TaskCompletion, TaskObserver, TaskSet};
+use arty_executor::{TaskCompletion, TaskInstrumentation, TaskSet};
 
 /// Captures submission metadata before a task crosses threads.
 pub(crate) struct TaskMonitoring<Body, S = ()> {
@@ -53,13 +53,13 @@ where
         F: IntoFuture<Output = R> + 'static,
         R: 'static,
         T: TaskCompletion<R>,
-        O: TaskObserver,
+        O: TaskInstrumentation<F::IntoFuture>,
     {
         #[cfg(any(test, feature = "monitor"))]
         super::task::add_task_with_metadata::<Body, _, _, _, _, _>(tasks, future, completion, observer, self.parent, self.body_size);
         // #[gamma::skip(stmt.delete_call, reason = "This branch is absent from Gamma's all-features builds; runtime-only integration tests exercise it.")]
         #[cfg(not(any(test, feature = "monitor")))]
-        tasks.task(future).observe(observer).register(completion);
+        tasks.task(future).instrument(observer).register(completion);
     }
 }
 

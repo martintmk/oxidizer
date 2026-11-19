@@ -22,9 +22,6 @@ private-api = true
 [package.metadata.cargo_check_external_types]
 allowed_external_types = ["thread_aware_core::thread::Thread"]
 
-[features]
-inspection = []
-
 [dependencies]
 derive_more = { workspace = true, features = ["debug"] }
 nm = { workspace = true }
@@ -43,10 +40,6 @@ metabench = { path = "../metabench", default-features = false }
 static_assertions = { workspace = true }
 thread_aware = { path = "../thread_aware", default-features = false, features = ["std"] }
 tick = { path = "../tick", default-features = false, features = ["fast-instant", "test-util"] }
-
-[[test]]
-name = "inspection"
-required-features = ["inspection"]
 
 # >>> anvil-managed: anvil-lints
 [lints]

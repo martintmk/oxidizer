@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 
-use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskObserver, TaskSet, discard_task_panic_payload};
+use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskInstrumentation, TaskSet, discard_task_panic_payload};
 use static_assertions::assert_not_impl_any;
 
 use super::support::{DiscardCompletion, TaskBuilderExt as _};
@@ -46,7 +46,7 @@ struct PollOutcomes {
     outcomes: Rc<RefCell<Vec<Poll<()>>>>,
 }
 
-impl TaskObserver for PollOutcomes {
+impl<F> TaskInstrumentation<F> for PollOutcomes {
     fn poll_start(&mut self) {
         self.starts.set(self.starts.get() + 1);
     }
@@ -73,7 +73,7 @@ fn task_observer_receives_each_poll_outcome() {
                 Poll::Ready(())
             }
         }))
-        .observe(PollOutcomes {
+        .instrument(PollOutcomes {
             starts: Rc::clone(&starts),
             outcomes: Rc::clone(&outcomes),
         })

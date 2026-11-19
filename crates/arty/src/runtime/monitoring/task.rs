@@ -6,7 +6,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use arty_executor::{ShutdownCause, TaskCompletion, TaskObserver, TaskPanicPayload, TaskSet, TaskState};
+use arty_executor::{TaskCompletion, TaskInstrumentation, TaskSet, TaskState};
 use seismograph::recorder::event::{EventClass, EventTimestamp};
 use seismograph::recorder::runtime::{TaskId, TypeDescriptorId};
 use seismograph_runtime::snapshot::{Task, TaskActivityState};
@@ -222,31 +222,52 @@ impl AsyncTaskInfo {
 }
 
 #[derive(Debug)]
-struct Completion<T> {
-    target: T,
+struct MonitoredTask<Body, O, S> {
+    observer: O,
     info: AsyncTaskInfo,
+    body_size: S,
+    marker: std::marker::PhantomData<fn() -> Body>,
 }
 
-impl<R: 'static, T: TaskCompletion<R>> TaskCompletion<R> for Completion<T> {
-    fn completed(self, result: R) {
+impl<Body, F, O, S> TaskInstrumentation<F> for MonitoredTask<Body, O, S>
+where
+    Body: 'static,
+    O: TaskInstrumentation<F>,
+    S: Fn() -> usize + 'static,
+{
+    fn inspect(&self, _future: &F, state: TaskState, visitor: &mut dyn FnMut(&dyn std::any::Any)) {
+        let description = seismograph::recorder::without_recording(|| match state {
+            TaskState::Ready => Description::Snapshot(self.info.describe::<Body>(TaskActivityState::Ready, (self.body_size)())),
+            TaskState::Waiting => Description::Snapshot(self.info.describe::<Body>(TaskActivityState::Waiting, (self.body_size)())),
+            TaskState::Running => Description::Poll(self.info.id()),
+        });
+        visitor(&description);
+    }
+
+    fn poll_start(&mut self) {
+        self.observer.poll_start();
+    }
+
+    fn poll_end(&mut self, outcome: std::task::Poll<()>) {
+        self.observer.poll_end(outcome);
+    }
+
+    fn completed(&mut self) {
         if let Some(id) = self.info.terminal_id() {
             self.info.events.completed(id);
         }
-        self.target.completed(result);
     }
 
-    fn panicked(self, panic: TaskPanicPayload, cause: Option<ShutdownCause>) {
+    fn panicked(&mut self) {
         if let Some(id) = self.info.terminal_id() {
             self.info.events.panicked(id);
         }
-        self.target.panicked(panic, cause);
     }
 
-    fn cancelled(self, cause: ShutdownCause) {
+    fn cancelled(&mut self) {
         if let Some(id) = self.info.terminal_id() {
             self.info.events.canceled(id);
         }
-        self.target.cancelled(cause);
     }
 }
 
@@ -262,92 +283,26 @@ pub(crate) fn add_task_with_metadata<Body, F, R, T, O, S>(
     F: IntoFuture<Output = R> + 'static,
     R: 'static,
     T: TaskCompletion<R>,
-    O: TaskObserver,
+    O: TaskInstrumentation<F::IntoFuture>,
     S: Fn() -> usize + 'static,
 {
     let Some(events) = current_events() else {
-        tasks.task(future).observe(observer).register(completion);
+        tasks.task(future).instrument(observer).register(completion);
         return;
     };
-    let completion = Completion {
-        target: completion,
+    let instrumentation = MonitoredTask::<Body, _, _> {
+        observer,
         info: AsyncTaskInfo::new::<Body>(events, parent, body_size()),
+        body_size,
+        marker: std::marker::PhantomData,
     };
-    tasks
-        .task(future)
-        .observe(observer)
-        .register_with_inspection(completion, move |_, completion, state| {
-            let info = &completion.info;
-            Some(seismograph::recorder::without_recording(|| match state {
-                TaskState::Ready => Description::Snapshot(info.describe::<Body>(TaskActivityState::Ready, body_size())),
-                TaskState::Waiting => Description::Snapshot(info.describe::<Body>(TaskActivityState::Waiting, body_size())),
-                TaskState::Running => Description::Poll(info.id()),
-            }))
-        });
+    tasks.task(future).instrument(instrumentation).register(completion);
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::error::Error as _;
-
-    use arty_executor::{ShutdownCause, ShutdownError, TaskCompletion};
-    use seismograph_runtime::RuntimeMetadata;
-    use seismograph_runtime::worker::{WorkerMetadata, WorkerRole};
-
-    use super::{AsyncTaskInfo, Completion, TaskInfo, current_task, enter_current};
-    use crate::runtime::shutdown::{Shutdown, ShutdownState};
-    use crate::task::handle::JoinHandlePool;
-
-    #[test]
-    fn monitored_panic_preserves_the_payload_and_executor_shutdown_cause() {
-        let _monitoring = crate::runtime::monitoring::TEST_LOCK.lock().unwrap();
-        let runtime = seismograph_runtime::register_runtime(RuntimeMetadata::new("panic-forwarding", 1));
-        let worker = runtime.register_worker(WorkerMetadata::new(WorkerRole::Core));
-
-        for stopping in [false, true] {
-            let pool = JoinHandlePool::new(Shutdown::default());
-            let (handle, target) = pool.handle::<u32>();
-            let cause = stopping.then(|| ShutdownCause::panic(&42_u32));
-            let expected = cause.as_ref().and_then(ShutdownCause::as_error).cloned();
-            let completion = Completion {
-                target,
-                info: AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0),
-            };
-
-            completion.panicked(Box::new(42_u32), cause);
-
-            if let Some(expected) = expected {
-                assert!(std::ptr::addr_eq(pool.shutdown().error().unwrap().inner(), expected.inner()));
-            } else {
-                assert_eq!(pool.shutdown().state(), ShutdownState::Running);
-            }
-            assert_eq!(*handle.join().unwrap_err().into_panic().unwrap().downcast::<u32>().unwrap(), 42);
-        }
-    }
-
-    #[test]
-    fn monitored_cancellation_delivers_the_executor_shutdown_cause() {
-        let _monitoring = crate::runtime::monitoring::TEST_LOCK.lock().unwrap();
-        let runtime = seismograph_runtime::register_runtime(RuntimeMetadata::new("cancellation-forwarding", 1));
-        let worker = runtime.register_worker(WorkerMetadata::new(WorkerRole::Core));
-        let pool = JoinHandlePool::new(Shutdown::default());
-        let (handle, target) = pool.handle::<u32>();
-        let cause = ShutdownCause::panic(&"executor failure");
-        let expected = cause.as_error().unwrap().clone();
-        let completion = Completion {
-            target,
-            info: AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0),
-        };
-
-        completion.cancelled(cause);
-        let error = handle.join().unwrap_err();
-
-        assert!(error.is_shutdown());
-        let source = error.source().unwrap().downcast_ref::<ShutdownError>().unwrap();
-        assert!(std::ptr::addr_eq(source.inner(), expected.inner()));
-        assert!(std::ptr::addr_eq(pool.shutdown().error().unwrap().inner(), expected.inner()));
-    }
+    use super::{AsyncTaskInfo, TaskInfo, current_task, enter_current};
 
     #[test]
     fn current_task_scope_restores_its_parent_after_return_and_panic() {
