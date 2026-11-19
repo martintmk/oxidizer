@@ -18,8 +18,8 @@ use crate::task::preparation::DeferredTaskFactory;
 
 thread_local! {
     static CURRENT: RefCell<Option<LocalWorker>> = const { RefCell::new(None) };
-    static SPAWN_HOOKS: RefCell<Option<Vec<Arc<ErasedHookFn<TaskSpawn>>>>> = const { RefCell::new(None) };
-    static PANIC_HOOKS: RefCell<Option<Vec<Arc<ErasedHookFn<Panic>>>>> = const { RefCell::new(None) };
+    static SPAWN_HOOKS: RefCell<Option<Arc<Vec<Arc<ErasedHookFn<TaskSpawn>>>>>> = const { RefCell::new(None) };
+    static PANIC_HOOKS: RefCell<Option<Arc<Vec<Arc<ErasedHookFn<Panic>>>>>> = const { RefCell::new(None) };
 }
 
 static LOCAL_SPAWN_HOOK: LocalHook<TaskSpawn> = LocalHook { hooks: &SPAWN_HOOKS };
@@ -114,12 +114,12 @@ impl LocalWorker {
     }
 
     fn execute_spawn_hooks(thread: &Thread) -> Option<TaskObservers> {
-        let hooks = SPAWN_HOOKS.with_borrow(|hooks| hooks.as_ref().expect("a running worker retains its installed hooks").clone());
+        let hooks = SPAWN_HOOKS.with_borrow(|hooks| Arc::clone(hooks.as_ref().expect("a running worker retains its installed hooks")));
         if hooks.is_empty() {
             return None;
         }
         let mut event = TaskSpawn::new(Some(thread.clone()));
-        for hook in hooks {
+        for hook in hooks.iter() {
             hook.execute(&mut event);
         }
         event.into_observers()

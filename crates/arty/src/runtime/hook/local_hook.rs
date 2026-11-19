@@ -11,7 +11,7 @@ use super::{ErasedHookFn, Hook};
 
 #[derive(Debug)]
 pub(crate) struct LocalHook<H: Hook> {
-    pub(crate) hooks: &'static LocalKey<RefCell<Option<Vec<Arc<ErasedHookFn<H>>>>>>,
+    pub(crate) hooks: &'static LocalKey<RefCell<Option<Arc<Vec<Arc<ErasedHookFn<H>>>>>>>,
 }
 
 pub(crate) type LocalHookGuard<H> = scopeguard::ScopeGuard<&'static LocalHook<H>, fn(&'static LocalHook<H>)>;
@@ -20,7 +20,7 @@ impl<H: Hook> LocalHook<H> {
     pub(crate) fn initialize(&'static self) -> LocalHookGuard<H> {
         self.hooks.with_borrow_mut(|hooks| {
             assert!(
-                hooks.replace(Vec::new()).is_none(),
+                hooks.replace(Arc::new(Vec::new())).is_none(),
                 "hooks are already installed on this task worker"
             );
         });
@@ -36,18 +36,15 @@ impl<H: Hook> LocalHook<H> {
     pub(crate) fn install(&self, mut hook: ErasedHookFn<H>, source: Option<&Thread>, destination: &Thread) {
         hook.relocate(source, destination);
         self.hooks.with_borrow_mut(|hooks| {
-            hooks
-                .as_mut()
-                .expect("a running worker retains its installed hooks")
-                .push(Arc::new(hook));
+            Arc::make_mut(hooks.as_mut().expect("a running worker retains its installed hooks")).push(Arc::new(hook));
         });
     }
 
     pub(crate) fn execute(&self, event: &mut H) {
         let hooks = self
             .hooks
-            .with_borrow(|hooks| hooks.as_ref().expect("a running worker retains its installed hooks").clone());
-        for hook in hooks {
+            .with_borrow(|hooks| Arc::clone(hooks.as_ref().expect("a running worker retains its installed hooks")));
+        for hook in hooks.iter() {
             hook.execute(event);
         }
     }
@@ -59,7 +56,7 @@ mod tests {
     use crate::runtime::hook::Panic;
 
     thread_local! {
-        static HOOKS: RefCell<Option<Vec<Arc<ErasedHookFn<Panic>>>>> = const { RefCell::new(None) };
+        static HOOKS: RefCell<Option<Arc<Vec<Arc<ErasedHookFn<Panic>>>>>> = const { RefCell::new(None) };
     }
 
     static LOCAL_HOOK: LocalHook<Panic> = LocalHook { hooks: &HOOKS };

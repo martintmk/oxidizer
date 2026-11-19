@@ -15,7 +15,7 @@ use std::thread::ThreadId;
 use performables::sync::channel;
 use plurality::{Arc as PoolArc, MultiPool};
 
-use crate::inspection::Inspector;
+use crate::inspection::CompletionInspector;
 use crate::wake::RemoteWake;
 use crate::{
     PanicPolicy, Shutdown, TaskCompletion, TaskHandle, TaskObserver, TypeErasedTask, WakeShared, WakeSignal, allocate_task,
@@ -123,7 +123,7 @@ impl ExecutorShared {
         F: IntoFuture + 'static,
         F::Output: 'static,
         T: TaskCompletion<F::Output>,
-        I: Inspector<F::IntoFuture>,
+        I: CompletionInspector<F::IntoFuture, T>,
         O: TaskObserver,
     {
         if self.shutdown().is_triggered() {

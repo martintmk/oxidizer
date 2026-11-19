@@ -4,7 +4,6 @@
 use std::any::TypeId;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::OnceLock;
 
 use arty_executor::{ShutdownCause, TaskCompletion, TaskObserver, TaskPanicPayload, TaskSet, TaskState};
@@ -225,7 +224,7 @@ impl AsyncTaskInfo {
 #[derive(Debug)]
 struct Completion<T> {
     target: T,
-    info: Rc<AsyncTaskInfo>,
+    info: AsyncTaskInfo,
 }
 
 impl<R: 'static, T: TaskCompletion<R>> TaskCompletion<R> for Completion<T> {
@@ -272,27 +271,25 @@ pub(crate) fn add_task_with_metadata<Body, F, R, T, O, S>(
     };
     let completion = Completion {
         target: completion,
-        info: Rc::new(AsyncTaskInfo::new::<Body>(events, parent, body_size())),
+        info: AsyncTaskInfo::new::<Body>(events, parent, body_size()),
     };
-    let info = Rc::clone(&completion.info);
     tasks
         .task(future)
         .observe(observer)
-        .inspect(move |_, state| {
+        .register_with_inspection(completion, move |_, completion, state| {
+            let info = &completion.info;
             Some(seismograph::recorder::without_recording(|| match state {
                 TaskState::Ready => Description::Snapshot(info.describe::<Body>(TaskActivityState::Ready, body_size())),
                 TaskState::Waiting => Description::Snapshot(info.describe::<Body>(TaskActivityState::Waiting, body_size())),
                 TaskState::Running => Description::Poll(info.id()),
             }))
-        })
-        .register(completion);
+        });
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::error::Error as _;
-    use std::rc::Rc;
 
     use arty_executor::{ShutdownCause, ShutdownError, TaskCompletion};
     use seismograph_runtime::RuntimeMetadata;
@@ -315,7 +312,7 @@ mod tests {
             let expected = cause.as_ref().and_then(ShutdownCause::as_error).cloned();
             let completion = Completion {
                 target,
-                info: Rc::new(AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0)),
+                info: AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0),
             };
 
             completion.panicked(Box::new(42_u32), cause);
@@ -340,7 +337,7 @@ mod tests {
         let expected = cause.as_error().unwrap().clone();
         let completion = Completion {
             target,
-            info: Rc::new(AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0)),
+            info: AsyncTaskInfo::new::<()>(worker.handle().task_events(), None, 0),
         };
 
         completion.cancelled(cause);

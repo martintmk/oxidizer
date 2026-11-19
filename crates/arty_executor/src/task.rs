@@ -17,7 +17,7 @@ use plurality::{Arc as PoolArc, MultiPool};
 use crate::TaskHandle;
 #[cfg(feature = "inspection")]
 use crate::TaskState;
-use crate::inspection::Inspector;
+use crate::inspection::CompletionInspector;
 use crate::{
     ExecutorShared, ShutdownCause, TaskHandleSlot, TaskObserver, TaskPanicPayload, TaskPtr, WakeSignal, discard_task_panic_payload,
 };
@@ -40,7 +40,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
     /// `None` after the task completes or the executor abandons it during shutdown.
@@ -78,7 +78,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
 }
@@ -89,7 +89,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
 }
@@ -99,7 +99,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
     fn new(future: F, result_target: T, observer: O, inspector: I) -> Self {
@@ -132,7 +132,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
     pool.alloc_arc_pin_with(|| Task::new(future, completion, observer, inspector))
@@ -165,7 +165,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
     #[cfg(feature = "inspection")]
@@ -175,8 +175,9 @@ where
         let payload = unsafe { &*self.payload.get() };
         if let Some(payload) = payload
             && let Some(future) = &payload.future.inner
+            && let Some(completion) = &payload.result_target
         {
-            payload.inspector.inspect(future, state, visitor);
+            payload.inspector.inspect(future, completion, state, visitor);
         }
     }
 
@@ -268,7 +269,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
     fn pinned_wake_signal(self: Pin<&Self>) -> Pin<&WakeSignal> {
@@ -364,7 +365,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
     T: TaskCompletion<F::Output>,
-    I: Inspector<F>,
+    I: CompletionInspector<F, T>,
     O: TaskObserver,
 {
     /// The future that will be polled by the executor to progress the task.

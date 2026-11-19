@@ -1478,10 +1478,7 @@ mod tests {
             WorkerState::Running
         );
         for _ in 0..COMMANDS_PER_CYCLE {
-            commands
-                .spawn_sender()
-                .send(enqueue(RemoteFutureFactory::new_without_observers(|_, _| {})))
-                .unwrap();
+            commands.spawn_sender().send(enqueue(RemoteFutureFactory::new(|_, _| {}))).unwrap();
         }
         assert!(worker.execute_step().is_continue());
 
