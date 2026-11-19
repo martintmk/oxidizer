@@ -54,7 +54,7 @@ impl RetainedHooks {
         hooks.rcu(move |current| {
             let mut updated = Vec::with_capacity(current.len().saturating_add(1));
             updated.extend(current.iter().cloned());
-            updated.push(hook.clone());
+            updated.push(Arc::clone(&hook));
             Arc::new(updated)
         });
     }
@@ -91,6 +91,7 @@ impl RetainedHooks {
 impl fmt::Debug for RetainedHooks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RetainedHooks")
+            .field("has_task_spawn", &self.has_task_spawn.load(Ordering::Acquire))
             .field("task_spawn", &self.task_spawn.load().len())
             .field("worker_init", &self.worker_init.load().len())
             .finish()

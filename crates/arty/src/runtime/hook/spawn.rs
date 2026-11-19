@@ -153,6 +153,8 @@ impl super::private::Sealed for TaskSpawn {
 
 #[cfg(all(test, not(miri)))]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
+
     use std::alloc::System;
     use std::hint::black_box;
 
@@ -200,7 +202,7 @@ mod tests {
         let mut event = TaskSpawn::new(None);
         event.observe(OneBytePoll(1));
 
-        assert!(event.into_observers().unwrap().into_single().is_ok());
+        let _observer = event.into_observers().unwrap().into_single().unwrap();
     }
 
     #[test]
@@ -225,7 +227,7 @@ mod tests {
             for value in 0..MEASURED_OPERATIONS {
                 let mut event = TaskSpawn::new(Some(worker.clone()));
                 for observer in 0..observer_count {
-                    event.observe(OneBytePoll((value + observer) as u8));
+                    event.observe(OneBytePoll(u8::try_from((value + observer) % 256).unwrap()));
                 }
                 black_box(event.into_observers());
             }

@@ -42,6 +42,7 @@ gungraun = { workspace = true, features = ["default"] }
 metabench = { path = "../metabench", default-features = false }
 static_assertions = { workspace = true }
 thread_aware = { path = "../thread_aware", default-features = false, features = ["std"] }
+tick = { path = "../tick", default-features = false, features = ["fast-instant", "test-util"] }
 
 [[test]]
 name = "inspection"

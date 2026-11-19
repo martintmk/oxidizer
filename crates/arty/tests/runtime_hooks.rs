@@ -4,6 +4,8 @@
 //! Public runtime hook contracts.
 
 #![cfg(feature = "rt")]
+#![allow(clippy::panic, reason = "tests deliberately trigger panics")]
+#![allow(clippy::unwrap_used, reason = "test code")]
 
 mod support;
 
@@ -400,9 +402,11 @@ fn spawn_hook_runs_for_a_detached_scheduler() {
 #[derive(Clone)]
 struct NeutralSpawnProbe {
     factory_created: Arc<AtomicBool>,
-    relocation: Arc<Mutex<Option<(Option<ThreadId>, ThreadId)>>>,
+    relocation: ObserverRelocation,
     began: Arc<AtomicBool>,
 }
+
+type ObserverRelocation = Arc<Mutex<Option<(Option<ThreadId>, ThreadId)>>>;
 
 impl ThreadAware for NeutralSpawnProbe {
     fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
@@ -410,7 +414,7 @@ impl ThreadAware for NeutralSpawnProbe {
 
 struct RelocatedPoll {
     factory_created: Arc<AtomicBool>,
-    relocation: Arc<Mutex<Option<(Option<ThreadId>, ThreadId)>>>,
+    relocation: ObserverRelocation,
     began: Arc<AtomicBool>,
 }
 

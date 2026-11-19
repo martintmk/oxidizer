@@ -55,9 +55,14 @@ impl<F> Drop for TaskFactory<F> {
 /// heap allocation for every remote spawn.
 type ErasedRemoteFutureFactory = dyn Fn(Context, &TaskSet, Option<TaskObservers>) + Send;
 
+enum TaskObserversSource {
+    Default,
+    Explicit(Option<TaskObservers>),
+}
+
 pub(crate) struct RemoteFutureFactory {
     inner: PoolBox<ErasedRemoteFutureFactory>,
-    observers: Option<Option<TaskObservers>>,
+    observers: TaskObserversSource,
     requires_spawn: bool,
 }
 
@@ -96,13 +101,13 @@ impl RemoteFutureFactory {
             });
         Self {
             inner,
-            observers: None,
+            observers: TaskObserversSource::Default,
             requires_spawn,
         }
     }
 
     pub(crate) fn with_observers(mut self, observers: Option<TaskObservers>) -> Self {
-        self.observers = Some(observers);
+        self.observers = TaskObserversSource::Explicit(observers);
         self
     }
 
@@ -113,9 +118,9 @@ impl RemoteFutureFactory {
             requires_spawn,
         } = self;
         let observers = match observers {
-            Some(observers) => observers,
-            None if requires_spawn => crate::runtime::worker::asynchronous::LocalWorker::on_spawn(),
-            None => None,
+            TaskObserversSource::Explicit(observers) => observers,
+            TaskObserversSource::Default if requires_spawn => crate::runtime::worker::asynchronous::LocalWorker::on_spawn(),
+            TaskObserversSource::Default => None,
         };
         inner(cx, tasks, observers);
         RegisteredRemoteTask
