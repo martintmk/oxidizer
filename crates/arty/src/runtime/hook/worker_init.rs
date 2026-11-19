@@ -3,14 +3,15 @@
 
 use thread_aware::Thread;
 
-/// ⓘ An event that runs once on each async worker after the worker initializes.
-///
-/// Arty retains each registered callback. The callback runs once on every
-/// current worker and once on each worker that starts after registration.
+/// An event that runs once on each async worker after the worker initializes.
+/// [^worker-init-retention]
 ///
 /// Do not request runtime shutdown from this callback, including through
 /// [`RuntimeControl::request_stop`](crate::runtime::RuntimeControl::request_stop).
 /// Worker initialization callbacks must finish their setup and return normally.
+///
+/// [^worker-init-retention]: Arty retains each registered callback. The callback runs once on every
+/// current worker and once on each worker that starts after registration.
 #[derive(Debug)]
 pub struct WorkerInit {
     thread: Thread,
