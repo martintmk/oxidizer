@@ -380,6 +380,10 @@ impl DispatcherCore {
     }
 
     fn submission_observers(&self) -> Option<TaskObservers> {
+        // #[gamma::skip(cond.always_false, reason = "This guard only avoids hook discovery; the empty hook snapshot also returns no observers.")]
+        if !self.retained_hooks.has_task_spawn() {
+            return None;
+        }
         if LocalWorker::current_thread().is_some_and(|thread| self.owns(&thread)) {
             LocalWorker::on_spawn()
         } else {
