@@ -35,6 +35,11 @@ pub(crate) struct WorkerEndpoint {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerIndex(usize);
 
+enum SubmissionObservers {
+    Neutral,
+    Worker(Option<TaskObservers>),
+}
+
 impl From<WorkerIndex> for usize {
     fn from(value: WorkerIndex) -> Self {
         value.0
@@ -378,7 +383,10 @@ impl DispatcherCore {
             return join_handle;
         }
         let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
-        let observers = self.current_worker_observers().unwrap_or_else(|| self.neutral_observers());
+        let observers = match self.current_worker_observers() {
+            SubmissionObservers::Neutral => self.neutral_observers(),
+            SubmissionObservers::Worker(observers) => observers,
+        };
         self.send_prepared(worker_index, future_factory.with_observers(observers));
 
         join_handle
@@ -401,7 +409,7 @@ impl DispatcherCore {
             return join_handle;
         }
         let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
-        if let Some(observers) = self.current_worker_observers() {
+        if let SubmissionObservers::Worker(observers) = self.current_worker_observers() {
             self.send_prepared(worker_index, future_factory.with_observers(observers));
             return join_handle;
         }
@@ -414,10 +422,12 @@ impl DispatcherCore {
         self.retained_hooks.execute_task_spawn(|| TaskSpawn::new(None))
     }
 
-    fn current_worker_observers(&self) -> Option<Option<TaskObservers>> {
-        LocalWorker::current_thread()
-            .filter(|thread| self.owns(thread))
-            .map(|_| LocalWorker::on_spawn())
+    fn current_worker_observers(&self) -> SubmissionObservers {
+        if LocalWorker::current_thread().is_some_and(|thread| self.owns(&thread)) {
+            SubmissionObservers::Worker(LocalWorker::on_spawn())
+        } else {
+            SubmissionObservers::Neutral
+        }
     }
 
     fn send_prepared(&self, worker_index: WorkerIndex, future_factory: RemoteFutureFactory) {

@@ -9,7 +9,7 @@ use thread_aware::{Thread, ThreadAware};
 
 use crate::io::RuntimeDriverHost;
 use crate::runtime::dispatch::DispatcherClient;
-use crate::runtime::hook::{ErasedHookFn, HookRegistration, LocalHook, LocalHookGuard, Panic, TaskObservers, TaskSpawn, WorkerInit};
+use crate::runtime::hook::{HookRegistration, LocalHook, LocalHookGuard, LocalHookStorage, Panic, TaskObservers, TaskSpawn, WorkerInit};
 use crate::runtime::monitoring::TaskMonitoring;
 use crate::runtime::worker::{self, WorkerMarker};
 use crate::task::Context;
@@ -18,8 +18,8 @@ use crate::task::preparation::DeferredTaskFactory;
 
 thread_local! {
     static CURRENT: RefCell<Option<LocalWorker>> = const { RefCell::new(None) };
-    static SPAWN_HOOKS: RefCell<Option<Arc<Vec<Arc<ErasedHookFn<TaskSpawn>>>>>> = const { RefCell::new(None) };
-    static PANIC_HOOKS: RefCell<Option<Arc<Vec<Arc<ErasedHookFn<Panic>>>>>> = const { RefCell::new(None) };
+    static SPAWN_HOOKS: LocalHookStorage<TaskSpawn> = const { RefCell::new(None) };
+    static PANIC_HOOKS: LocalHookStorage<Panic> = const { RefCell::new(None) };
 }
 
 static LOCAL_SPAWN_HOOK: LocalHook<TaskSpawn> = LocalHook { hooks: &SPAWN_HOOKS };

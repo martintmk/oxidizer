@@ -9,9 +9,11 @@ use thread_aware::{Thread, ThreadAware};
 
 use super::{ErasedHookFn, Hook};
 
+pub(crate) type LocalHookStorage<H> = RefCell<Option<Arc<Vec<Arc<ErasedHookFn<H>>>>>>;
+
 #[derive(Debug)]
 pub(crate) struct LocalHook<H: Hook> {
-    pub(crate) hooks: &'static LocalKey<RefCell<Option<Arc<Vec<Arc<ErasedHookFn<H>>>>>>>,
+    pub(crate) hooks: &'static LocalKey<LocalHookStorage<H>>,
 }
 
 pub(crate) type LocalHookGuard<H> = scopeguard::ScopeGuard<&'static LocalHook<H>, fn(&'static LocalHook<H>)>;
@@ -56,7 +58,7 @@ mod tests {
     use crate::runtime::hook::Panic;
 
     thread_local! {
-        static HOOKS: RefCell<Option<Arc<Vec<Arc<ErasedHookFn<Panic>>>>>> = const { RefCell::new(None) };
+        static HOOKS: LocalHookStorage<Panic> = const { RefCell::new(None) };
     }
 
     static LOCAL_HOOK: LocalHook<Panic> = LocalHook { hooks: &HOOKS };

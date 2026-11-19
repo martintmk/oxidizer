@@ -47,7 +47,7 @@ mod worker_init;
 
 pub(crate) use hook_fn::ErasedHookFn;
 pub use hook_fn::HookFn;
-pub(crate) use local_hook::{LocalHook, LocalHookGuard};
+pub(crate) use local_hook::{LocalHook, LocalHookGuard, LocalHookStorage};
 pub use panic::Panic;
 pub(crate) use registry::{HookRegistration, registration};
 pub(crate) use retained_hooks::RetainedHooks;
