@@ -15,7 +15,6 @@ mod asynchronous;
 mod blocking;
 #[cfg(any(test, feature = "monitor"))]
 mod runtime;
-mod submission;
 #[cfg(any(test, feature = "monitor"))]
 mod task;
 
@@ -35,8 +34,9 @@ pub(crate) use blocking::MonitoredBlockingJob;
 pub(crate) use blocking::{BlockingJob, BlockingPoolMonitoring, BlockingTaskEvents, BlockingTaskMonitoring, BlockingWorkerMonitoring};
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) use runtime::RuntimeDiagnostics;
-pub(crate) use submission::TaskMonitoring;
 #[cfg(any(test, feature = "monitor"))]
-pub(crate) use task::TaskInfo;
-#[cfg(all(test, feature = "test-util"))]
-pub(crate) use task::current_task;
+pub(crate) use task::register_monitored;
+#[cfg(test)]
+pub(crate) use task::{Description, enter_current, set_events};
+#[cfg(any(test, feature = "monitor"))]
+pub(crate) use task::{TaskInfo, current_task};

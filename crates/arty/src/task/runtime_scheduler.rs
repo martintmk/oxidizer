@@ -137,7 +137,7 @@ impl RuntimeScheduler {
         let factory = unsafe { std::mem::transmute::<BoxedFutureFactory<'a, R>, BoxedFutureFactory<'static, R>>(factory) };
         let task = self
             .dispatcher
-            .spawn(factory, crate::runtime::monitoring::TaskMonitoring::with_body_size(size_of::<F>()));
+            .spawn(factory, crate::task::preparation::TaskSpawnOptions::with_body_size(size_of::<F>()));
         futures::executor::block_on(task).map_err(Error::new)
     }
 
@@ -199,7 +199,7 @@ impl RuntimeScheduler {
                 data.relocate(None, cx.thread());
                 future_factory(cx, data)
             },
-            crate::runtime::monitoring::TaskMonitoring::capture(),
+            crate::task::preparation::TaskSpawnOptions::capture(),
         )
     }
 

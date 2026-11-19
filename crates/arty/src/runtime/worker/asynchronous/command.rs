@@ -211,14 +211,11 @@ mod tests {
         let executor = Executor::builder().build();
         let invoked = Arc::new(AtomicBool::new(false));
         let factory_invoked = Arc::clone(&invoked);
-        let factory = RemoteFutureFactory::new(
-            move |_, _, _| {
-                factory_invoked.store(true, Ordering::Release);
-            },
-            false,
-        );
+        let factory = RemoteFutureFactory::new(move |_, _| {
+            factory_invoked.store(true, Ordering::Release);
+        });
 
-        let _registered = QueuedFactory::new(factory).into_inner().register(context, &executor.tasks());
+        QueuedFactory::new(factory).into_inner().register(context, &executor.tasks());
 
         assert!(invoked.load(Ordering::Acquire));
         runtime.stop().unwrap();
@@ -230,7 +227,7 @@ mod tests {
         let (factory, join) = prepare_remote(
             &result_pool,
             |_| async { 42 },
-            crate::runtime::monitoring::TaskMonitoring::capture(),
+            crate::task::preparation::TaskSpawnOptions::capture(),
         );
         let mut join = pin!(join);
         let wake = Arc::new(PanicWake(AtomicBool::new(false)));
@@ -250,12 +247,9 @@ mod tests {
     fn queued_factory_disposal_contains_captured_destructor_panic() {
         let drops = Arc::new(AtomicUsize::new(0));
         let capture = PanicOnDrop(Arc::clone(&drops));
-        let factory = RemoteFutureFactory::new(
-            move |_, _, _| {
-                let _ = &capture;
-            },
-            false,
-        );
+        let factory = RemoteFutureFactory::new(move |_, _| {
+            let _ = &capture;
+        });
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(QueuedFactory::new(factory));

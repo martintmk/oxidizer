@@ -345,7 +345,7 @@ impl Worker {
         // this batch, prepare_cycle stops before polling the registered tasks.
         let mut processed = 0_usize;
         for SpawnCommand { future_factory } in std::iter::from_fn(|| commands.spawn_receiver().try_recv().ok()).take(COMMANDS_PER_CYCLE) {
-            let _registered = future_factory.into_inner().register(context.clone(), &self.tasks);
+            future_factory.into_inner().register(context.clone(), &self.tasks);
             processed = processed.saturating_add(1);
             if !commands.system_receiver().is_empty() {
                 return BatchProgress::LimitReached;
@@ -863,7 +863,7 @@ mod tests {
     }
 
     fn test_factory(factory: impl FnOnce(Context, &TaskSet) + Send + 'static) -> RemoteFutureFactory {
-        RemoteFutureFactory::new(move |context, tasks, _| factory(context, tasks), false)
+        RemoteFutureFactory::new(factory)
     }
 
     #[derive(Clone)]
@@ -1350,7 +1350,7 @@ mod tests {
         }
         let join = worker_context(&worker)
             .dispatcher()
-            .spawn(|_| async {}, crate::runtime::monitoring::TaskMonitoring::capture());
+            .spawn(|_| async {}, crate::task::preparation::TaskSpawnOptions::capture());
         commands.system_sender().send(SystemCommand::Shutdown).unwrap();
 
         assert!(worker.execute_step().is_break());
@@ -1458,14 +1458,14 @@ mod tests {
         );
         let polled = std::rc::Rc::new(std::cell::Cell::new(false));
         let completed = std::rc::Rc::clone(&polled);
-        crate::runtime::monitoring::TaskMonitoring::<()>::capture().register(
+        crate::task::preparation::TaskSpawnOptions::<()>::capture().register(
+            worker_context(&worker).thread(),
             &worker.tasks,
             async move {
                 assert_eq!(crate::runtime::monitoring::current_task(), None);
                 completed.set(true);
             },
             DiscardCompletion,
-            None::<()>,
         );
         seismograph::recorder::without_recording(|| {
             worker.prepare_cycle();
@@ -2130,7 +2130,7 @@ mod tests {
                     std::future::ready(())
                 }
             },
-            crate::runtime::monitoring::TaskMonitoring::capture(),
+            crate::task::preparation::TaskSpawnOptions::capture(),
         );
 
         assert!(worker.execute_step().is_break());

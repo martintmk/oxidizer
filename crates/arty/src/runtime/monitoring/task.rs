@@ -23,7 +23,7 @@ pub(crate) fn current_events() -> Option<EventContext> {
     EVENTS.with(Cell::get)
 }
 
-pub(super) fn set_events(events: Option<EventContext>) {
+pub(crate) fn set_events(events: Option<EventContext>) {
     EVENTS.with(|slot| slot.set(events));
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn enter_current(task: TaskId) -> CurrentTask {
     clippy::large_enum_variant,
     reason = "descriptions are transient stack values; boxing snapshots would allocate during native inspection"
 )]
-pub(super) enum Description {
+pub(crate) enum Description {
     Snapshot(Task),
     Poll(TaskId),
 }
@@ -222,17 +222,17 @@ impl AsyncTaskInfo {
 }
 
 #[derive(Debug)]
-struct MonitoredTask<Body, O, S> {
-    observer: O,
+struct TaskMonitor<Body, I, S> {
+    instrumentation: I,
     info: AsyncTaskInfo,
     body_size: S,
     marker: std::marker::PhantomData<fn() -> Body>,
 }
 
-impl<Body, F, O, S> TaskInstrumentation<F> for MonitoredTask<Body, O, S>
+impl<Body, F, I, S> TaskInstrumentation<F> for TaskMonitor<Body, I, S>
 where
     Body: 'static,
-    O: TaskInstrumentation<F>,
+    I: TaskInstrumentation<F>,
     S: Fn() -> usize + 'static,
 {
     fn inspect(&self, _future: &F, state: TaskState, visitor: &mut dyn FnMut(&dyn std::any::Any)) {
@@ -245,11 +245,11 @@ where
     }
 
     fn poll_start(&mut self) {
-        self.observer.poll_start();
+        self.instrumentation.poll_start();
     }
 
     fn poll_end(&mut self, outcome: std::task::Poll<()>) {
-        self.observer.poll_end(outcome);
+        self.instrumentation.poll_end(outcome);
     }
 
     fn completed(&mut self) {
@@ -271,11 +271,11 @@ where
     }
 }
 
-pub(crate) fn add_task_with_metadata<Body, F, R, T, O, S>(
+pub(crate) fn register_monitored<Body, F, R, T, I, S>(
     tasks: &TaskSet,
     future: F,
     completion: T,
-    observer: O,
+    instrumentation: I,
     parent: Option<TaskId>,
     body_size: S,
 ) where
@@ -283,20 +283,20 @@ pub(crate) fn add_task_with_metadata<Body, F, R, T, O, S>(
     F: IntoFuture<Output = R> + 'static,
     R: 'static,
     T: TaskCompletion<R>,
-    O: TaskInstrumentation<F::IntoFuture>,
+    I: TaskInstrumentation<F::IntoFuture>,
     S: Fn() -> usize + 'static,
 {
     let Some(events) = current_events() else {
-        tasks.task(future).instrument(observer).register(completion);
+        tasks.task(future).instrument(instrumentation).register(completion);
         return;
     };
-    let instrumentation = MonitoredTask::<Body, _, _> {
-        observer,
+    let monitor = TaskMonitor::<Body, _, _> {
+        instrumentation,
         info: AsyncTaskInfo::new::<Body>(events, parent, body_size()),
         body_size,
         marker: std::marker::PhantomData,
     };
-    tasks.task(future).instrument(instrumentation).register(completion);
+    tasks.task(future).instrument(monitor).register(completion);
 }
 
 #[cfg(test)]
@@ -362,7 +362,7 @@ mod tests {
         let completion = crate::task::handle::JoinHandlePool::new(crate::runtime::shutdown::Shutdown::default());
         let (_handle, sender) = completion.handle();
 
-        super::add_task_with_metadata::<(), _, _, _, _, _>(&executor.tasks(), future, sender, (), None, || 0);
+        super::register_monitored::<(), _, _, _, _, _>(&executor.tasks(), future, sender, (), None, || 0);
         let _ = executor.execute_cycle();
 
         assert!(ran.get());

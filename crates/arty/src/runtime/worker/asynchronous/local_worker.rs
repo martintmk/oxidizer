@@ -10,11 +10,10 @@ use thread_aware::{Thread, ThreadAware};
 use crate::io::RuntimeDriverHost;
 use crate::runtime::dispatch::DispatcherClient;
 use crate::runtime::hook::{HookRegistration, LocalHook, LocalHookGuard, LocalHookStorage, Panic, TaskObservers, TaskSpawn, WorkerInit};
-use crate::runtime::monitoring::TaskMonitoring;
 use crate::runtime::worker::{self, WorkerMarker};
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
-use crate::task::preparation::DeferredTaskFactory;
+use crate::task::preparation::{DeferredTaskFactory, TaskSpawnOptions};
 
 thread_local! {
     static CURRENT: RefCell<Option<LocalWorker>> = const { RefCell::new(None) };
@@ -280,7 +279,7 @@ impl SchedulerContext {
 
         let (handle, result_tx) = self.results.handle();
         let inner = DeferredTaskFactory::new(future_factory, self.context.clone());
-        TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, None::<TaskObservers>);
+        TaskSpawnOptions::<F>::capture().register(&self.thread, &self.tasks, inner, result_tx);
         handle
     }
 
@@ -292,19 +291,11 @@ impl SchedulerContext {
         R: Send + 'static,
     {
         let (handle, result_tx) = self.results.handle();
-        let observers = LocalWorker::execute_spawn_hooks(&self.thread).map(|mut observers| {
-            observers.relocate_to(&self.thread);
-            observers
-        });
+        let observers = LocalWorker::execute_spawn_hooks(&self.thread);
         let inner = DeferredTaskFactory::new(future_factory, self.context.clone());
-        if let Some(observers) = observers {
-            match observers.into_single() {
-                Ok(observer) => TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, Some(observer)),
-                Err(observers) => TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, Some(observers)),
-            }
-        } else {
-            TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, None::<TaskObservers>);
-        }
+        TaskSpawnOptions::<F>::capture()
+            .observed_by(observers)
+            .register(&self.thread, &self.tasks, inner, result_tx);
         handle
     }
 }

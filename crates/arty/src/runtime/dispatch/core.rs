@@ -14,14 +14,13 @@ use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
 
 use crate::runtime::hook::{HookRegistration, RetainedHooks, TaskObservers, TaskSpawn};
-use crate::runtime::monitoring::TaskMonitoring;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::worker::asynchronous::{CommandSender, LocalWorker, QueuedFactory, QueuedIoAccess, SpawnCommand, SystemCommand};
 use crate::runtime::worker::blocking::Worker;
 use crate::runtime::{Error, Workers};
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
-use crate::task::preparation::{RemoteFutureFactory, prepare_remote};
+use crate::task::preparation::{RemoteFutureFactory, TaskSpawnOptions, prepare_remote};
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerEndpoint {
@@ -34,11 +33,6 @@ pub(crate) struct WorkerEndpoint {
 /// Index resolved against a dispatcher's registered workers, not a hardware processor ID.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkerIndex(usize);
-
-enum SubmissionObservers {
-    Neutral,
-    Worker(Option<TaskObservers>),
-}
 
 impl From<WorkerIndex> for usize {
     fn from(value: WorkerIndex) -> Self {
@@ -183,14 +177,14 @@ impl DispatcherCore {
         WorkerIndex(self.next_async_worker_index.fetch_add(1, Ordering::Relaxed) % self.worker_endpoints.len())
     }
 
-    pub(crate) fn spawn<FF, F, R, S>(&self, future_factory: FF, monitoring: TaskMonitoring<F, S>) -> JoinHandle<R>
+    pub(crate) fn spawn<FF, F, R, S>(&self, future_factory: FF, options: TaskSpawnOptions<F, S>) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: Send + 'static,
         S: Fn() -> usize + Send + 'static,
     {
-        self.enqueue(self.next_worker_index(), future_factory, monitoring)
+        self.enqueue(self.next_worker_index(), future_factory, options)
     }
 
     pub(crate) fn spawn_relocating<FF, F, R>(&self, source: &Thread, future_factory: FF) -> JoinHandle<R>
@@ -356,7 +350,7 @@ impl DispatcherCore {
         F: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        self.enqueue_on_worker(worker_index, future_factory, TaskMonitoring::capture())
+        self.enqueue(worker_index, future_factory, TaskSpawnOptions::capture())
     }
 
     /// Records the execution worker so a successful result can relocate when its join is polled.
@@ -367,11 +361,11 @@ impl DispatcherCore {
         R: ThreadAware + 'static,
     {
         let source = self.worker_endpoints[usize::from(worker_index)].thread.clone();
-        self.enqueue_on_worker(worker_index, future_factory, TaskMonitoring::capture())
+        self.enqueue(worker_index, future_factory, TaskSpawnOptions::capture())
             .relocate_result_from(source)
     }
 
-    fn enqueue<FF, F, R, S>(&self, worker_index: WorkerIndex, future_factory: FF, monitoring: TaskMonitoring<F, S>) -> JoinHandle<R>
+    fn enqueue<FF, F, R, S>(&self, worker_index: WorkerIndex, future_factory: FF, options: TaskSpawnOptions<F, S>) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
@@ -382,51 +376,17 @@ impl DispatcherCore {
             drop(future_factory);
             return join_handle;
         }
-        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
-        let observers = match self.current_worker_observers() {
-            SubmissionObservers::Neutral => self.neutral_observers(),
-            SubmissionObservers::Worker(observers) => observers,
-        };
-        self.send_prepared(worker_index, future_factory.with_observers(observers));
-
+        let options = options.observed_by(self.submission_observers());
+        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, options);
+        self.send_prepared(worker_index, future_factory);
         join_handle
     }
 
-    fn enqueue_on_worker<FF, F, R, S>(
-        &self,
-        worker_index: WorkerIndex,
-        future_factory: FF,
-        monitoring: TaskMonitoring<F, S>,
-    ) -> JoinHandle<R>
-    where
-        FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
-        S: Fn() -> usize + Send + 'static,
-    {
-        if let Some(join_handle) = JoinHandle::try_from_shutdown(self.shutdown()) {
-            drop(future_factory);
-            return join_handle;
-        }
-        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
-        if let SubmissionObservers::Worker(observers) = self.current_worker_observers() {
-            self.send_prepared(worker_index, future_factory.with_observers(observers));
-            return join_handle;
-        }
-        let observers = self.neutral_observers();
-        self.send_prepared(worker_index, future_factory.with_observers(observers));
-        join_handle
-    }
-
-    fn neutral_observers(&self) -> Option<TaskObservers> {
-        self.retained_hooks.execute_task_spawn(|| TaskSpawn::new(None))
-    }
-
-    fn current_worker_observers(&self) -> SubmissionObservers {
+    fn submission_observers(&self) -> Option<TaskObservers> {
         if LocalWorker::current_thread().is_some_and(|thread| self.owns(&thread)) {
-            SubmissionObservers::Worker(LocalWorker::on_spawn())
+            LocalWorker::on_spawn()
         } else {
-            SubmissionObservers::Neutral
+            self.retained_hooks.execute_task_spawn(|| TaskSpawn::new(None))
         }
     }
 
@@ -608,12 +568,12 @@ mod tests {
 
         dispatcher.spawn(
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskMonitoring::capture(),
+            TaskSpawnOptions::capture(),
         );
 
         dispatcher.spawn(
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskMonitoring::capture(),
+            TaskSpawnOptions::capture(),
         );
 
         assert_eq!(drain_spawn(&worker_rx).len(), 2);
@@ -633,12 +593,12 @@ mod tests {
 
         dispatcher.spawn(
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskMonitoring::capture(),
+            TaskSpawnOptions::capture(),
         );
 
         dispatcher.spawn(
             |_| async move { unreachable!("we do not expect the task to be executed") },
-            TaskMonitoring::capture(),
+            TaskSpawnOptions::capture(),
         );
 
         assert_eq!(drain_spawn(&worker1_rx).len(), 1);
@@ -656,7 +616,7 @@ mod tests {
         for _ in 0..4 {
             dispatcher.spawn(
                 |_| async move { unreachable!("we do not expect the task to be executed") },
-                TaskMonitoring::capture(),
+                TaskSpawnOptions::capture(),
             );
         }
 
@@ -728,7 +688,7 @@ mod tests {
         let dispatcher = DispatcherCore::new(NonEmpty::new(endpoint(&threads[0]).0), Shutdown::default(), Vec::new());
         dispatcher.stop_inner(ShutdownError::new(Error::worker_panicked()).into());
 
-        let mut join = pin!(dispatcher.spawn(|_| async {}, TaskMonitoring::capture()));
+        let mut join = pin!(dispatcher.spawn(|_| async {}, TaskSpawnOptions::capture()));
         let Poll::Ready(Err(error)) = join.as_mut().poll(&mut task::Context::from_waker(Waker::noop())) else {
             panic!("shutdown rejection must be immediately ready");
         };
@@ -824,7 +784,7 @@ mod tests {
         // Close the command channel.
         drop(command_rx);
 
-        let join_handle = dispatcher.spawn(|_| async move {}, TaskMonitoring::capture());
+        let join_handle = dispatcher.spawn(|_| async move {}, TaskSpawnOptions::capture());
         let join_handle = pin!(join_handle);
 
         let mut cx = task::Context::from_waker(Waker::noop());

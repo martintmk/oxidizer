@@ -13,8 +13,7 @@ use arty_executor::{CycleOutcome, Executor};
 use futures::executor::block_on;
 
 use super::*;
-use crate::runtime::hook::TaskSpawn;
-use crate::runtime::monitoring::{BlockingTaskMonitoring, TaskMonitoring};
+use crate::runtime::monitoring::BlockingTaskMonitoring;
 use crate::runtime::{Runtime, Shutdown, WorkersPolicy};
 use crate::task::Context;
 use crate::task::handle::JoinHandlePool;
@@ -42,13 +41,12 @@ fn remote_factory_defers_future_creation_until_polling() {
                 *value
             }
         },
-        TaskMonitoring::capture(),
+        TaskSpawnOptions::capture(),
     );
 
     let mut executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
     let (_runtime, cx) = test_context();
-    let spawn = TaskSpawn::new(Some(cx.thread().clone()));
-    let _registered = factory.with_observers(spawn.into_observers()).register(cx, &executor.tasks());
+    factory.register(cx, &executor.tasks());
     let before_poll = invoked.load(Ordering::Relaxed);
     run_to_completion(&mut executor);
     let result = block_on(handle).unwrap();
@@ -98,12 +96,11 @@ fn remote_factory_panic_is_delivered_to_joiner() {
     let (factory, handle) = prepare_remote(
         &result_pool,
         |_| -> std::future::Ready<()> { panic_any(Payload(42)) },
-        TaskMonitoring::capture(),
+        TaskSpawnOptions::capture(),
     );
     let mut executor = Executor::builder().owner_waker(Waker::noop().clone()).build();
     let (_runtime, cx) = test_context();
-    let spawn = TaskSpawn::new(Some(cx.thread().clone()));
-    let _registered = factory.with_observers(spawn.into_observers()).register(cx, &executor.tasks());
+    factory.register(cx, &executor.tasks());
     run_to_completion(&mut executor);
     assert!(block_on(handle).unwrap_err().is_panic());
 }
@@ -130,7 +127,7 @@ fn discarded_remote_factory_reports_the_shutdown_cause() {
     let shutdown = Shutdown::default();
     shutdown.begin(arty_executor::ShutdownError::new(std::io::Error::other("queued shutdown")).into());
     let result_pool = JoinHandlePool::new(shutdown);
-    let (factory, handle) = prepare_remote(&result_pool, |_| async { 42 }, TaskMonitoring::capture());
+    let (factory, handle) = prepare_remote(&result_pool, |_| async { 42 }, TaskSpawnOptions::capture());
 
     drop(factory);
 

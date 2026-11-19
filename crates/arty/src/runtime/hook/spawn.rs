@@ -95,28 +95,33 @@ impl TaskObservers {
         self
     }
 
+    pub(crate) fn relocate_to(mut self, destination: &Thread) -> PollObservers {
+        for observer in &mut self.observers {
+            observer.relocate(self.source.as_ref(), destination);
+        }
+        PollObservers(self.observers)
+    }
+}
+
+#[derive(derive_more::Debug)]
+pub(crate) struct PollObservers(#[debug(ignore)] SmallVec<[Box<dyn TaskObserver>; 2]>);
+
+impl PollObservers {
     pub(crate) fn into_single(mut self) -> Result<Box<dyn TaskObserver>, Self> {
-        if self.observers.len() == 1 {
-            return Ok(self.observers.pop().expect("observer count was exactly one"));
+        if self.0.len() == 1 {
+            return Ok(self.0.pop().expect("observer count was exactly one"));
         }
         Err(self)
     }
 
-    pub(crate) fn relocate_to(&mut self, destination: &Thread) {
-        for observer in &mut self.observers {
-            observer.relocate(self.source.as_ref(), destination);
-        }
-        self.source = Some(destination.clone());
-    }
-
     pub(crate) fn poll_start(&mut self) {
-        for observer in &mut self.observers {
+        for observer in &mut self.0 {
             observer.poll_start();
         }
     }
 
     pub(crate) fn poll_end(&mut self, outcome: Poll<()>) {
-        for observer in self.observers.iter_mut().rev() {
+        for observer in self.0.iter_mut().rev() {
             observer.poll_end(outcome);
         }
     }
@@ -132,7 +137,7 @@ impl<F> arty_executor::TaskInstrumentation<F> for Box<dyn TaskObserver> {
     }
 }
 
-impl<F> arty_executor::TaskInstrumentation<F> for TaskObservers {
+impl<F> arty_executor::TaskInstrumentation<F> for PollObservers {
     fn poll_start(&mut self) {
         Self::poll_start(self);
     }
@@ -207,8 +212,9 @@ mod tests {
     fn into_single_returns_only_observer() {
         let mut event = TaskSpawn::new(None);
         event.observe(OneBytePoll(1));
+        let worker = ThreadBuilder::default().build(std::thread::current().id());
 
-        let _observer = event.into_observers().unwrap().into_single().unwrap();
+        let _observer = event.into_observers().unwrap().relocate_to(&worker).into_single().unwrap();
     }
 
     #[test]
@@ -216,12 +222,13 @@ mod tests {
         let mut event = TaskSpawn::new(None);
         event.observe(OneBytePoll(1));
         event.observe(OneBytePoll(2));
-        let observers = event.into_observers().unwrap();
+        let worker = ThreadBuilder::default().build(std::thread::current().id());
+        let observers = event.into_observers().unwrap().relocate_to(&worker);
 
         let Err(observers) = observers.into_single() else {
             panic!("multiple observers cannot become one observer");
         };
-        assert_eq!(observers.observers.len(), 2);
+        assert_eq!(observers.0.len(), 2);
     }
 
     fn observer_allocations(observer_count: usize) -> u64 {

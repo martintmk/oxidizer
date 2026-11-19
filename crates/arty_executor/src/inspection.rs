@@ -81,44 +81,6 @@ pub trait TaskInstrumentation<F>: 'static {
 
 impl<F> TaskInstrumentation<F> for () {}
 
-impl<F, I: TaskInstrumentation<F>> TaskInstrumentation<F> for Option<I> {
-    fn inspect(&self, future: &F, state: TaskState, visitor: &mut dyn FnMut(&dyn Any)) {
-        if let Some(instrumentation) = self {
-            instrumentation.inspect(future, state, visitor);
-        }
-    }
-
-    fn poll_start(&mut self) {
-        if let Some(instrumentation) = self {
-            instrumentation.poll_start();
-        }
-    }
-
-    fn poll_end(&mut self, outcome: Poll<()>) {
-        if let Some(instrumentation) = self {
-            instrumentation.poll_end(outcome);
-        }
-    }
-
-    fn completed(&mut self) {
-        if let Some(instrumentation) = self {
-            instrumentation.completed();
-        }
-    }
-
-    fn panicked(&mut self) {
-        if let Some(instrumentation) = self {
-            instrumentation.panicked();
-        }
-    }
-
-    fn cancelled(&mut self) {
-        if let Some(instrumentation) = self {
-            instrumentation.cancelled();
-        }
-    }
-}
-
 pub(crate) struct InspectWith<I, J, D> {
     instrumentation: I,
     inspect: J,

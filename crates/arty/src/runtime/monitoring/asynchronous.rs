@@ -188,11 +188,11 @@ mod tests {
         let parent = seismograph_runtime::allocate_task_id();
         {
             let _parent = crate::runtime::monitoring::task::enter_current(parent);
-            crate::runtime::monitoring::TaskMonitoring::<()>::capture().register(
+            crate::task::preparation::TaskSpawnOptions::<()>::capture().register(
+                &thread,
                 &executor.tasks(),
                 std::future::pending::<()>(),
                 sender,
-                None::<()>,
             );
         }
         let snapshot = capture(&mut executor);
