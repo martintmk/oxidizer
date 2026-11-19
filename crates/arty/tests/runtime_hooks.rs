@@ -109,6 +109,13 @@ impl ThreadAware for SharedLog {
     fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
 }
 
+#[derive(Clone)]
+struct SpawnSourceProbe(mpsc::Sender<Option<ThreadId>>);
+
+impl ThreadAware for SpawnSourceProbe {
+    fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+}
+
 struct PollRecorder {
     before: &'static str,
     after: &'static str,
@@ -374,6 +381,45 @@ fn spawn_hook_covers_runtime_local_relocating_and_specific_worker_submissions() 
 }
 
 #[test]
+fn spawn_hook_uses_the_actual_submitting_worker() {
+    let (observed, observations) = mpsc::channel();
+    let runtime = Runtime::builder()
+        .workers(WorkersPolicy::exactly(2))
+        .on(HookFn::<TaskSpawn, _>::new(SpawnSourceProbe(observed), |event, probe| {
+            probe.0.send(event.thread().map(Thread::id)).unwrap();
+        }))
+        .build()
+        .unwrap();
+    let (scheduler, destination) = runtime
+        .scheduler()
+        .block_on(async |cx| {
+            let destination = cx
+                .control()
+                .workers()
+                .into_iter()
+                .find(|worker| worker.id() != cx.thread().id())
+                .unwrap()
+                .clone();
+            (cx.scheduler().clone(), destination)
+        })
+        .unwrap();
+    for _ in observations.try_iter() {}
+
+    let bound = scheduler.clone();
+    scheduler
+        .spawn_at(&destination, bound, |bound| async move {
+            bound.spawn_anywhere((), |()| async {}).await.unwrap();
+        })
+        .join()
+        .unwrap();
+
+    let sources: Vec<_> = (0..2).map(|_| observations.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+    assert!(sources.contains(&None));
+    assert!(sources.contains(&Some(destination.id())));
+    runtime.stop().unwrap();
+}
+
+#[test]
 fn spawn_hook_runs_for_a_detached_scheduler() {
     let calls = Arc::new(AtomicUsize::new(0));
     let runtime = Runtime::builder()
@@ -536,6 +582,19 @@ fn control_registration_precedes_later_task_submissions() {
             probe.calls.fetch_add(1, Ordering::SeqCst);
         },
     ));
+    let (initialized, initialization) = mpsc::channel();
+    control.on(HookFn::<WorkerInit, _>::new(
+        InitSignal {
+            calls: PanicCount(Arc::new(AtomicUsize::new(0))),
+            initialized,
+        },
+        |_event, data| {
+            data.initialized.send(()).unwrap();
+        },
+    ));
+    for _ in control.workers() {
+        initialization.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
 
     let tasks: Vec<_> = control
         .workers()
@@ -572,6 +631,55 @@ fn spawn_hook_registration_applies_before_local_spawn() {
         .unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    runtime.stop().unwrap();
+}
+
+#[derive(Clone)]
+struct NestedSpawnRegistration {
+    context: Context,
+    registered: Arc<AtomicBool>,
+    outer_calls: Arc<AtomicUsize>,
+    nested_calls: Arc<AtomicUsize>,
+}
+
+impl ThreadAware for NestedSpawnRegistration {
+    fn relocate(&mut self, source: Option<&Thread>, destination: &Thread) {
+        self.context.relocate(source, destination);
+    }
+}
+
+#[test]
+fn spawn_hook_can_register_another_spawn_hook() {
+    let runtime = Runtime::builder().workers(WorkersPolicy::exactly(1)).build().unwrap();
+    let context = runtime.scheduler().block_on(async |cx| cx).unwrap();
+    let outer_calls = Arc::new(AtomicUsize::new(0));
+    let nested_calls = Arc::new(AtomicUsize::new(0));
+
+    context.control().on(HookFn::<TaskSpawn, _>::new(
+        NestedSpawnRegistration {
+            context: context.clone(),
+            registered: Arc::new(AtomicBool::new(false)),
+            outer_calls: Arc::clone(&outer_calls),
+            nested_calls: Arc::clone(&nested_calls),
+        },
+        |_event, data| {
+            data.outer_calls.fetch_add(1, Ordering::SeqCst);
+            if !data.registered.swap(true, Ordering::SeqCst) {
+                data.context.control().on(HookFn::<TaskSpawn, _>::new(
+                    PanicCount(Arc::clone(&data.nested_calls)),
+                    |_event, calls| {
+                        calls.0.fetch_add(1, Ordering::SeqCst);
+                    },
+                ));
+            }
+        },
+    ));
+
+    context.scheduler().spawn(async |_| {}).join().unwrap();
+    context.scheduler().spawn(async |_| {}).join().unwrap();
+
+    assert_eq!(outer_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(nested_calls.load(Ordering::SeqCst), 1);
     runtime.stop().unwrap();
 }
 

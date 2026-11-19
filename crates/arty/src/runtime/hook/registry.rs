@@ -13,12 +13,6 @@ pub(crate) enum HookRegistration {
     WorkerInit(ErasedHookFn<WorkerInit>),
 }
 
-impl From<ErasedHookFn<TaskSpawn>> for HookRegistration {
-    fn from(hook: ErasedHookFn<TaskSpawn>) -> Self {
-        Self::TaskSpawn(hook)
-    }
-}
-
 impl From<ErasedHookFn<Panic>> for HookRegistration {
     fn from(hook: ErasedHookFn<Panic>) -> Self {
         Self::Panic(hook)

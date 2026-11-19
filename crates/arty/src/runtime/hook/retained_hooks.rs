@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,6 +13,7 @@ pub(crate) struct ClearedHooks {
     _worker_init: Arc<Vec<Arc<ErasedHookFn<WorkerInit>>>>,
 }
 
+#[derive(derive_more::Debug)]
 pub(crate) struct RetainedHooks {
     has_task_spawn: AtomicBool,
     task_spawn: ArcSwap<Vec<Arc<ErasedHookFn<TaskSpawn>>>>,
@@ -85,16 +85,6 @@ impl RetainedHooks {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.task_spawn.load().len().saturating_add(self.worker_init.load().len())
-    }
-}
-
-impl fmt::Debug for RetainedHooks {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RetainedHooks")
-            .field("has_task_spawn", &self.has_task_spawn.load(Ordering::Acquire))
-            .field("task_spawn", &self.task_spawn.load().len())
-            .field("worker_init", &self.worker_init.load().len())
-            .finish()
     }
 }
 

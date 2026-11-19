@@ -211,7 +211,7 @@ mod tests {
         let executor = Executor::builder().build();
         let invoked = Arc::new(AtomicBool::new(false));
         let factory_invoked = Arc::clone(&invoked);
-        let factory = RemoteFutureFactory::new_without_observers(move |_, _| {
+        let factory = RemoteFutureFactory::new(move |_, _| {
             factory_invoked.store(true, Ordering::Release);
         });
 
@@ -247,7 +247,7 @@ mod tests {
     fn queued_factory_disposal_contains_captured_destructor_panic() {
         let drops = Arc::new(AtomicUsize::new(0));
         let capture = PanicOnDrop(Arc::clone(&drops));
-        let factory = RemoteFutureFactory::new_without_observers(move |_, _| {
+        let factory = RemoteFutureFactory::new(move |_, _| {
             let _ = &capture;
         });
 

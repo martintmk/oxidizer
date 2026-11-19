@@ -194,9 +194,6 @@ impl DispatcherCore {
         F: Future<Output = R> + 'static,
         R: ThreadAware + 'static,
     {
-        let source_index = self
-            .worker_index(source.id())
-            .expect("a scheduler source must identify a registered runtime worker");
         let worker_index = self.next_worker_index();
         let endpoint = &self.worker_endpoints[usize::from(worker_index)];
         let future_factory = if &endpoint.thread == source {
@@ -221,21 +218,16 @@ impl DispatcherCore {
         } else {
             future_factory
         };
-        self.spawn_relocating_on_worker(source_index, worker_index, future_factory)
+        self.spawn_relocating_on_worker(worker_index, future_factory)
     }
 
-    pub(crate) fn spawn_at_worker_relocating<FF, F, R>(
-        &self,
-        source_index: WorkerIndex,
-        worker_index: WorkerIndex,
-        future_factory: FF,
-    ) -> JoinHandle<R>
+    pub(crate) fn spawn_at_worker_relocating<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: ThreadAware + 'static,
     {
-        self.spawn_relocating_on_worker(source_index, worker_index, future_factory)
+        self.spawn_relocating_on_worker(worker_index, future_factory)
     }
 
     pub(crate) fn worker_index(&self, thread_id: ThreadId) -> Option<WorkerIndex> {
@@ -353,44 +345,24 @@ impl DispatcherCore {
             .wake_by_ref();
     }
 
-    #[cfg(test)]
     pub(crate) fn spawn_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        self.enqueue(worker_index, future_factory, TaskMonitoring::capture())
-    }
-
-    pub(crate) fn spawn_on_worker_from<FF, F, R>(
-        &self,
-        source_index: WorkerIndex,
-        worker_index: WorkerIndex,
-        future_factory: FF,
-    ) -> JoinHandle<R>
-    where
-        FF: FnOnce(Context) -> F + Send + 'static,
-        F: Future<Output = R> + 'static,
-        R: Send + 'static,
-    {
-        self.enqueue_from_worker(source_index, worker_index, future_factory, TaskMonitoring::capture())
+        self.enqueue_on_worker(worker_index, future_factory, TaskMonitoring::capture())
     }
 
     /// Records the execution worker so a successful result can relocate when its join is polled.
-    fn spawn_relocating_on_worker<FF, F, R>(
-        &self,
-        source_index: WorkerIndex,
-        worker_index: WorkerIndex,
-        future_factory: FF,
-    ) -> JoinHandle<R>
+    fn spawn_relocating_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: ThreadAware + 'static,
     {
         let source = self.worker_endpoints[usize::from(worker_index)].thread.clone();
-        self.enqueue_from_worker(source_index, worker_index, future_factory, TaskMonitoring::capture())
+        self.enqueue_on_worker(worker_index, future_factory, TaskMonitoring::capture())
             .relocate_result_from(source)
     }
 
@@ -406,15 +378,14 @@ impl DispatcherCore {
             return join_handle;
         }
         let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
-        let observers = self.neutral_observers();
+        let observers = self.current_worker_observers().unwrap_or_else(|| self.neutral_observers());
         self.send_prepared(worker_index, future_factory.with_observers(observers));
 
         join_handle
     }
 
-    fn enqueue_from_worker<FF, F, R, S>(
+    fn enqueue_on_worker<FF, F, R, S>(
         &self,
-        source_index: WorkerIndex,
         worker_index: WorkerIndex,
         future_factory: FF,
         monitoring: TaskMonitoring<F, S>,
@@ -430,9 +401,8 @@ impl DispatcherCore {
             return join_handle;
         }
         let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
-        let source = &self.worker_endpoints[usize::from(source_index)];
-        if LocalWorker::current_thread().is_some_and(|thread| thread == source.thread) {
-            self.send_prepared(worker_index, future_factory.with_observers(LocalWorker::on_spawn()));
+        if let Some(observers) = self.current_worker_observers() {
+            self.send_prepared(worker_index, future_factory.with_observers(observers));
             return join_handle;
         }
         let observers = self.neutral_observers();
@@ -442,6 +412,12 @@ impl DispatcherCore {
 
     fn neutral_observers(&self) -> Option<TaskObservers> {
         self.retained_hooks.execute_task_spawn(|| TaskSpawn::new(None))
+    }
+
+    fn current_worker_observers(&self) -> Option<Option<TaskObservers>> {
+        LocalWorker::current_thread()
+            .filter(|thread| self.owns(thread))
+            .map(|_| LocalWorker::on_spawn())
     }
 
     fn send_prepared(&self, worker_index: WorkerIndex, future_factory: RemoteFutureFactory) {

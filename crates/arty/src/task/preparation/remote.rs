@@ -71,11 +71,11 @@ pub(crate) struct RegisteredRemoteTask;
 
 impl RemoteFutureFactory {
     #[cfg(test)]
-    pub(crate) fn new_without_observers(factory: impl FnOnce(Context, &TaskSet) + Send + 'static) -> Self {
-        Self::new(move |cx, tasks, _observers| factory(cx, tasks), false)
+    pub(crate) fn new(factory: impl FnOnce(Context, &TaskSet) + Send + 'static) -> Self {
+        Self::new_observed(move |cx, tasks, _observers| factory(cx, tasks), false)
     }
 
-    fn new(factory: impl FnOnce(Context, &TaskSet, Option<TaskObservers>) + Send + 'static, requires_spawn: bool) -> Self {
+    fn new_observed(factory: impl FnOnce(Context, &TaskSet, Option<TaskObservers>) + Send + 'static, requires_spawn: bool) -> Self {
         let factory = Cell::new(Some(factory));
         // A pooled box cannot move an erased FnOnce out of its slot. Take the concrete
         // closure through Cell instead, without requiring its captures to be Unpin.
@@ -140,7 +140,7 @@ where
 {
     let (handle, result_tx) = result_pool.handle();
     let future_factory = TaskFactory::new(future_factory);
-    let future_factory = RemoteFutureFactory::new(
+    let future_factory = RemoteFutureFactory::new_observed(
         move |cx, tasks, observers| {
             let observers = observers.map(|mut observers| {
                 observers.relocate_to(cx.thread());
@@ -150,11 +150,11 @@ where
             let inner = DeferredTaskFactory::new(future_factory, cx);
             if let Some(observers) = observers {
                 match observers.into_single() {
-                    Ok(observer) => monitoring.register_observed(tasks, inner, result_tx, observer),
-                    Err(observers) => monitoring.register_observed(tasks, inner, result_tx, observers),
+                    Ok(observer) => monitoring.register(tasks, inner, result_tx, Some(observer)),
+                    Err(observers) => monitoring.register(tasks, inner, result_tx, Some(observers)),
                 }
             } else {
-                monitoring.register(tasks, inner, result_tx);
+                monitoring.register(tasks, inner, result_tx, None::<TaskObservers>);
             }
         },
         true,
@@ -181,7 +181,7 @@ mod tests {
 
     impl Drop for FactoryOnDrop {
         fn drop(&mut self) {
-            drop(RemoteFutureFactory::new_without_observers(|_, _| {}));
+            drop(RemoteFutureFactory::new(|_, _| {}));
             self.0.send(()).unwrap();
         }
     }
@@ -190,11 +190,11 @@ mod tests {
     fn remote_factory_reuses_its_pool_slot() {
         fn factory(_: Context, _: &TaskSet) {}
 
-        let first = RemoteFutureFactory::new_without_observers(factory);
+        let first = RemoteFutureFactory::new(factory);
         let address = std::ptr::from_ref(&*first.inner).cast::<()>();
         let chunks = FUTURE_FACTORIES.with(MultiPool::chunks_allocated);
         drop(first);
-        let second = RemoteFutureFactory::new_without_observers(factory);
+        let second = RemoteFutureFactory::new(factory);
 
         assert_eq!(std::ptr::from_ref(&*second.inner).cast::<()>(), address);
         assert_eq!(FUTURE_FACTORIES.with(MultiPool::chunks_allocated), chunks);

@@ -57,7 +57,7 @@ impl<'a, F, I, O> TaskBuilder<'a, F, I, O> {
     ///
     /// The observer runs on the executor thread. It must always return normally.
     /// Calling this method again replaces the previous observer.
-    pub fn observe<Q>(self, observer: Q) -> TaskBuilder<'a, F, I, Q> {
+    pub fn observe<Q: TaskObserver>(self, observer: Q) -> TaskBuilder<'a, F, I, Q> {
         TaskBuilder {
             shared: self.shared,
             future: self.future,
@@ -83,33 +83,6 @@ where
     /// Registration does not wake the executor owner. The caller must arrange an
     /// [`execute_cycle`](crate::Executor::execute_cycle) after registration.
     pub fn register(self, completion: impl TaskCompletion<F::Output>) {
-        self.shared.add_task(
-            self.future,
-            self.observer,
-            completion,
-            crate::inspection::FutureInspector(self.inspector),
-        );
-    }
-}
-
-impl<F, I, O> TaskBuilder<'_, F, I, O>
-where
-    F: IntoFuture + 'static,
-    F::Output: 'static,
-    O: TaskObserver,
-{
-    /// Registers a task whose inspector borrows its future and completion target.
-    ///
-    /// The callback replaces any configured inspector. It runs only during
-    /// explicit inspection or observed polls.
-    #[cfg(feature = "inspection")]
-    pub fn register_with_inspection<T, D, J>(self, completion: T, inspect: J)
-    where
-        T: TaskCompletion<F::Output>,
-        D: 'static,
-        J: Fn(&F::IntoFuture, &T, crate::TaskState) -> Option<D> + 'static,
-    {
-        self.shared
-            .add_task(self.future, self.observer, completion, crate::inspection::InspectWith::new(inspect));
+        self.shared.add_task(self.future, self.observer, completion, self.inspector);
     }
 }

@@ -144,6 +144,12 @@ impl arty_executor::TaskObserver for TaskObservers {
 
 impl super::Hook for TaskSpawn {}
 
+impl From<ErasedHookFn<TaskSpawn>> for super::HookRegistration {
+    fn from(hook: ErasedHookFn<TaskSpawn>) -> Self {
+        Self::TaskSpawn(hook)
+    }
+}
+
 impl super::private::Sealed for TaskSpawn {
     type Erased<D>
         = ErasedHookFn<Self>

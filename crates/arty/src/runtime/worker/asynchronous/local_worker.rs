@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use arty_executor::{Shutdown as ExecutorShutdown, ShutdownCause, TaskSet};
 use thread_aware::{Thread, ThreadAware};
@@ -17,8 +18,8 @@ use crate::task::preparation::DeferredTaskFactory;
 
 thread_local! {
     static CURRENT: RefCell<Option<LocalWorker>> = const { RefCell::new(None) };
-    static SPAWN_HOOKS: RefCell<Option<Vec<ErasedHookFn<TaskSpawn>>>> = const { RefCell::new(None) };
-    static PANIC_HOOKS: RefCell<Option<Vec<ErasedHookFn<Panic>>>> = const { RefCell::new(None) };
+    static SPAWN_HOOKS: RefCell<Option<Vec<Arc<ErasedHookFn<TaskSpawn>>>>> = const { RefCell::new(None) };
+    static PANIC_HOOKS: RefCell<Option<Vec<Arc<ErasedHookFn<Panic>>>>> = const { RefCell::new(None) };
 }
 
 static LOCAL_SPAWN_HOOK: LocalHook<TaskSpawn> = LocalHook { hooks: &SPAWN_HOOKS };
@@ -113,17 +114,15 @@ impl LocalWorker {
     }
 
     fn execute_spawn_hooks(thread: &Thread) -> Option<TaskObservers> {
-        SPAWN_HOOKS.with_borrow(|hooks| {
-            let hooks = hooks.as_ref().expect("a running worker retains its installed hooks");
-            if hooks.is_empty() {
-                return None;
-            }
-            let mut event = TaskSpawn::new(Some(thread.clone()));
-            for hook in hooks {
-                hook.execute(&mut event);
-            }
-            event.into_observers()
-        })
+        let hooks = SPAWN_HOOKS.with_borrow(|hooks| hooks.as_ref().expect("a running worker retains its installed hooks").clone());
+        if hooks.is_empty() {
+            return None;
+        }
+        let mut event = TaskSpawn::new(Some(thread.clone()));
+        for hook in hooks {
+            hook.execute(&mut event);
+        }
+        event.into_observers()
     }
 
     pub(crate) fn on_panic(panic: arty_executor::TaskPanicPayload) -> (arty_executor::PanicAction, arty_executor::TaskPanicPayload) {
@@ -281,7 +280,7 @@ impl SchedulerContext {
 
         let (handle, result_tx) = self.results.handle();
         let inner = DeferredTaskFactory::new(future_factory, self.context.clone());
-        TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx);
+        TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, None::<TaskObservers>);
         handle
     }
 
@@ -300,11 +299,11 @@ impl SchedulerContext {
         let inner = DeferredTaskFactory::new(future_factory, self.context.clone());
         if let Some(observers) = observers {
             match observers.into_single() {
-                Ok(observer) => TaskMonitoring::<F>::capture().register_observed(&self.tasks, inner, result_tx, observer),
-                Err(observers) => TaskMonitoring::<F>::capture().register_observed(&self.tasks, inner, result_tx, observers),
+                Ok(observer) => TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, Some(observer)),
+                Err(observers) => TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, Some(observers)),
             }
         } else {
-            TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx);
+            TaskMonitoring::<F>::capture().register(&self.tasks, inner, result_tx, None::<TaskObservers>);
         }
         handle
     }

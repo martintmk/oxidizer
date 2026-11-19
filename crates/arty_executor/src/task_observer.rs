@@ -25,3 +25,17 @@ impl TaskObserver for () {
     #[inline]
     fn poll_end(&mut self, _outcome: Poll<()>) {}
 }
+
+impl<O: TaskObserver> TaskObserver for Option<O> {
+    fn poll_start(&mut self) {
+        if let Some(observer) = self {
+            observer.poll_start();
+        }
+    }
+
+    fn poll_end(&mut self, outcome: Poll<()>) {
+        if let Some(observer) = self {
+            observer.poll_end(outcome);
+        }
+    }
+}

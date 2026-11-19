@@ -48,16 +48,7 @@ where
         not(any(test, feature = "monitor")),
         expect(clippy::unused_self, reason = "Submission metadata is empty when monitoring is compiled out.")
     )]
-    pub(crate) fn register<F, R, T>(self, tasks: &TaskSet, future: F, completion: T)
-    where
-        F: IntoFuture<Output = R> + 'static,
-        R: 'static,
-        T: TaskCompletion<R>,
-    {
-        self.register_observed(tasks, future, completion, ());
-    }
-
-    pub(crate) fn register_observed<F, R, T, O>(self, tasks: &TaskSet, future: F, completion: T, observer: O)
+    pub(crate) fn register<F, R, T, O>(self, tasks: &TaskSet, future: F, completion: T, observer: Option<O>)
     where
         F: IntoFuture<Output = R> + 'static,
         R: 'static,
@@ -105,7 +96,7 @@ mod tests {
         let results = JoinHandlePool::new(Shutdown::default());
         let (_handle, sender) = results.handle();
         let future: ErasedFuture = Box::pin(std::future::pending());
-        monitoring.register(&executor.tasks(), future, sender);
+        monitoring.register(&executor.tasks(), future, sender, None::<()>);
         let mut snapshots = Vec::new();
 
         let status = executor
