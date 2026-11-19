@@ -87,11 +87,12 @@ extern crate self as arty;
 use arty_io_core as _;
 /// Runs an async entry point on an Arty runtime.
 ///
-/// Apply it to an `async fn` that takes one owned
+/// Apply it to an `async fn` with no arguments or one owned
 /// [`Context`](crate::task::Context) argument. It creates a synchronous
 /// function with no arguments and the same visibility and return type.
-/// The async body runs on an Arty worker, not on the calling thread. For
-/// example, name the argument `cx` or `_cx`. The argument must be an identifier.
+/// The async body runs on an Arty worker, not on the calling thread.
+/// If you need the context, name the argument `cx`, for example.
+/// The argument must be an identifier.
 /// The attribute does not support `_` or destructuring patterns.
 ///
 /// The runtime stops when the body returns. Await required child tasks first.
@@ -143,6 +144,17 @@ use arty_io_core as _;
 ///
 /// # Examples
 ///
+/// Run without a context argument:
+///
+/// ```
+/// # #[cfg(all(feature = "macros", feature = "rt"))]
+/// #[arty::main]
+/// async fn main() {
+///     println!("Hello from Arty!");
+/// }
+/// # #[cfg(not(all(feature = "macros", feature = "rt")))] fn main() {}
+/// ```
+///
 /// Wait briefly and print a message:
 ///
 /// ```
@@ -191,11 +203,11 @@ use arty_io_core as _;
 pub use arty_macros::main;
 /// Runs an async test on an Arty runtime.
 ///
-/// Apply it to an `async fn` taking one owned
+/// Apply it to an `async fn` with no arguments or one owned
 /// [`Context`](crate::task::Context) argument. It registers a synchronous
 /// test that starts its own runtime, runs the body on a worker, and stops the
 /// runtime when the body returns.
-/// Name the argument `_cx` if it is unused.
+/// Omit the context argument if it is unused.
 ///
 /// The test keeps its return value, visibility, and attributes such as
 /// `#[should_panic]` and `#[ignore]`. An ignored test starts no runtime unless
@@ -225,7 +237,7 @@ pub use arty_macros::main;
 /// The control argument works with `workers`. To use a custom runtime builder
 /// with controlled time, create the control in a synchronous test and call
 /// `builder.clock(control.clone()).build()`. Enabling `test-util` alone does
-/// not change a one-argument test's clock.
+/// not change the clock of a test without a control argument.
 ///
 /// # Panics
 ///
@@ -246,6 +258,16 @@ pub use arty_macros::main;
 ///
 /// # Examples
 ///
+/// Run without a context argument:
+///
+/// ```test_harness
+/// # #[cfg(all(feature = "macros", feature = "rt"))]
+/// #[arty::test]
+/// async fn answer_without_context() {
+///     assert_eq!(std::future::ready(42).await, 42);
+/// }
+/// ```
+///
 /// Await a task and inspect its result:
 ///
 /// ```test_harness
@@ -262,7 +284,7 @@ pub use arty_macros::main;
 /// ```no_run,test_harness
 /// # #[cfg(all(feature = "macros", feature = "rt"))]
 /// #[arty::test(monitor = enabled)]
-/// async fn monitored(_cx: arty::task::Context) {}
+/// async fn monitored() {}
 /// ```
 ///
 /// Keep the test runtime running after Arty catches a child task's panic:
