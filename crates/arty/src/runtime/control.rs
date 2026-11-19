@@ -77,13 +77,13 @@ impl RuntimeControl {
     ///
     /// ```
     /// use arty::runtime::Runtime;
-    /// use arty::runtime::hook::Panic;
+    /// use arty::runtime::hook::TaskPanic;
     ///
     /// let runtime = Runtime::new()?;
     /// let control = runtime
     ///     .scheduler()
     ///     .block_on(async |cx| cx.control().clone())?;
-    /// control.on(Panic::IGNORE);
+    /// control.on(TaskPanic::IGNORE);
     /// runtime.stop()?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```

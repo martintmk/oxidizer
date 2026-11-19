@@ -4,12 +4,12 @@
 use thread_aware::ThreadAware;
 
 use super::hook_fn::{ErasedHookFn, HookFn};
-use super::{Hook, Panic, TaskSpawn, WorkerSpawn};
+use super::{Hook, TaskPanic, TaskSpawn, WorkerSpawn};
 
 #[derive(Clone, derive_more::Debug, ThreadAware)]
 pub(crate) enum HookRegistration {
     TaskSpawn(ErasedHookFn<TaskSpawn>),
-    Panic(ErasedHookFn<Panic>),
+    TaskPanic(ErasedHookFn<TaskPanic>),
     WorkerSpawn(ErasedHookFn<WorkerSpawn>),
 }
 
@@ -19,9 +19,9 @@ impl HookRegistration {
     }
 }
 
-impl From<ErasedHookFn<Panic>> for HookRegistration {
-    fn from(hook: ErasedHookFn<Panic>) -> Self {
-        Self::Panic(hook)
+impl From<ErasedHookFn<TaskPanic>> for HookRegistration {
+    fn from(hook: ErasedHookFn<TaskPanic>) -> Self {
+        Self::TaskPanic(hook)
     }
 }
 

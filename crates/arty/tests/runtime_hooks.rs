@@ -19,7 +19,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use arty::core::{Thread, ThreadAware};
-use arty::runtime::hook::{HookFn, Panic, TaskObserver, TaskSpawn, WorkerSpawn};
+use arty::runtime::hook::{HookFn, TaskObserver, TaskPanic, TaskSpawn, WorkerSpawn};
 use arty::runtime::{Runtime, RuntimeControl, WorkersPolicy};
 use arty::task::Context;
 use support::JoinHandleExt as _;
@@ -260,7 +260,7 @@ fn poll_hook_scope_completes_when_the_task_panics() {
     let log = SharedLog(Arc::new(Mutex::new(Vec::new())));
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(1))
-        .on(Panic::IGNORE)
+        .on(TaskPanic::IGNORE)
         .on(HookFn::<TaskSpawn, _>::new(log.clone(), |event, log| {
             event.observe(PollRecorder {
                 before: "before",
@@ -988,7 +988,7 @@ fn panic_hook_covers_async_user_panics_only() {
     let count = Arc::new(AtomicUsize::new(0));
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(1))
-        .on(HookFn::<Panic, _>::new(
+        .on(HookFn::<TaskPanic, _>::new(
             PanicProbe {
                 count: Arc::clone(&count),
                 destination: None,
@@ -1028,7 +1028,7 @@ fn panic_hook_covers_async_user_panics_only() {
 fn panic_hook_selects_shutdown_from_the_payload() {
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(1))
-        .on(HookFn::<Panic, _>::new((), |event, ()| {
+        .on(HookFn::<TaskPanic, _>::new((), |event, ()| {
             if event.payload().downcast_ref::<u32>() != Some(&2) {
                 event.ignore();
             }
@@ -1064,7 +1064,7 @@ fn control_appends_panic_hooks_in_registration_order() {
 
     let order = SharedLog(Arc::new(Mutex::new(Vec::new())));
     let (installed, installation) = mpsc::channel();
-    control.on(HookFn::<Panic, _>::new(
+    control.on(HookFn::<TaskPanic, _>::new(
         RegistrationLog {
             log: order.clone(),
             installed,
@@ -1088,7 +1088,7 @@ fn control_appends_panic_hooks_in_registration_order() {
     assert_eq!(order.take(), ["ignore"]);
 
     let (installed, installation) = mpsc::channel();
-    control.on(HookFn::<Panic, _>::new(
+    control.on(HookFn::<TaskPanic, _>::new(
         RegistrationLog {
             log: order.clone(),
             installed,
@@ -1119,9 +1119,9 @@ fn control_registration_applies_before_local_spawn() {
     runtime
         .scheduler()
         .block_on(async |cx| {
-            cx.control().on(Panic::IGNORE);
+            cx.control().on(TaskPanic::IGNORE);
             cx.control()
-                .on(HookFn::<Panic, _>::new(PanicCount(Arc::clone(&calls)), |_event, data| {
+                .on(HookFn::<TaskPanic, _>::new(PanicCount(Arc::clone(&calls)), |_event, data| {
                     data.0.fetch_add(1, Ordering::SeqCst);
                 }));
             let panic = cx.scheduler().spawn(async |_| panic!("local panic")).await.unwrap_err();
@@ -1144,7 +1144,7 @@ fn local_registration_clones_once_and_relocates_from_the_current_worker() {
         .scheduler()
         .block_on(async |cx| {
             let source = cx.thread().id();
-            cx.control().on(HookFn::<Panic, _>::new(
+            cx.control().on(HookFn::<TaskPanic, _>::new(
                 LocalRegistrationProbe {
                     clones: Arc::clone(&clones),
                     relocated,
@@ -1192,7 +1192,7 @@ fn worker_registration_relocates_and_runs_on_every_worker() {
         .block_on(async |cx| {
             let workers: Vec<_> = cx.control().workers().into_iter().cloned().collect();
             let source = cx.thread().id();
-            cx.control().on(HookFn::<Panic, _>::new(
+            cx.control().on(HookFn::<TaskPanic, _>::new(
                 RemotePanicProbe {
                     source: None,
                     destination: None,
@@ -1248,12 +1248,12 @@ fn panic_callbacks_share_one_borrowed_event() {
     let addresses = EventAddresses(Arc::new(Mutex::new(Vec::new())));
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(1))
-        .on(HookFn::<Panic, _>::new(addresses.clone(), |event, data| {
+        .on(HookFn::<TaskPanic, _>::new(addresses.clone(), |event, data| {
             let address = std::ptr::from_mut(event).addr();
             data.0.lock().unwrap().push(address);
             event.ignore();
         }))
-        .on(HookFn::<Panic, _>::new(addresses.clone(), |event, data| {
+        .on(HookFn::<TaskPanic, _>::new(addresses.clone(), |event, data| {
             let address = std::ptr::from_mut(event).addr();
             data.0.lock().unwrap().push(address);
             event.ignore();
@@ -1411,7 +1411,7 @@ fn control_ignores_registration_after_shutdown_starts() {
     let clones = Arc::new(AtomicUsize::new(0));
 
     control.request_stop();
-    control.on(HookFn::<Panic, _>::new(CloneCount(Arc::clone(&clones)), |_event, _data| {}));
+    control.on(HookFn::<TaskPanic, _>::new(CloneCount(Arc::clone(&clones)), |_event, _data| {}));
 
     assert_eq!(clones.load(Ordering::SeqCst), 0);
     runtime.stop().unwrap();
@@ -1423,7 +1423,7 @@ fn control_clones_nonretained_hook_data_for_each_worker() {
     let control = support::runtime_control(&runtime);
     let clones = Arc::new(AtomicUsize::new(0));
 
-    control.on(HookFn::<Panic, _>::new(CloneCount(Arc::clone(&clones)), |_event, _data| {}));
+    control.on(HookFn::<TaskPanic, _>::new(CloneCount(Arc::clone(&clones)), |_event, _data| {}));
 
     assert_eq!(clones.load(Ordering::SeqCst), 1);
     runtime.stop().unwrap();

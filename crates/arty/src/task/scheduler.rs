@@ -311,7 +311,7 @@ impl Scheduler {
     /// These calls can prevent an async worker from running other tasks and
     /// processing timers. The function runs on a separate pool thread.
     /// A panic in this function returns an error through [`JoinHandle`].
-    /// It does not invoke the configured [`Panic`](crate::runtime::hook::Panic)
+    /// It does not invoke the configured [`TaskPanic`](crate::runtime::hook::TaskPanic)
     /// hook or stop the runtime.
     /// The function and its result must implement `Send + 'static`.
     ///

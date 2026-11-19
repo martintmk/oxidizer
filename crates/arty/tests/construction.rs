@@ -10,7 +10,7 @@ use std::error::Error as StdError;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 
-use arty::runtime::hook::Panic;
+use arty::runtime::hook::TaskPanic;
 use arty::runtime::{BlockingPoolPolicy, Error, Runtime, RuntimeBuilder, WorkersPolicy};
 use testing_aids::{TEST_TIMEOUT, is_mutation_testing};
 
@@ -241,8 +241,8 @@ fn default_runtime_construction_uses_one_worker() {
 #[test]
 fn explicit_panic_policies_preserve_runtime_construction() {
     for builder in [
-        Runtime::builder().workers(WorkersPolicy::exactly(1)).on(Panic::SHUTDOWN),
-        Runtime::builder().workers(WorkersPolicy::exactly(1)).on(Panic::IGNORE),
+        Runtime::builder().workers(WorkersPolicy::exactly(1)).on(TaskPanic::SHUTDOWN),
+        Runtime::builder().workers(WorkersPolicy::exactly(1)).on(TaskPanic::IGNORE),
     ] {
         let runtime = builder.build().unwrap();
 

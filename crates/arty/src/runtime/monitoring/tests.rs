@@ -19,7 +19,7 @@ use seismograph_runtime::worker::WorkerRole;
 use testing_aids::{TEST_TIMEOUT, is_mutation_testing};
 use thread_aware::{Thread, ThreadAware, Unaware};
 
-use crate::runtime::hook::{HookFn, Panic, TaskObserver, TaskSpawn};
+use crate::runtime::hook::{HookFn, TaskObserver, TaskPanic, TaskSpawn};
 use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, Runtime, WorkersPolicy};
 
 struct RecorderGuard {
@@ -46,7 +46,7 @@ fn runtime(name: &str) -> Runtime {
         .workers(WorkersPolicy::exactly(1))
         .blocking_pool(BlockingPoolPolicy::shared().max(1))
         .name(name)
-        .on(Panic::IGNORE)
+        .on(TaskPanic::IGNORE)
         .build()
         .unwrap()
 }
@@ -158,7 +158,7 @@ fn monitored_tasks_forward_poll_observers() {
     let runtime = Runtime::builder()
         .monitor(MonitorPolicy::enabled())
         .workers(WorkersPolicy::exactly(1))
-        .on(Panic::IGNORE)
+        .on(TaskPanic::IGNORE)
         .on(HookFn::<TaskSpawn, _>::new(PollObservation(observed), |event, observed| {
             if event.origin().is_some() {
                 event.observe(MonitoredPollObserver {

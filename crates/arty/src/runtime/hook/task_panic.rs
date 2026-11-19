@@ -21,13 +21,13 @@ use super::hook_fn::HookFn;
 /// callback completes without a panic. Arty also cannot repair application
 /// data that the original task panic left in an invalid state.
 #[derive(derive_more::Debug)]
-pub struct Panic {
+pub struct TaskPanic {
     pub(super) action: PanicAction,
     #[debug(ignore)]
     pub(super) payload: TaskPanicPayload,
 }
 
-impl Panic {
+impl TaskPanic {
     /// Stops the runtime after a contained panic.
     pub const SHUTDOWN: HookFn<Self, ()> = HookFn::new((), |event, ()| event.shutdown());
 
@@ -62,9 +62,9 @@ impl Panic {
     }
 }
 
-impl super::Hook for Panic {}
+impl super::Hook for TaskPanic {}
 
-impl super::private::Sealed for Panic {
+impl super::private::Sealed for TaskPanic {
     type Erased<D>
         = super::hook_fn::ErasedHookFn<Self>
     where

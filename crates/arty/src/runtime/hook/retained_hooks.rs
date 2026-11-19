@@ -30,7 +30,7 @@ impl RetainedHooks {
             match hook {
                 HookRegistration::TaskSpawn(hook) => task_spawn.push(Arc::new(hook)),
                 HookRegistration::WorkerSpawn(hook) => worker_spawn.push(Arc::new(hook)),
-                HookRegistration::Panic(_) => {}
+                HookRegistration::TaskPanic(_) => {}
             }
         }
         let has_task_spawn = !task_spawn.is_empty();
@@ -54,7 +54,7 @@ impl RetainedHooks {
                 self.has_task_spawn.store(true, Ordering::Release);
             }
             HookRegistration::WorkerSpawn(hook) => Self::push_to(&self.worker_spawn, hook),
-            HookRegistration::Panic(_) => {}
+            HookRegistration::TaskPanic(_) => {}
         }
         true
     }
@@ -109,7 +109,7 @@ mod tests {
     use thread_aware::{Thread, ThreadAware};
 
     use super::*;
-    use crate::runtime::hook::{HookFn, Panic, registration};
+    use crate::runtime::hook::{HookFn, TaskPanic, registration};
 
     #[derive(Clone)]
     struct Calls(Arc<AtomicUsize>);
@@ -159,7 +159,7 @@ mod tests {
         hooks.has_task_spawn.store(false, Ordering::Release);
 
         let panic_calls = Arc::new(AtomicUsize::new(0));
-        let panic_hook = registration(HookFn::<Panic, _>::new(Calls(Arc::clone(&panic_calls)), |_event, calls| {
+        let panic_hook = registration(HookFn::<TaskPanic, _>::new(Calls(Arc::clone(&panic_calls)), |_event, calls| {
             calls.0.fetch_add(1, Ordering::Relaxed);
         }));
         let panic_only = RetainedHooks::new(vec![panic_hook.clone()]);

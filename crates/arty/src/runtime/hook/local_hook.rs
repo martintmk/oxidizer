@@ -55,13 +55,13 @@ impl<H: Hook> LocalHook<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::hook::Panic;
+    use crate::runtime::hook::TaskPanic;
 
     thread_local! {
-        static HOOKS: LocalHookStorage<Panic> = const { RefCell::new(None) };
+        static HOOKS: LocalHookStorage<TaskPanic> = const { RefCell::new(None) };
     }
 
-    static LOCAL_HOOK: LocalHook<Panic> = LocalHook { hooks: &HOOKS };
+    static LOCAL_HOOK: LocalHook<TaskPanic> = LocalHook { hooks: &HOOKS };
 
     #[test]
     fn guard_initializes_and_clears_worker_local_storage() {

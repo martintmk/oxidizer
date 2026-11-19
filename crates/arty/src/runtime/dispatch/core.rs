@@ -416,7 +416,7 @@ mod tests {
     use super::*;
     use crate::runtime::config::RuntimeName;
     use crate::runtime::dispatch::{DispatcherClient, test_threads};
-    use crate::runtime::hook::{HookFn, Panic, WorkerSpawn, registration};
+    use crate::runtime::hook::{HookFn, TaskPanic, WorkerSpawn, registration};
     use crate::runtime::worker::asynchronous::{CommandReceiver, command_channel};
     use crate::runtime::worker::blocking::Pool;
 
@@ -473,7 +473,7 @@ mod tests {
         let threads = test_threads(1);
         let (worker, _worker_rx) = endpoint(&threads[0]);
         let worker_spawn = registration(HookFn::<WorkerSpawn, _>::new((), |_event, ()| {}));
-        let panic = registration(HookFn::<Panic, _>::new((), |_event, ()| {}));
+        let panic = registration(HookFn::<TaskPanic, _>::new((), |_event, ()| {}));
         let dispatcher = DispatcherCore::new(
             NonEmpty::new(worker),
             Shutdown::default(),

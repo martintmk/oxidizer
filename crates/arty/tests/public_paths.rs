@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::io;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
-use arty::runtime::hook::{Hook, HookFn, Panic, TaskSpawn, WorkerSpawn};
+use arty::runtime::hook::{Hook, HookFn, TaskPanic, TaskSpawn, WorkerSpawn};
 use arty::runtime::{
     BlockingPoolPolicy, Error, MonitorPolicy, Runtime, RuntimeBuilder, RuntimeControl, ShutdownCause, Workers, WorkersPolicy,
 };
@@ -38,16 +38,16 @@ assert_not_impl_any!(RuntimeScheduler: Clone, ThreadAware);
 assert_impl_all!(BlockingPoolPolicy: Clone, Debug);
 assert_impl_all!(MonitorPolicy: Clone, Debug, Default);
 assert_not_impl_any!(MonitorPolicy: Copy);
-assert_impl_all!(Panic: Debug, Hook);
+assert_impl_all!(TaskPanic: Debug, Hook);
 assert_impl_all!(TaskSpawn: Debug, Hook);
 assert_impl_all!(WorkerSpawn: Debug, Hook);
-assert_impl_all!(HookFn<Panic, ()>: Clone, Sync, ThreadAware);
+assert_impl_all!(HookFn<TaskPanic, ()>: Clone, Sync, ThreadAware);
 assert_impl_all!(HookFn<TaskSpawn, ()>: Clone, Sync, ThreadAware);
 assert_impl_all!(HookFn<WorkerSpawn, ()>: Clone, Sync, ThreadAware);
-assert_not_impl_any!(Panic: Clone, Copy);
+assert_not_impl_any!(TaskPanic: Clone, Copy);
 assert_not_impl_any!(TaskSpawn: Clone, Copy);
 assert_not_impl_any!(WorkerSpawn: Clone, Copy);
-assert_not_impl_any!(HookFn<Panic, ()>: Copy);
+assert_not_impl_any!(HookFn<TaskPanic, ()>: Copy);
 assert_not_impl_any!(HookFn<TaskSpawn, ()>: Copy);
 assert_not_impl_any!(HookFn<WorkerSpawn, ()>: Copy);
 assert_impl_all!(WorkersPolicy: Clone, Copy, Debug, Default);

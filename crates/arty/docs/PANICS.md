@@ -13,10 +13,10 @@ async task panic shuts down the runtime. Register `Panic` and call
 
 ```rust
 use arty::runtime::Runtime;
-use arty::runtime::hook::Panic;
+use arty::runtime::hook::TaskPanic;
 
 let runtime = Runtime::builder()
-    .on(Panic::IGNORE)
+    .on(TaskPanic::IGNORE)
     .build()?;
 # runtime.stop()?;
 # Ok::<(), Box<dyn std::error::Error>>(())
