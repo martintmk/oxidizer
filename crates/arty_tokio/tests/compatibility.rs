@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use arty::core::{Thread, ThreadAware};
-use arty::runtime::hook::{HookFn, WorkerInit};
+use arty::runtime::hook::{HookFn, WorkerSpawn};
 use arty::runtime::{Runtime, WorkersPolicy};
 use arty::task::Context;
 use arty_tokio::TokioCompatExt as _;
@@ -32,7 +32,7 @@ impl ThreadAware for InitSignal {
 fn wait_for_worker_initialization(cx: &Context) {
     let (initialized, initialization) = mpsc::channel();
     cx.control()
-        .on(HookFn::<WorkerInit, _>::new(InitSignal(initialized), |_event, signal| {
+        .on(HookFn::<WorkerSpawn, _>::new(InitSignal(initialized), |_event, signal| {
             signal.0.send(()).unwrap();
         }));
     for _ in cx.control().workers() {

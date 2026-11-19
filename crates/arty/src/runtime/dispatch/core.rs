@@ -416,7 +416,7 @@ mod tests {
     use super::*;
     use crate::runtime::config::RuntimeName;
     use crate::runtime::dispatch::{DispatcherClient, test_threads};
-    use crate::runtime::hook::{HookFn, Panic, WorkerInit, registration};
+    use crate::runtime::hook::{HookFn, Panic, WorkerSpawn, registration};
     use crate::runtime::worker::asynchronous::{CommandReceiver, command_channel};
     use crate::runtime::worker::blocking::Pool;
 
@@ -472,15 +472,19 @@ mod tests {
     fn dispatcher_retains_only_hooks_that_require_retention() {
         let threads = test_threads(1);
         let (worker, _worker_rx) = endpoint(&threads[0]);
-        let worker_init = registration(HookFn::<WorkerInit, _>::new((), |_event, ()| {}));
+        let worker_spawn = registration(HookFn::<WorkerSpawn, _>::new((), |_event, ()| {}));
         let panic = registration(HookFn::<Panic, _>::new((), |_event, ()| {}));
-        let dispatcher = DispatcherCore::new(NonEmpty::new(worker), Shutdown::default(), vec![worker_init.clone(), panic.clone()]);
+        let dispatcher = DispatcherCore::new(
+            NonEmpty::new(worker),
+            Shutdown::default(),
+            vec![worker_spawn.clone(), panic.clone()],
+        );
 
         assert_eq!(dispatcher.retained_hooks.len(), 1);
-        dispatcher.register_hook(worker_init.clone());
+        dispatcher.register_hook(worker_spawn.clone());
         dispatcher.register_hook(panic);
         assert_eq!(dispatcher.retained_hooks.len(), 2);
-        dispatcher.register_hook(worker_init);
+        dispatcher.register_hook(worker_spawn);
         assert_eq!(dispatcher.retained_hooks.len(), 3);
     }
 
@@ -489,7 +493,7 @@ mod tests {
     impl Clone for RegisterOnClone {
         fn clone(&self) -> Self {
             self.0
-                .register_hook(registration(HookFn::<WorkerInit, _>::new((), |_event, ()| {})));
+                .register_hook(registration(HookFn::<WorkerSpawn, _>::new((), |_event, ()| {})));
             Self(self.0.clone())
         }
     }
@@ -516,7 +520,7 @@ mod tests {
         let threads = test_threads(1);
         let (worker, _worker_rx) = endpoint(&threads[0]);
         let dispatcher = DispatcherCore::new(NonEmpty::new(worker), Shutdown::default(), Vec::new());
-        let hook = registration(HookFn::<WorkerInit, _>::new(
+        let hook = registration(HookFn::<WorkerSpawn, _>::new(
             RegisterOnClone(dispatcher.clone()),
             |_event, _data| {},
         ));
@@ -525,7 +529,7 @@ mod tests {
         assert_eq!(dispatcher.retained_hooks.len(), 2);
 
         dispatcher.stop_inner(ShutdownCause::default());
-        assert!(!dispatcher.retain_hook(registration(HookFn::<WorkerInit, _>::new((), |_event, ()| {}))));
+        assert!(!dispatcher.retain_hook(registration(HookFn::<WorkerSpawn, _>::new((), |_event, ()| {}))));
         assert_eq!(dispatcher.retained_hooks.len(), 2);
         dispatcher.release_retained_hooks();
         assert_eq!(dispatcher.retained_hooks.len(), 0);
@@ -536,7 +540,7 @@ mod tests {
         let threads = test_threads(1);
         let (worker, worker_rx) = endpoint(&threads[0]);
         let dispatcher = DispatcherCore::new(NonEmpty::new(worker), Shutdown::default(), Vec::new());
-        let hook = registration(HookFn::<WorkerInit, _>::new(StopOnClone(dispatcher.clone()), |_event, _data| {}));
+        let hook = registration(HookFn::<WorkerSpawn, _>::new(StopOnClone(dispatcher.clone()), |_event, _data| {}));
 
         dispatcher.register_hook(hook);
 

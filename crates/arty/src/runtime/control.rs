@@ -65,7 +65,7 @@ impl RuntimeControl {
     /// queues. A worker applies the hook when it processes that command. If
     /// runtime shutdown has started, Arty ignores the registration.
     ///
-    /// [`WorkerInit`](crate::runtime::hook::WorkerInit) runs once on each live
+    /// [`WorkerSpawn`](crate::runtime::hook::WorkerSpawn) runs once on each live
     /// worker. The runtime keeps that registration for workers that start
     /// later and releases it during shutdown. Each worker discards its
     /// callback after it runs.

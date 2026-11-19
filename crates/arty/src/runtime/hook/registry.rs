@@ -4,18 +4,18 @@
 use thread_aware::ThreadAware;
 
 use super::hook_fn::{ErasedHookFn, HookFn};
-use super::{Hook, Panic, TaskSpawn, WorkerInit};
+use super::{Hook, Panic, TaskSpawn, WorkerSpawn};
 
 #[derive(Clone, derive_more::Debug, ThreadAware)]
 pub(crate) enum HookRegistration {
     TaskSpawn(ErasedHookFn<TaskSpawn>),
     Panic(ErasedHookFn<Panic>),
-    WorkerInit(ErasedHookFn<WorkerInit>),
+    WorkerSpawn(ErasedHookFn<WorkerSpawn>),
 }
 
 impl HookRegistration {
     pub(crate) const fn is_retained(&self) -> bool {
-        matches!(self, Self::TaskSpawn(_) | Self::WorkerInit(_))
+        matches!(self, Self::TaskSpawn(_) | Self::WorkerSpawn(_))
     }
 }
 
@@ -25,9 +25,9 @@ impl From<ErasedHookFn<Panic>> for HookRegistration {
     }
 }
 
-impl From<ErasedHookFn<WorkerInit>> for HookRegistration {
-    fn from(hook: ErasedHookFn<WorkerInit>) -> Self {
-        Self::WorkerInit(hook)
+impl From<ErasedHookFn<WorkerSpawn>> for HookRegistration {
+    fn from(hook: ErasedHookFn<WorkerSpawn>) -> Self {
+        Self::WorkerSpawn(hook)
     }
 }
 

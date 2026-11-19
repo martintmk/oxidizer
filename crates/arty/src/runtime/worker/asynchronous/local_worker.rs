@@ -9,7 +9,7 @@ use thread_aware::{Thread, ThreadAware};
 
 use crate::io::RuntimeDriverHost;
 use crate::runtime::dispatch::DispatcherClient;
-use crate::runtime::hook::{HookRegistration, LocalHook, LocalHookGuard, LocalHookStorage, Panic, TaskObservers, TaskSpawn, WorkerInit};
+use crate::runtime::hook::{HookRegistration, LocalHook, LocalHookGuard, LocalHookStorage, Panic, TaskObservers, TaskSpawn, WorkerSpawn};
 use crate::runtime::worker::{self, WorkerMarker};
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
@@ -153,10 +153,10 @@ impl LocalWorker {
                 });
                 LOCAL_PANIC_HOOK.install(hook, source, &destination);
             }
-            HookRegistration::WorkerInit(mut hook) => {
+            HookRegistration::WorkerSpawn(mut hook) => {
                 let (destination, mut event) = Self::with_scheduler(|current| {
                     let current = current.expect("a running worker retains its scheduler while processing hook registration");
-                    (current.thread.clone(), WorkerInit::new(current.thread.clone()))
+                    (current.thread.clone(), WorkerSpawn::new(current.thread.clone()))
                 });
                 hook.relocate(source, &destination);
                 hook.execute(&mut event);

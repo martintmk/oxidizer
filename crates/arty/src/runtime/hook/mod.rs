@@ -6,12 +6,12 @@
 //! This module provides these hooks:
 //!
 //! - [`TaskSpawn`] runs when Arty submits an async task.
-//! - [`WorkerInit`][^worker-init-retention] runs once on each async worker after
+//! - [`WorkerSpawn`][^worker-spawn-retention] runs once on each async worker after
 //!   the worker initializes.
 //! - [`Panic`] runs when Arty contains a panic from an async task factory or
 //!   task poll. The callback can stop the runtime or keep it running.
 //!
-//! [^worker-init-retention]: [`WorkerInit`] has retained registration semantics.
+//! [^worker-spawn-retention]: [`WorkerSpawn`] has retained registration semantics.
 //! Arty runs the callback on current workers and on workers that start after
 //! registration.
 //!
@@ -23,7 +23,7 @@
 //!
 //! Register hooks before startup with [`RuntimeBuilder::on`]. Add hooks after
 //! startup with [`RuntimeControl::on`]. Before startup completes, each initial
-//! worker runs its [`WorkerInit`] callbacks from the builder.
+//! worker runs its [`WorkerSpawn`] callbacks from the builder.
 //!
 //! Arty does not catch a panic from a hook callback. You must make sure that
 //! every hook callback completes without a panic.
@@ -47,7 +47,7 @@ mod panic;
 mod registry;
 mod retained_hooks;
 mod spawn;
-mod worker_init;
+mod worker_spawn;
 
 pub(crate) use hook_fn::ErasedHookFn;
 pub use hook_fn::HookFn;
@@ -57,7 +57,7 @@ pub(crate) use registry::{HookRegistration, registration};
 pub(crate) use retained_hooks::RetainedHooks;
 pub(crate) use spawn::TaskObservers;
 pub use spawn::{TaskObserver, TaskSpawn};
-pub use worker_init::WorkerInit;
+pub use worker_spawn::WorkerSpawn;
 
 /// Marks an event that can be registered as a runtime hook.
 ///

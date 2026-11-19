@@ -19,42 +19,42 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use arty::core::{Thread, ThreadAware};
-use arty::runtime::hook::{HookFn, Panic, TaskObserver, TaskSpawn, WorkerInit};
+use arty::runtime::hook::{HookFn, Panic, TaskObserver, TaskSpawn, WorkerSpawn};
 use arty::runtime::{Runtime, RuntimeControl, WorkersPolicy};
 use arty::task::Context;
 use support::JoinHandleExt as _;
 
 #[derive(Clone)]
-struct WorkerInitProbe {
+struct WorkerSpawnProbe {
     destination: Option<ThreadId>,
-    observed: mpsc::Sender<WorkerInitObservation>,
+    observed: mpsc::Sender<WorkerSpawnObservation>,
 }
 
-impl ThreadAware for WorkerInitProbe {
+impl ThreadAware for WorkerSpawnProbe {
     fn relocate(&mut self, _source: Option<&Thread>, destination: &Thread) {
         self.destination = Some(destination.id());
     }
 }
 
-struct WorkerInitObservation {
+struct WorkerSpawnObservation {
     callback: ThreadId,
     event: ThreadId,
     relocated: ThreadId,
 }
 
 #[test]
-fn worker_init_runs_once_per_worker() {
+fn worker_spawn_runs_once_per_worker() {
     let (observed, observations) = mpsc::channel();
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(2))
-        .on(HookFn::<WorkerInit, _>::new(
-            WorkerInitProbe {
+        .on(HookFn::<WorkerSpawn, _>::new(
+            WorkerSpawnProbe {
                 destination: None,
                 observed,
             },
             |event, data| {
                 data.observed
-                    .send(WorkerInitObservation {
+                    .send(WorkerSpawnObservation {
                         callback: std::thread::current().id(),
                         event: event.thread().id(),
                         relocated: data.destination.unwrap(),
@@ -76,12 +76,12 @@ fn worker_init_runs_once_per_worker() {
 }
 
 #[test]
-fn builder_retains_worker_init_data_until_shutdown() {
+fn builder_retains_worker_spawn_data_until_shutdown() {
     let calls = Arc::new(AtomicUsize::new(0));
     let lifetime = Arc::downgrade(&calls);
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(2))
-        .on(HookFn::<WorkerInit, _>::new(PanicCount(calls), |_event, data| {
+        .on(HookFn::<WorkerSpawn, _>::new(PanicCount(calls), |_event, data| {
             data.0.fetch_add(1, Ordering::SeqCst);
         }))
         .build()
@@ -738,7 +738,7 @@ fn control_registration_precedes_later_task_submissions() {
         },
     ));
     let (initialized, initialization) = mpsc::channel();
-    control.on(HookFn::<WorkerInit, _>::new(
+    control.on(HookFn::<WorkerSpawn, _>::new(
         InitSignal {
             calls: PanicCount(Arc::new(AtomicUsize::new(0))),
             initialized,
@@ -1161,12 +1161,12 @@ fn local_registration_clones_once_and_relocates_from_the_current_worker() {
 }
 
 #[test]
-fn local_worker_init_retains_original_before_callback_starts_shutdown() {
+fn local_worker_spawn_retains_original_before_callback_starts_shutdown() {
     let runtime = Runtime::builder().workers(WorkersPolicy::exactly(1)).build().unwrap();
     let original_dropped = Arc::new(AtomicBool::new(false));
 
     let result = runtime.scheduler().block_on(async |cx| {
-        cx.control().on(HookFn::<WorkerInit, _>::new(
+        cx.control().on(HookFn::<WorkerSpawn, _>::new(
             ShutdownDuringRegistration {
                 control: cx.control().clone(),
                 original_dropped: Some(Arc::clone(&original_dropped)),
@@ -1277,13 +1277,13 @@ fn panic_callbacks_share_one_borrowed_event() {
 }
 
 #[test]
-fn control_worker_init_runs_once_on_every_worker() {
+fn control_worker_spawn_runs_once_on_every_worker() {
     let runtime = Runtime::builder().workers(WorkersPolicy::exactly(2)).build().unwrap();
     let control = runtime.scheduler().block_on(async |cx| cx.control().clone()).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let (initialized, initialization) = mpsc::channel();
 
-    control.on(HookFn::<WorkerInit, _>::new(
+    control.on(HookFn::<WorkerSpawn, _>::new(
         InitSignal {
             calls: PanicCount(Arc::clone(&calls)),
             initialized,
@@ -1309,7 +1309,7 @@ struct RetainedContext {
 
 impl Drop for RetainedContext {
     fn drop(&mut self) {
-        self.context.control().on(HookFn::<WorkerInit, _>::new((), |_event, ()| {}));
+        self.context.control().on(HookFn::<WorkerSpawn, _>::new((), |_event, ()| {}));
     }
 }
 
@@ -1350,7 +1350,7 @@ impl ThreadAware for BlockingDrop {
 }
 
 #[test]
-fn retained_worker_init_data_is_released_during_shutdown() {
+fn retained_worker_spawn_data_is_released_during_shutdown() {
     let runtime = Runtime::builder().workers(WorkersPolicy::exactly(1)).build().unwrap();
     let lifetime = Arc::new(());
     let weak = Arc::downgrade(&lifetime);
@@ -1358,7 +1358,7 @@ fn retained_worker_init_data_is_released_during_shutdown() {
     runtime
         .scheduler()
         .block_on(async move |cx| {
-            cx.control().on(HookFn::<WorkerInit, _>::new(
+            cx.control().on(HookFn::<WorkerSpawn, _>::new(
                 RetainedContext {
                     context: cx.clone(),
                     _lifetime: lifetime,
@@ -1381,7 +1381,7 @@ fn request_stop_does_not_drop_retained_hook_data() {
     let control = runtime
         .scheduler()
         .block_on(async move |cx| {
-            cx.control().on(HookFn::<WorkerInit, _>::new(
+            cx.control().on(HookFn::<WorkerSpawn, _>::new(
                 BlockingDrop {
                     retained: true,
                     started,

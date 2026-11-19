@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 
-use super::{ErasedHookFn, HookRegistration, TaskObservers, TaskSpawn, WorkerInit};
+use super::{ErasedHookFn, HookRegistration, TaskObservers, TaskSpawn, WorkerSpawn};
 
 pub(crate) struct ClearedHooks {
     _task_spawn: Arc<Vec<Arc<ErasedHookFn<TaskSpawn>>>>,
-    _worker_init: Arc<Vec<Arc<ErasedHookFn<WorkerInit>>>>,
+    _worker_spawn: Arc<Vec<Arc<ErasedHookFn<WorkerSpawn>>>>,
 }
 
 #[derive(derive_more::Debug)]
@@ -19,17 +19,17 @@ pub(crate) struct RetainedHooks {
     closed: AtomicBool,
     has_task_spawn: AtomicBool,
     task_spawn: ArcSwap<Vec<Arc<ErasedHookFn<TaskSpawn>>>>,
-    worker_init: ArcSwap<Vec<Arc<ErasedHookFn<WorkerInit>>>>,
+    worker_spawn: ArcSwap<Vec<Arc<ErasedHookFn<WorkerSpawn>>>>,
 }
 
 impl RetainedHooks {
     pub(crate) fn new(hooks: Vec<HookRegistration>) -> Self {
         let mut task_spawn = Vec::new();
-        let mut worker_init = Vec::new();
+        let mut worker_spawn = Vec::new();
         for hook in hooks {
             match hook {
                 HookRegistration::TaskSpawn(hook) => task_spawn.push(Arc::new(hook)),
-                HookRegistration::WorkerInit(hook) => worker_init.push(Arc::new(hook)),
+                HookRegistration::WorkerSpawn(hook) => worker_spawn.push(Arc::new(hook)),
                 HookRegistration::Panic(_) => {}
             }
         }
@@ -39,7 +39,7 @@ impl RetainedHooks {
             closed: AtomicBool::new(false),
             has_task_spawn: AtomicBool::new(has_task_spawn),
             task_spawn: ArcSwap::from_pointee(task_spawn),
-            worker_init: ArcSwap::from_pointee(worker_init),
+            worker_spawn: ArcSwap::from_pointee(worker_spawn),
         }
     }
 
@@ -53,7 +53,7 @@ impl RetainedHooks {
                 Self::push_to(&self.task_spawn, hook);
                 self.has_task_spawn.store(true, Ordering::Release);
             }
-            HookRegistration::WorkerInit(hook) => Self::push_to(&self.worker_init, hook),
+            HookRegistration::WorkerSpawn(hook) => Self::push_to(&self.worker_spawn, hook),
             HookRegistration::Panic(_) => {}
         }
         true
@@ -89,7 +89,7 @@ impl RetainedHooks {
         self.closed.store(true, Ordering::Release);
         let cleared = ClearedHooks {
             _task_spawn: self.task_spawn.swap(Arc::new(Vec::new())),
-            _worker_init: self.worker_init.swap(Arc::new(Vec::new())),
+            _worker_spawn: self.worker_spawn.swap(Arc::new(Vec::new())),
         };
         self.has_task_spawn.store(false, Ordering::Release);
         cleared
@@ -97,7 +97,7 @@ impl RetainedHooks {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.task_spawn.load().len().saturating_add(self.worker_init.load().len())
+        self.task_spawn.load().len().saturating_add(self.worker_spawn.load().len())
     }
 }
 
@@ -124,19 +124,19 @@ mod tests {
             Calls(Arc::new(AtomicUsize::new(0))),
             |_event, _calls| {},
         ));
-        let worker_init = registration(HookFn::<WorkerInit, _>::new(
+        let worker_spawn = registration(HookFn::<WorkerSpawn, _>::new(
             Calls(Arc::new(AtomicUsize::new(0))),
             |_event, _calls| {},
         ));
 
         assert!(RetainedHooks::new(vec![task_spawn]).has_task_spawn());
-        assert!(!RetainedHooks::new(vec![worker_init]).has_task_spawn());
+        assert!(!RetainedHooks::new(vec![worker_spawn]).has_task_spawn());
     }
 
     #[test]
     fn publishes_executes_and_clears_snapshots() {
         let spawn_calls = Arc::new(AtomicUsize::new(0));
-        let worker_init_calls = Arc::new(AtomicUsize::new(0));
+        let worker_spawn_calls = Arc::new(AtomicUsize::new(0));
         let hooks = RetainedHooks::new(Vec::new());
         assert!(!hooks.has_task_spawn());
         let created = Cell::new(false);
@@ -174,8 +174,8 @@ mod tests {
             },
         ))));
         assert!(hooks.has_task_spawn());
-        assert!(hooks.push(registration(HookFn::<WorkerInit, _>::new(
-            Calls(Arc::clone(&worker_init_calls)),
+        assert!(hooks.push(registration(HookFn::<WorkerSpawn, _>::new(
+            Calls(Arc::clone(&worker_spawn_calls)),
             |_event, calls| {
                 calls.0.fetch_add(1, Ordering::Relaxed);
             },
@@ -185,8 +185,8 @@ mod tests {
         assert_eq!(hooks.len(), 2);
         drop(hooks.clear());
         assert!(!hooks.has_task_spawn());
-        assert!(!hooks.push(registration(HookFn::<WorkerInit, _>::new(
-            Calls(Arc::clone(&worker_init_calls)),
+        assert!(!hooks.push(registration(HookFn::<WorkerSpawn, _>::new(
+            Calls(Arc::clone(&worker_spawn_calls)),
             |_event, _calls| {},
         ))));
         assert_eq!(hooks.len(), 0);
@@ -196,7 +196,7 @@ mod tests {
         }));
 
         assert_eq!(spawn_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(worker_init_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(worker_spawn_calls.load(Ordering::Relaxed), 0);
         assert_eq!(panic_calls.load(Ordering::Relaxed), 0);
         assert!(!created.get());
     }
