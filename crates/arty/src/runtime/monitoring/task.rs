@@ -6,7 +6,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use arty_executor::{ShutdownCause, TaskCompletion, TaskPanicPayload, TaskPlacement, TaskSet, TaskState};
+use arty_executor::{ShutdownCause, TaskCompletion, TaskObserver, TaskPanicPayload, TaskSet, TaskState};
 use seismograph::recorder::event::{EventClass, EventTimestamp};
 use seismograph::recorder::runtime::{TaskId, TypeDescriptorId};
 use seismograph_runtime::snapshot::{Task, TaskActivityState};
@@ -250,11 +250,11 @@ impl<R: 'static, T: TaskCompletion<R>> TaskCompletion<R> for Completion<T> {
     }
 }
 
-pub(crate) fn add_task_with_metadata<Body, F, R, T, S>(
+pub(crate) fn add_task_with_metadata<Body, F, R, T, O, S>(
     tasks: &TaskSet,
     future: F,
-    placement: TaskPlacement,
     completion: T,
+    observer: O,
     parent: Option<TaskId>,
     body_size: S,
 ) where
@@ -262,10 +262,11 @@ pub(crate) fn add_task_with_metadata<Body, F, R, T, S>(
     F: IntoFuture<Output = R> + 'static,
     R: 'static,
     T: TaskCompletion<R>,
+    O: TaskObserver,
     S: Fn() -> usize + 'static,
 {
     let Some(events) = current_events() else {
-        tasks.task(future).placement(placement).register(completion);
+        tasks.task(future).observe(observer).register(completion);
         return;
     };
     let completion = Completion {
@@ -274,7 +275,7 @@ pub(crate) fn add_task_with_metadata<Body, F, R, T, S>(
     };
     tasks
         .task(future)
-        .placement(placement)
+        .observe(observer)
         .register_with_inspection(completion, move |_, completion, state| {
             let info = &completion.info;
             Some(seismograph::recorder::without_recording(|| match state {
@@ -406,7 +407,7 @@ mod tests {
         let completion = crate::task::handle::JoinHandlePool::new(crate::runtime::shutdown::Shutdown::default());
         let (_handle, sender) = completion.handle();
 
-        super::add_task_with_metadata::<(), _, _, _, _>(&executor.tasks(), future, arty_executor::TaskPlacement::Any, sender, None, || 0);
+        super::add_task_with_metadata::<(), _, _, _, _, _>(&executor.tasks(), future, sender, (), None, || 0);
         let _ = executor.execute_cycle();
 
         assert!(ran.get());

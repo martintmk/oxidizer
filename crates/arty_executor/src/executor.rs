@@ -14,8 +14,7 @@ use std::task;
 use std::thread::ThreadId;
 
 use nm::{Event, Magnitude, MetricsPusher, Push};
-use observed::Sink;
-use tick::{SimpleClock, Stopwatch};
+use tick::SimpleClock;
 
 use crate::{
     CycleOutcome, ExecutorBuilder, ExecutorShared, Shutdown, ShutdownCause, TaskHandle, TaskList, TaskSet, TypeErasedTask, executor_context,
@@ -133,9 +132,9 @@ impl Executor {
     }
 
     #[must_use]
-    pub(crate) fn new(owner_waker: task::Waker, sink: Sink, thread_id: ThreadId, panic_policy: crate::PanicPolicy) -> Self {
-        let shared = ExecutorShared::new(owner_waker, sink, thread_id, panic_policy);
-        let stopwatch = Stopwatch::new_coarse(SimpleClock::new_system());
+    pub(crate) fn new(owner_waker: task::Waker, thread_id: ThreadId, panic_policy: crate::PanicPolicy) -> Self {
+        let shared = ExecutorShared::new(owner_waker, thread_id, panic_policy);
+        let clock = SimpleClock::new_system().with_fast_instant(true);
         // Register before creating an executor because its Drop unregisters this thread.
         executor_context::register(thread_id);
         Self {

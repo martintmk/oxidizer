@@ -7,14 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Waker;
 use std::thread::ThreadId;
 
-use arty_executor::{ShutdownCause, TaskPlacement};
+use arty_executor::ShutdownCause;
 use foldhash::HashMap;
 use nonempty::NonEmpty;
 use performables::arc::Arc;
-use performables::sync::mutex::Mutex;
 use thread_aware::{Thread, ThreadAware};
 
-use crate::runtime::hook::HookRegistration;
+use crate::runtime::hook::{HookRegistration, RetainedHooks, TaskObservers, TaskSpawn};
 use crate::runtime::monitoring::TaskMonitoring;
 use crate::runtime::shutdown::{Shutdown, ShutdownState};
 use crate::runtime::worker::asynchronous::{CommandSender, LocalWorker, QueuedFactory, QueuedIoAccess, SpawnCommand, SystemCommand};
@@ -22,9 +21,7 @@ use crate::runtime::worker::blocking::Worker;
 use crate::runtime::{Error, Workers};
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
-use crate::task::preparation::prepare_remote;
-
-const ERR_POISONED_HOOKS: &str = "runtime hook lock is poisoned by a prior panic";
+use crate::task::preparation::{RemoteFutureFactory, prepare_remote};
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerEndpoint {
@@ -68,7 +65,7 @@ pub(crate) struct DispatcherCore {
     // cached index. IDs come only from registered workers, so a non-cryptographic hasher fits.
     worker_indices: HashMap<ThreadId, WorkerIndex>,
 
-    retained_hooks: Mutex<Vec<HookRegistration>>,
+    retained_hooks: RetainedHooks,
 
     // Minimal effort round-robin scheduling of async tasks.
     next_async_worker_index: AtomicUsize,
@@ -112,7 +109,7 @@ impl DispatcherCore {
             worker_endpoints,
             workers,
             worker_indices,
-            retained_hooks: Mutex::new(hook_registrations.into_iter().filter(HookRegistration::is_retained).collect()),
+            retained_hooks: RetainedHooks::new(hook_registrations),
             next_async_worker_index: AtomicUsize::new(0),
             remote_results: JoinHandlePool::new(shutdown),
             #[cfg(any(test, feature = "monitor"))]
@@ -169,7 +166,7 @@ impl DispatcherCore {
     }
 
     pub(crate) fn release_retained_hooks(&self) {
-        let hooks = std::mem::take(&mut *self.retained_hooks.lock_result().expect(ERR_POISONED_HOOKS));
+        let hooks = self.retained_hooks.clear();
         // Hook data can hold a Context or register hooks from its destructor.
         // Runtime shutdown calls this only after every worker has stopped.
         drop(hooks);
@@ -188,7 +185,7 @@ impl DispatcherCore {
         R: Send + 'static,
         S: Fn() -> usize + Send + 'static,
     {
-        self.enqueue(self.next_worker_index(), TaskPlacement::Any, future_factory, monitoring)
+        self.enqueue(self.next_worker_index(), future_factory, monitoring)
     }
 
     pub(crate) fn spawn_relocating<FF, F, R>(&self, source: &Thread, future_factory: FF) -> JoinHandle<R>
@@ -197,6 +194,9 @@ impl DispatcherCore {
         F: Future<Output = R> + 'static,
         R: ThreadAware + 'static,
     {
+        let source_index = self
+            .worker_index(source.id())
+            .expect("a scheduler source must identify a registered runtime worker");
         let worker_index = self.next_worker_index();
         let endpoint = &self.worker_endpoints[usize::from(worker_index)];
         let future_factory = if &endpoint.thread == source {
@@ -209,7 +209,7 @@ impl DispatcherCore {
                 let Some(current) = current.filter(|current| current.thread() == &endpoint.thread) else {
                     return Err(future_factory);
                 };
-                let handle = current.spawn(future_factory, TaskPlacement::Any);
+                let handle = current.spawn(future_factory);
                 if !current.tasks().is_executing() {
                     endpoint.waker.wake_by_ref();
                 }
@@ -221,16 +221,21 @@ impl DispatcherCore {
         } else {
             future_factory
         };
-        self.spawn_relocating_on_worker(worker_index, TaskPlacement::Any, future_factory)
+        self.spawn_relocating_on_worker(source_index, worker_index, future_factory)
     }
 
-    pub(crate) fn spawn_at_worker_relocating<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
+    pub(crate) fn spawn_at_worker_relocating<FF, F, R>(
+        &self,
+        source_index: WorkerIndex,
+        worker_index: WorkerIndex,
+        future_factory: FF,
+    ) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: ThreadAware + 'static,
     {
-        self.spawn_relocating_on_worker(worker_index, TaskPlacement::SpecificThread, future_factory)
+        self.spawn_relocating_on_worker(source_index, worker_index, future_factory)
     }
 
     pub(crate) fn worker_index(&self, thread_id: ThreadId) -> Option<WorkerIndex> {
@@ -348,31 +353,69 @@ impl DispatcherCore {
             .wake_by_ref();
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, future_factory: FF) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: Send + 'static,
     {
-        self.enqueue(worker_index, TaskPlacement::SameThread, future_factory, TaskMonitoring::capture())
+        self.enqueue(worker_index, future_factory, TaskMonitoring::capture())
+    }
+
+    pub(crate) fn spawn_on_worker_from<FF, F, R>(
+        &self,
+        source_index: WorkerIndex,
+        worker_index: WorkerIndex,
+        future_factory: FF,
+    ) -> JoinHandle<R>
+    where
+        FF: FnOnce(Context) -> F + Send + 'static,
+        F: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        self.enqueue_from_worker(source_index, worker_index, future_factory, TaskMonitoring::capture())
     }
 
     /// Records the execution worker so a successful result can relocate when its join is polled.
-    fn spawn_relocating_on_worker<FF, F, R>(&self, worker_index: WorkerIndex, placement: TaskPlacement, future_factory: FF) -> JoinHandle<R>
+    fn spawn_relocating_on_worker<FF, F, R>(
+        &self,
+        source_index: WorkerIndex,
+        worker_index: WorkerIndex,
+        future_factory: FF,
+    ) -> JoinHandle<R>
     where
         FF: FnOnce(Context) -> F + Send + 'static,
         F: Future<Output = R> + 'static,
         R: ThreadAware + 'static,
     {
         let source = self.worker_endpoints[usize::from(worker_index)].thread.clone();
-        self.enqueue(worker_index, placement, future_factory, TaskMonitoring::capture())
+        self.enqueue_from_worker(source_index, worker_index, future_factory, TaskMonitoring::capture())
             .relocate_result_from(source)
     }
 
-    fn enqueue<FF, F, R, S>(
+    fn enqueue<FF, F, R, S>(&self, worker_index: WorkerIndex, future_factory: FF, monitoring: TaskMonitoring<F, S>) -> JoinHandle<R>
+    where
+        FF: FnOnce(Context) -> F + Send + 'static,
+        F: Future<Output = R> + 'static,
+        R: Send + 'static,
+        S: Fn() -> usize + Send + 'static,
+    {
+        if let Some(join_handle) = JoinHandle::try_from_shutdown(self.shutdown()) {
+            drop(future_factory);
+            return join_handle;
+        }
+        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
+        let observers = self.neutral_observers();
+        self.send_prepared(worker_index, future_factory.with_observers(observers));
+
+        join_handle
+    }
+
+    fn enqueue_from_worker<FF, F, R, S>(
         &self,
+        source_index: WorkerIndex,
         worker_index: WorkerIndex,
-        placement: TaskPlacement,
         future_factory: FF,
         monitoring: TaskMonitoring<F, S>,
     ) -> JoinHandle<R>
@@ -386,21 +429,29 @@ impl DispatcherCore {
             drop(future_factory);
             return join_handle;
         }
-        let endpoint = self
-            .worker_endpoints
-            .get(usize::from(worker_index))
-            .expect("worker index must identify a registered runtime worker");
-        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, placement, monitoring);
+        let (future_factory, join_handle) = prepare_remote(&self.remote_results, future_factory, monitoring);
+        let source = &self.worker_endpoints[usize::from(source_index)];
+        if LocalWorker::current_thread().is_some_and(|thread| thread == source.thread) {
+            self.send_prepared(worker_index, future_factory.with_observers(LocalWorker::on_spawn()));
+            return join_handle;
+        }
+        let observers = self.neutral_observers();
+        self.send_prepared(worker_index, future_factory.with_observers(observers));
+        join_handle
+    }
 
+    fn neutral_observers(&self) -> Option<TaskObservers> {
+        self.retained_hooks.execute_task_spawn(|| TaskSpawn::new(None))
+    }
+
+    fn send_prepared(&self, worker_index: WorkerIndex, future_factory: RemoteFutureFactory) {
+        let endpoint = &self.worker_endpoints[usize::from(worker_index)];
         // A worker can close its channel before this send if shutdown already
         // reached that worker. The join handle detects the disconnection.
         _ = endpoint.commands.spawn_sender().send(SpawnCommand {
             future_factory: QueuedFactory::new(future_factory),
         });
-
         endpoint.waker.wake_by_ref();
-
-        join_handle
     }
 }
 
@@ -478,12 +529,12 @@ mod tests {
         let panic = registration(HookFn::<Panic, _>::new((), |_event, ()| {}));
         let dispatcher = DispatcherCore::new(NonEmpty::new(worker), Shutdown::default(), vec![worker_init.clone(), panic.clone()]);
 
-        assert_eq!(dispatcher.retained_hooks.lock_result().unwrap().len(), 1);
+        assert_eq!(dispatcher.retained_hooks.len(), 1);
         dispatcher.register_hook(worker_init.clone());
         dispatcher.register_hook(panic);
-        assert_eq!(dispatcher.retained_hooks.lock_result().unwrap().len(), 2);
+        assert_eq!(dispatcher.retained_hooks.len(), 2);
         dispatcher.register_hook(worker_init);
-        assert_eq!(dispatcher.retained_hooks.lock_result().unwrap().len(), 3);
+        assert_eq!(dispatcher.retained_hooks.len(), 3);
     }
 
     struct RegisterOnClone(Arc<DispatcherCore>);
@@ -524,13 +575,13 @@ mod tests {
         ));
 
         dispatcher.register_hook(hook);
-        assert_eq!(dispatcher.retained_hooks.lock_result().unwrap().len(), 2);
+        assert_eq!(dispatcher.retained_hooks.len(), 2);
 
         dispatcher.stop_inner(ShutdownCause::default());
         assert!(!dispatcher.retain_hook(registration(HookFn::<WorkerInit, _>::new((), |_event, ()| {}))));
         assert_eq!(dispatcher.retained_hooks.lock_result().unwrap().len(), 2);
         dispatcher.release_retained_hooks();
-        assert!(dispatcher.retained_hooks.lock_result().unwrap().is_empty());
+        assert_eq!(dispatcher.retained_hooks.len(), 0);
     }
 
     #[test]

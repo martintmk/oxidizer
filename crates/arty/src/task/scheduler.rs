@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use arty_executor::TaskPlacement;
 use performables::arc::Arc;
 use thread_aware::{Thread, ThreadAware};
 
@@ -145,7 +144,8 @@ impl Scheduler {
             Ok(join_handle) => return join_handle,
             Err(future_factory) => future_factory,
         };
-        self.dispatcher.spawn_on_worker(self.binding.worker_index, future_factory)
+        self.dispatcher
+            .spawn_on_worker_from(self.binding.worker_index, self.binding.worker_index, future_factory)
     }
 
     fn spawn_on_current_worker<FF, F, R>(&self, future_factory: FF) -> Result<JoinHandle<R>, FF>
@@ -161,7 +161,7 @@ impl Scheduler {
             if current.thread() != &self.binding.thread {
                 return Err(future_factory);
             }
-            let handle = current.spawn(future_factory, TaskPlacement::SameThread);
+            let handle = current.spawn(future_factory);
             if !current.tasks().is_executing() {
                 self.dispatcher.wake_worker(self.binding.worker_index);
             }
@@ -299,11 +299,12 @@ impl Scheduler {
             return JoinHandle::invalid_destination();
         };
         let source = self.binding.thread.clone();
-        self.dispatcher.spawn_at_worker_relocating(worker_index, move |cx| {
-            let mut data = data;
-            data.relocate(Some(&source), cx.thread());
-            f(data)
-        })
+        self.dispatcher
+            .spawn_at_worker_relocating(self.binding.worker_index, worker_index, move |cx| {
+                let mut data = data;
+                data.relocate(Some(&source), cx.thread());
+                f(data)
+            })
     }
 
     /// Runs a function on a thread from a blocking pool.

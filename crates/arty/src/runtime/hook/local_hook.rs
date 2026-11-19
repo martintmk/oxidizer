@@ -40,8 +40,8 @@ impl<H: Hook> LocalHook<H> {
     }
 
     pub(crate) fn execute(&self, event: &mut H) {
-        self.hooks.with_borrow_mut(|hooks| {
-            for hook in hooks.as_mut().expect("a running worker retains its installed hooks") {
+        self.hooks.with_borrow(|hooks| {
+            for hook in hooks.as_ref().expect("a running worker retains its installed hooks") {
                 hook.execute(event);
             }
         });

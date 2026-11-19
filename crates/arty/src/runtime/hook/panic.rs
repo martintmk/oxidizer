@@ -68,5 +68,5 @@ impl super::private::Sealed for Panic {
     type Erased<D>
         = super::hook_fn::ErasedHookFn<Self>
     where
-        D: thread_aware::ThreadAware + Clone + 'static;
+        D: thread_aware::ThreadAware + Clone + Sync + 'static;
 }

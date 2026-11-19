@@ -10,8 +10,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use arty_executor::{
-    Executor, InspectionError, InspectionStatus, PollObserver, Shutdown, ShutdownCause, TaskCompletion, TaskPanicPayload, TaskPlacement,
-    TaskState,
+    Executor, InspectionError, InspectionStatus, PollObserver, Shutdown, ShutdownCause, TaskCompletion, TaskPanicPayload, TaskState,
 };
 
 #[derive(Debug)]
@@ -162,8 +161,7 @@ impl Future for InspectableFuture {
 
 #[test]
 fn inspection_builder_defers_conversion_and_inspects_the_native_future() {
-    let (sink, processor) = observed_testing::test_emitter(observed_testing::TEST_ID);
-    let mut executor = Executor::builder().sink(sink.clone()).build();
+    let mut executor = Executor::builder().build();
     let tasks = executor.tasks();
     let converted = Rc::new(Cell::new(false));
     let builder = tasks
@@ -171,9 +169,7 @@ fn inspection_builder_defers_conversion_and_inspects_the_native_future() {
             converted: Rc::clone(&converted),
             shutdown: None,
         })
-        .inspect(|future, state| Some((future.0, state)))
-        .context(sink.transfer_context())
-        .placement(TaskPlacement::SpecificThread);
+        .inspect(|future, state| Some((future.0, state)));
 
     assert!(!converted.get());
     assert!(!executor.has_tasks());
@@ -184,39 +180,16 @@ fn inspection_builder_defers_conversion_and_inspects_the_native_future() {
         .inspect(1, |description: &(u32, TaskState)| descriptions.push(*description))
         .unwrap();
     assert_eq!(descriptions, [(42, TaskState::Ready)]);
-    assert_eq!(
-        processor.events()[0].dimensions(),
-        vec![("placement".to_owned(), "specific_thread".into())]
-    );
     let _ = executor.execute_cycle();
     assert!(!executor.has_tasks());
 }
 
 #[test]
-fn replacing_inspector_preserves_preconfigured_metadata() {
-    use observed::enrichment::{Enrichment, EnrichmentEntry};
-
-    struct TaskContext;
-
-    impl data_privacy::RedactedDisplay for TaskContext {
-        fn fmt(&self, _: &dyn data_privacy::Redactor, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            Ok(())
-        }
-    }
-
-    impl Enrichment for TaskContext {
-        fn into_entries(self) -> Vec<EnrichmentEntry> {
-            vec![EnrichmentEntry::new("task.context", self)]
-        }
-    }
-
-    let (sink, processor) = observed_testing::test_emitter(observed_testing::TEST_ID);
-    let mut executor = Executor::builder().sink(sink.clone()).build();
+fn replacing_inspector_uses_the_latest_callback() {
+    let mut executor = Executor::builder().build();
     executor
         .tasks()
         .task(std::future::ready(42))
-        .context(sink.transfer_context().with_enrichment(TaskContext))
-        .placement(TaskPlacement::SpecificThread)
         .inspect(|_, _| -> Option<()> { panic!("the replaced inspector must not run") })
         .inspect(|_, state| Some(state))
         .register(Completion);
@@ -226,13 +199,6 @@ fn replacing_inspector_preserves_preconfigured_metadata() {
     assert_eq!(descriptions, [TaskState::Ready]);
 
     let _ = executor.execute_cycle();
-    let events = processor.events();
-    let created = events.iter().find(|event| event.name() == "arty.rt.task.spawned").unwrap();
-    assert!(created.dimensions().contains(&("placement".to_owned(), "specific_thread".into())));
-    for name in ["arty.rt.task.spawned", "arty.rt.task.succeeded"] {
-        let event = events.iter().find(|event| event.name() == name).unwrap();
-        assert!(event.dimensions().iter().any(|(key, _)| key == "task.context"));
-    }
 }
 
 #[test]

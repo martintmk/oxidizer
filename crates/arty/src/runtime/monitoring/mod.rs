@@ -35,8 +35,8 @@ pub(crate) use blocking::MonitoredBlockingJob;
 pub(crate) use blocking::{BlockingJob, BlockingPoolMonitoring, BlockingTaskEvents, BlockingTaskMonitoring, BlockingWorkerMonitoring};
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) use runtime::RuntimeDiagnostics;
-pub(crate) use submission::{TaskMonitoring, add_task};
+pub(crate) use submission::TaskMonitoring;
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) use task::TaskInfo;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) use task::current_task;

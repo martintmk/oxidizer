@@ -3,7 +3,7 @@
 
 use std::marker::PhantomData;
 
-use arty_executor::{TaskCompletion, TaskPlacement, TaskSet};
+use arty_executor::{TaskCompletion, TaskObserver, TaskSet};
 
 /// Captures submission metadata before a task crosses threads.
 pub(crate) struct TaskMonitoring<Body, S = ()> {
@@ -48,28 +48,28 @@ where
         not(any(test, feature = "monitor")),
         expect(clippy::unused_self, reason = "Submission metadata is empty when monitoring is compiled out.")
     )]
-    pub(crate) fn register<F, R, T>(self, tasks: &TaskSet, future: F, placement: TaskPlacement, completion: T)
+    pub(crate) fn register<F, R, T>(self, tasks: &TaskSet, future: F, completion: T)
     where
         F: IntoFuture<Output = R> + 'static,
         R: 'static,
         T: TaskCompletion<R>,
     {
+        self.register_observed(tasks, future, completion, ());
+    }
+
+    pub(crate) fn register_observed<F, R, T, O>(self, tasks: &TaskSet, future: F, completion: T, observer: O)
+    where
+        F: IntoFuture<Output = R> + 'static,
+        R: 'static,
+        T: TaskCompletion<R>,
+        O: TaskObserver,
+    {
         #[cfg(any(test, feature = "monitor"))]
-        super::task::add_task_with_metadata::<Body, _, _, _, _>(tasks, future, placement, completion, self.parent, self.body_size);
+        super::task::add_task_with_metadata::<Body, _, _, _, _, _>(tasks, future, completion, observer, self.parent, self.body_size);
         // #[gamma::skip(stmt.delete_call, reason = "This branch is absent from Gamma's all-features builds; runtime-only integration tests exercise it.")]
         #[cfg(not(any(test, feature = "monitor")))]
-        tasks.task(future).placement(placement).register(completion);
+        tasks.task(future).observe(observer).register(completion);
     }
-}
-
-pub(crate) fn add_task<Body, F, R, T>(tasks: &TaskSet, future: F, placement: TaskPlacement, completion: T)
-where
-    Body: 'static,
-    F: IntoFuture<Output = R> + 'static,
-    R: 'static,
-    T: TaskCompletion<R>,
-{
-    TaskMonitoring::<Body>::capture().register(tasks, future, placement, completion);
 }
 
 #[cfg(test)]
@@ -105,7 +105,7 @@ mod tests {
         let results = JoinHandlePool::new(Shutdown::default());
         let (_handle, sender) = results.handle();
         let future: ErasedFuture = Box::pin(std::future::pending());
-        monitoring.register(&executor.tasks(), future, TaskPlacement::Any, sender);
+        monitoring.register(&executor.tasks(), future, sender);
         let mut snapshots = Vec::new();
 
         let status = executor

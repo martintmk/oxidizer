@@ -1,19 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::cell::{Cell, RefCell};
 use std::future::poll_fn;
 use std::panic::{RefUnwindSafe, UnwindSafe, catch_unwind};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 
-use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskPlacement, TaskSet, discard_task_panic_payload};
-use static_assertions::{assert_impl_all, assert_not_impl_any};
+use arty_executor::{ExecutorBuilder, PanicPolicy, TaskBuilder, TaskObserver, TaskSet, discard_task_panic_payload};
+use static_assertions::assert_not_impl_any;
 
-use super::support::TaskBuilderExt as _;
+use super::support::{DiscardCompletion, TaskBuilderExt as _};
 
 assert_not_impl_any!(TaskSet: Send, Sync);
-assert_impl_all!(TaskPlacement: UnwindSafe, RefUnwindSafe);
 // Captured enrichment can contain user-defined interior state.
 assert_not_impl_any!(TaskBuilder<'static, std::future::Ready<()>>: UnwindSafe, RefUnwindSafe);
 
@@ -38,6 +39,51 @@ fn panic_policy_is_configurable() {
 
         assert_eq!(executor.shutdown().is_triggered(), shuts_down);
     }
+}
+
+struct PollOutcomes {
+    starts: Rc<Cell<usize>>,
+    outcomes: Rc<RefCell<Vec<Poll<()>>>>,
+}
+
+impl TaskObserver for PollOutcomes {
+    fn poll_start(&mut self) {
+        self.starts.set(self.starts.get() + 1);
+    }
+
+    fn poll_end(&mut self, outcome: Poll<()>) {
+        self.outcomes.borrow_mut().push(outcome);
+    }
+}
+
+#[test]
+fn task_observer_receives_each_poll_outcome() {
+    let mut executor = ExecutorBuilder::new().build();
+    let starts = Rc::new(Cell::new(0));
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let mut first = true;
+    executor
+        .tasks()
+        .task(poll_fn(move |cx| {
+            if first {
+                first = false;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }))
+        .observe(PollOutcomes {
+            starts: Rc::clone(&starts),
+            outcomes: Rc::clone(&outcomes),
+        })
+        .register(DiscardCompletion);
+
+    _ = executor.execute_cycle();
+    _ = executor.execute_cycle();
+
+    assert_eq!(starts.get(), 2);
+    assert_eq!(*outcomes.borrow(), [Poll::Pending, Poll::Ready(())]);
 }
 
 #[test]

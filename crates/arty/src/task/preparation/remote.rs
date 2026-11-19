@@ -3,9 +3,10 @@
 
 use std::cell::Cell;
 
-use arty_executor::{TaskPlacement, TaskSet};
+use arty_executor::TaskSet;
 use plurality::{Box as PoolBox, MultiPool, coerce};
 
+use crate::runtime::hook::TaskObservers;
 use crate::runtime::monitoring::TaskMonitoring;
 use crate::task::Context;
 use crate::task::handle::{JoinHandle, JoinHandlePool};
@@ -52,39 +53,71 @@ impl<F> Drop for TaskFactory<F> {
 /// registration. The executor can then store the future inline in its task
 /// storage pool. Returning the future requires a `Pin<Box<dyn Future>>` and a
 /// heap allocation for every remote spawn.
-type ErasedRemoteFutureFactory = dyn Fn(Context, &TaskSet) + Send;
+type ErasedRemoteFutureFactory = dyn Fn(Context, &TaskSet, Option<TaskObservers>) + Send;
 
 pub(crate) struct RemoteFutureFactory {
     inner: PoolBox<ErasedRemoteFutureFactory>,
+    observers: Option<Option<TaskObservers>>,
+    requires_spawn: bool,
 }
 
 #[must_use]
 pub(crate) struct RegisteredRemoteTask;
 
 impl RemoteFutureFactory {
-    pub(crate) fn new(factory: impl FnOnce(Context, &TaskSet) + Send + 'static) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_without_observers(factory: impl FnOnce(Context, &TaskSet) + Send + 'static) -> Self {
+        Self::new(move |cx, tasks, _observers| factory(cx, tasks), false)
+    }
+
+    fn new(factory: impl FnOnce(Context, &TaskSet, Option<TaskObservers>) + Send + 'static, requires_spawn: bool) -> Self {
         let factory = Cell::new(Some(factory));
         // A pooled box cannot move an erased FnOnce out of its slot. Take the concrete
         // closure through Cell instead, without requiring its captures to be Unpin.
-        let factory = move |cx: Context, tasks: &TaskSet| {
-            factory.take().expect("a remote factory is registered exactly once")(cx, tasks);
+        let factory = move |cx: Context, tasks: &TaskSet, observers| {
+            factory.take().expect("a remote factory is registered exactly once")(cx, tasks, observers);
         };
         let mut factory = Some(factory);
         let inner = FUTURE_FACTORIES
             .try_with(|pool| {
                 let factory = factory.take().expect("the pooled allocation consumes the factory once");
-                PoolBox::unsize(pool.alloc_box(factory), coerce!(dyn Fn(Context, &TaskSet) + Send))
+                PoolBox::unsize(
+                    pool.alloc_box(factory),
+                    coerce!(dyn Fn(Context, &TaskSet, Option<TaskObservers>) + Send),
+                )
             })
             .unwrap_or_else(|_| {
                 let pool = MultiPool::new();
                 let factory = factory.take().expect("the fallback allocation consumes the factory once");
-                PoolBox::unsize(pool.alloc_box(factory), coerce!(dyn Fn(Context, &TaskSet) + Send))
+                PoolBox::unsize(
+                    pool.alloc_box(factory),
+                    coerce!(dyn Fn(Context, &TaskSet, Option<TaskObservers>) + Send),
+                )
             });
-        Self { inner }
+        Self {
+            inner,
+            observers: None,
+            requires_spawn,
+        }
+    }
+
+    pub(crate) fn with_observers(mut self, observers: Option<TaskObservers>) -> Self {
+        self.observers = Some(observers);
+        self
     }
 
     pub(crate) fn register(self, cx: Context, tasks: &TaskSet) -> RegisteredRemoteTask {
-        (self.inner)(cx, tasks);
+        let Self {
+            inner,
+            observers,
+            requires_spawn,
+        } = self;
+        let observers = match observers {
+            Some(observers) => observers,
+            None if requires_spawn => crate::runtime::worker::asynchronous::LocalWorker::on_spawn(),
+            None => None,
+        };
+        inner(cx, tasks, observers);
         RegisteredRemoteTask
     }
 }
@@ -92,7 +125,6 @@ impl RemoteFutureFactory {
 pub(crate) fn prepare_remote<FF, F, R, S>(
     result_pool: &JoinHandlePool,
     future_factory: FF,
-    placement: TaskPlacement,
     monitoring: TaskMonitoring<F, S>,
 ) -> (RemoteFutureFactory, JoinHandle<R>)
 where
@@ -103,11 +135,25 @@ where
 {
     let (handle, result_tx) = result_pool.handle();
     let future_factory = TaskFactory::new(future_factory);
-    let future_factory = RemoteFutureFactory::new(move |cx, tasks| {
-        let future_factory = future_factory.into_inner();
-        let inner = DeferredTaskFactory::new(future_factory, cx);
-        monitoring.register(tasks, inner, placement, result_tx);
-    });
+    let future_factory = RemoteFutureFactory::new(
+        move |cx, tasks, observers| {
+            let observers = observers.map(|mut observers| {
+                observers.relocate_to(cx.thread());
+                observers
+            });
+            let future_factory = future_factory.into_inner();
+            let inner = DeferredTaskFactory::new(future_factory, cx);
+            if let Some(observers) = observers {
+                match observers.into_single() {
+                    Ok(observer) => monitoring.register_observed(tasks, inner, result_tx, observer),
+                    Err(observers) => monitoring.register_observed(tasks, inner, result_tx, observers),
+                }
+            } else {
+                monitoring.register(tasks, inner, result_tx);
+            }
+        },
+        true,
+    );
     (future_factory, handle)
 }
 
@@ -130,7 +176,7 @@ mod tests {
 
     impl Drop for FactoryOnDrop {
         fn drop(&mut self) {
-            drop(RemoteFutureFactory::new(|_, _| {}));
+            drop(RemoteFutureFactory::new_without_observers(|_, _| {}));
             self.0.send(()).unwrap();
         }
     }
@@ -139,11 +185,11 @@ mod tests {
     fn remote_factory_reuses_its_pool_slot() {
         fn factory(_: Context, _: &TaskSet) {}
 
-        let first = RemoteFutureFactory::new(factory);
+        let first = RemoteFutureFactory::new_without_observers(factory);
         let address = std::ptr::from_ref(&*first.inner).cast::<()>();
         let chunks = FUTURE_FACTORIES.with(MultiPool::chunks_allocated);
         drop(first);
-        let second = RemoteFutureFactory::new(factory);
+        let second = RemoteFutureFactory::new_without_observers(factory);
 
         assert_eq!(std::ptr::from_ref(&*second.inner).cast::<()>(), address);
         assert_eq!(FUTURE_FACTORIES.with(MultiPool::chunks_allocated), chunks);

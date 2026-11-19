@@ -144,7 +144,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
-    use arty_executor::{Executor, TaskPlacement};
+    use arty_executor::Executor;
 
     use super::*;
 
@@ -211,7 +211,7 @@ mod tests {
         let executor = Executor::builder().build();
         let invoked = Arc::new(AtomicBool::new(false));
         let factory_invoked = Arc::clone(&invoked);
-        let factory = RemoteFutureFactory::new(move |_, _| {
+        let factory = RemoteFutureFactory::new_without_observers(move |_, _| {
             factory_invoked.store(true, Ordering::Release);
         });
 
@@ -227,7 +227,6 @@ mod tests {
         let (factory, join) = prepare_remote(
             &result_pool,
             |_| async { 42 },
-            TaskPlacement::Any,
             crate::runtime::monitoring::TaskMonitoring::capture(),
         );
         let mut join = pin!(join);
@@ -248,7 +247,7 @@ mod tests {
     fn queued_factory_disposal_contains_captured_destructor_panic() {
         let drops = Arc::new(AtomicUsize::new(0));
         let capture = PanicOnDrop(Arc::clone(&drops));
-        let factory = RemoteFutureFactory::new(move |_, _| {
+        let factory = RemoteFutureFactory::new_without_observers(move |_, _| {
             let _ = &capture;
         });
 

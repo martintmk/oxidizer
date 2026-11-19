@@ -15,54 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use arty_executor::{
-    CycleOutcome, Executor, PanicAction, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskCompletion, TaskPanicPayload,
-    TaskPlacement, TaskSet,
+    CycleOutcome, Executor, PanicAction, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskCompletion, TaskPanicPayload, TaskSet,
 };
-use observed::Sink;
-use observed::enrichment::{Enrichment, EnrichmentEntry};
-use observed::metadata::EventDescription;
-use observed::processing::{EventProcessor, EventView};
-use observed_testing::{TEST_ID, test_emitter};
 
 use super::support::{CompletionHandle, TaskBuilderExt as _, TaskOutcome};
 
 thread_local! {
     static THREAD_LOCAL_EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
-    static REENTRANT_TELEMETRY_SUBMISSION: RefCell<Option<(TaskSet, Rc<Cell<bool>>)>> = const { RefCell::new(None) };
-    static OWNER_DROP_TELEMETRY: RefCell<Option<OwnerDropState>> = const { RefCell::new(None) };
-}
-
-struct ReentrantSubmissionProcessor;
-struct OwnerDropProcessor;
-
-struct ContextValue;
-
-impl data_privacy::RedactedDisplay for ContextValue {
-    fn fmt(&self, _: &dyn data_privacy::Redactor, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
-    }
-}
-
-struct TaskContext;
-
-impl Enrichment for TaskContext {
-    fn into_entries(self) -> Vec<EnrichmentEntry> {
-        vec![EnrichmentEntry::new("task.context", ContextValue)]
-    }
-}
-
-struct CallerContext;
-
-impl Enrichment for CallerContext {
-    fn into_entries(self) -> Vec<EnrichmentEntry> {
-        vec![EnrichmentEntry::new("caller.context", ContextValue)]
-    }
-}
-
-struct OwnerDropState {
-    owner: Executor,
-    tasks: TaskSet,
-    nested: Rc<RefCell<Option<CompletionHandle<usize>>>>,
 }
 
 #[test]
@@ -83,48 +42,6 @@ fn task_set_execution_state_follows_the_owner_cycle() {
 
     assert!(observed.get());
     assert!(!tasks.is_executing());
-}
-
-impl EventProcessor for ReentrantSubmissionProcessor {
-    fn is_interested(&self, description: &EventDescription) -> bool {
-        description.name() == "arty.rt.task.spawned"
-    }
-
-    fn process(&self, _event: &EventView<'_>) {
-        let Some((tasks, completed)) = REENTRANT_TELEMETRY_SUBMISSION.take() else {
-            return;
-        };
-        drop(
-            tasks
-                .task(async move {
-                    completed.set(true);
-                })
-                .register_test(),
-        );
-    }
-
-    fn flush(&self) -> Result<(), observed::FlushError> {
-        Ok(())
-    }
-}
-
-impl EventProcessor for OwnerDropProcessor {
-    fn is_interested(&self, description: &EventDescription) -> bool {
-        description.name() == "arty.rt.task.spawned"
-    }
-
-    fn process(&self, _event: &EventView<'_>) {
-        let Some(state) = OWNER_DROP_TELEMETRY.take() else {
-            return;
-        };
-        drop(state.owner);
-        let nested = state.tasks.task(async { 42 }).register_test();
-        assert!(state.nested.replace(Some(nested)).is_none());
-    }
-
-    fn flush(&self) -> Result<(), observed::FlushError> {
-        Ok(())
-    }
 }
 
 fn poll_once<R: 'static>(handle: &mut CompletionHandle<R>) -> Poll<TaskOutcome<R>> {
@@ -221,13 +138,6 @@ fn panic_causes_retain_messages_without_consuming_payloads() {
     assert!(ShutdownCause::default().as_error().is_none());
 }
 
-fn enrichment_keys(sink: &Sink) -> Vec<String> {
-    sink.current_enrichments()
-        .into_iter()
-        .map(|entry| entry.key().as_str().to_owned())
-        .collect()
-}
-
 #[test]
 fn failed_construction_preserves_existing_executor_notifications() {
     let mut executor = Executor::builder().build();
@@ -274,73 +184,6 @@ fn configured_current_thread_executes_tasks() {
 }
 
 #[test]
-fn noop_executor_applies_task_context_and_restores_caller_context() {
-    let sink = Sink::builder("arty-executor-context-restoration").build();
-    let task_context = sink.transfer_context().with_enrichment(TaskContext);
-    let caller_context = sink.transfer_context().with_enrichment(CallerContext);
-    let _caller_guard = caller_context.apply_current_thread();
-    assert_eq!(enrichment_keys(&sink), ["caller.context"]);
-
-    let mut executor = Executor::builder().build();
-    let task_sink = sink.clone();
-    let mut handle = executor
-        .tasks()
-        .task(async move { enrichment_keys(&task_sink) })
-        .context(task_context)
-        .placement(TaskPlacement::Any)
-        .register_test();
-
-    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-    assert_eq!(poll_completed(&mut handle), [String::from("task.context")]);
-    assert_eq!(enrichment_keys(&sink), ["caller.context"]);
-}
-
-#[test]
-fn task_builder_keeps_context_and_placement() {
-    let (sink, processor) = test_emitter(TEST_ID);
-    let context = sink.transfer_context().with_enrichment(TaskContext);
-    let mut executor = Executor::builder().sink(sink.clone()).build();
-    let task_sink = sink;
-    let mut handle = executor
-        .tasks()
-        .task(async move { enrichment_keys(&task_sink) })
-        .context(context)
-        .placement(TaskPlacement::SameThread)
-        .register_test();
-
-    _ = executor.execute_cycle();
-
-    assert_eq!(poll_completed(&mut handle), [String::from("task.context")]);
-    assert_eq!(
-        processor.events()[0].dimensions()[0],
-        ("placement".to_owned(), "same_thread".into())
-    );
-}
-
-#[test]
-fn task_builder_keeps_placement_without_context() {
-    let (sink, processor) = test_emitter(TEST_ID);
-    let caller = sink.transfer_context().with_enrichment(CallerContext);
-    let _guard = caller.apply_current_thread();
-    let mut executor = Executor::builder().sink(sink.clone()).build();
-    let task_sink = sink;
-    let mut handle = executor
-        .tasks()
-        .task(async move { enrichment_keys(&task_sink) })
-        .placement(TaskPlacement::SpecificThread)
-        .register_test();
-
-    _ = executor.execute_cycle();
-
-    assert_eq!(poll_completed(&mut handle), [String::from("caller.context")]);
-    assert!(
-        processor.events()[0]
-            .dimensions()
-            .contains(&("placement".to_owned(), "specific_thread".into()))
-    );
-}
-
-#[test]
 fn completed_result_remains_available_after_executor_stops() {
     let mut executor = Executor::builder().build();
     let mut handle = executor.tasks().task(async { 42 }).register_test();
@@ -355,21 +198,15 @@ fn completed_result_remains_available_after_executor_stops() {
 
 #[test]
 fn task_panic_publishes_the_original_payload_and_keeps_the_executor_usable() {
-    let (sink, processor) = test_emitter(TEST_ID);
-    let mut executor = Executor::builder().sink(sink.clone()).panic_policy(PanicPolicy::IGNORE).build();
+    let mut executor = Executor::builder().panic_policy(PanicPolicy::IGNORE).build();
     let tasks = executor.tasks();
-    let mut panicked = tasks
-        .task(poll_fn(|_| -> Poll<usize> { panic!("task panic") }))
-        .context(sink.transfer_context())
-        .placement(TaskPlacement::Any)
-        .register_test();
+    let mut panicked = tasks.task(poll_fn(|_| -> Poll<usize> { panic!("task panic") })).register_test();
 
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
     let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut panicked) else {
         panic!("panicking task must publish its panic payload");
     };
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"task panic"));
-    assert!(processor.events().iter().any(|event| event.name() == "arty.rt.task.panicked"));
 
     let mut completed = tasks.task(async { 7 }).register_test();
     assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
@@ -953,71 +790,6 @@ fn submission_during_shutdown_returns_shutdown_error() {
     assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
 }
 
-#[test]
-fn task_created_processor_may_submit_a_nested_task() {
-    let sink = Sink::builder("arty-executor-reentrant-telemetry")
-        .clock(tick::SimpleClock::new_frozen())
-        .processors(vec![Arc::new(ReentrantSubmissionProcessor)])
-        .build();
-    let mut executor = Executor::builder().sink(sink.clone()).build();
-    let tasks = executor.tasks();
-    let nested_completed = Rc::new(Cell::new(false));
-    REENTRANT_TELEMETRY_SUBMISSION.set(Some((tasks.clone(), Rc::clone(&nested_completed))));
-
-    let _outer = tasks
-        .task(async {})
-        .context(sink.transfer_context())
-        .placement(TaskPlacement::Any)
-        .register_test();
-
-    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-    assert!(nested_completed.get());
-}
-
-#[test]
-fn default_builder_emits_lifecycle_events_without_context_enrichment() {
-    let (sink, processor) = test_emitter(TEST_ID);
-    let mut executor = Executor::builder().sink(sink).build();
-    let _handle = executor.tasks().task(async {}).register_test();
-
-    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-
-    let events = processor.events();
-    assert!(events.iter().any(|event| event.name() == "arty.rt.task.spawned"));
-    assert!(events.iter().any(|event| event.name() == "arty.rt.task.succeeded"));
-    let created = events.iter().find(|event| event.name() == "arty.rt.task.spawned").unwrap();
-    assert_eq!(created.dimensions(), vec![("placement".to_owned(), "any".into())]);
-}
-
-#[test]
-fn builder_context_and_placement_reach_task_lifecycle_events() {
-    for (placement, label) in [
-        (TaskPlacement::SameThread, "same_thread"),
-        (TaskPlacement::SpecificThread, "specific_thread"),
-    ] {
-        let (sink, processor) = test_emitter(TEST_ID);
-        let mut executor = Executor::builder().sink(sink.clone()).build();
-        let task_sink = sink.clone();
-        let mut handle = executor
-            .tasks()
-            .task(async move { enrichment_keys(&task_sink) })
-            .placement(placement)
-            .context(sink.transfer_context().with_enrichment(TaskContext))
-            .register_test();
-
-        assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
-        assert_eq!(poll_completed(&mut handle), ["task.context"]);
-        let events = processor.events();
-        let created = events.iter().find(|event| event.name() == "arty.rt.task.spawned").unwrap();
-        assert!(created.dimensions().contains(&("placement".to_owned(), label.into())));
-        for name in ["arty.rt.task.spawned", "arty.rt.task.succeeded"] {
-            let event = events.iter().find(|event| event.name() == name).unwrap();
-            assert!(event.dimensions().iter().any(|(key, _)| key == "task.context"));
-        }
-        assert!(enrichment_keys(&sink).is_empty());
-    }
-}
-
 struct ReentrantIntoFuture {
     tasks: TaskSet,
     nested_completed: Rc<Cell<bool>>,
@@ -1092,28 +864,6 @@ fn owner_drop_during_conversion_cancels_tasks_and_rejects_nested_submission() {
 
     assert!(owner.borrow().is_none());
     assert!(matches!(poll_once(&mut existing), Poll::Ready(TaskOutcome::Cancelled(_))));
-    assert!(matches!(poll_once(&mut outer), Poll::Ready(TaskOutcome::Cancelled(_))));
-    let mut nested = nested.borrow_mut().take().unwrap();
-    assert!(matches!(poll_once(&mut nested), Poll::Ready(TaskOutcome::Cancelled(_))));
-}
-
-#[test]
-fn owner_drop_during_spawn_telemetry_cancels_task_and_rejects_nested_submission() {
-    let sink = Sink::builder("arty-executor-owner-drop")
-        .clock(tick::SimpleClock::new_frozen())
-        .processors(vec![Arc::new(OwnerDropProcessor)])
-        .build();
-    let executor = Executor::builder().sink(sink).build();
-    let tasks = executor.tasks();
-    let nested = Rc::new(RefCell::new(None));
-    OWNER_DROP_TELEMETRY.set(Some(OwnerDropState {
-        owner: executor,
-        tasks: tasks.clone(),
-        nested: Rc::clone(&nested),
-    }));
-
-    let mut outer = tasks.task(pending::<()>()).register_test();
-
     assert!(matches!(poll_once(&mut outer), Poll::Ready(TaskOutcome::Cancelled(_))));
     let mut nested = nested.borrow_mut().take().unwrap();
     assert!(matches!(poll_once(&mut nested), Poll::Ready(TaskOutcome::Cancelled(_))));
