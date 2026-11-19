@@ -354,6 +354,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_spawn_hook_snapshots_skip_event_creation() {
+        let _guard = LOCAL_SPAWN_HOOK.initialize();
+        let thread = ThreadBuilder::default().build(std::thread::current().id());
+
+        assert!(LocalWorker::execute_spawn_hooks(&thread).is_none());
+    }
+
+    #[test]
     fn relocating_registration_checks_owner_execution_and_shutdown() {
         let observations = std::thread::spawn(|| {
             let thread = ThreadBuilder::default().build(std::thread::current().id());

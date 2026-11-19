@@ -107,7 +107,7 @@ mod tests {
     use thread_aware::{Thread, ThreadAware};
 
     use super::*;
-    use crate::runtime::hook::{HookFn, registration};
+    use crate::runtime::hook::{HookFn, Panic, registration};
 
     #[derive(Clone)]
     struct Calls(Arc<AtomicUsize>);
@@ -127,6 +127,27 @@ mod tests {
             TaskSpawn::new(None)
         }));
         assert!(!created.get());
+
+        hooks.has_task_spawn.store(true, Ordering::Release);
+        assert!(
+            hooks
+                .execute_task_spawn(|| {
+                    created.set(true);
+                    TaskSpawn::new(None)
+                })
+                .is_none()
+        );
+        assert!(!created.get());
+        hooks.has_task_spawn.store(false, Ordering::Release);
+
+        let panic_calls = Arc::new(AtomicUsize::new(0));
+        let panic_hook = registration(HookFn::<Panic, _>::new(Calls(Arc::clone(&panic_calls)), |_event, calls| {
+            calls.0.fetch_add(1, Ordering::Relaxed);
+        }));
+        let panic_only = RetainedHooks::new(vec![panic_hook.clone()]);
+        assert_eq!(panic_only.len(), 0);
+        assert!(hooks.push(panic_hook));
+        assert_eq!(hooks.len(), 0);
 
         assert!(hooks.push(registration(HookFn::<TaskSpawn, _>::new(
             Calls(Arc::clone(&spawn_calls)),
@@ -156,6 +177,7 @@ mod tests {
 
         assert_eq!(spawn_calls.load(Ordering::Relaxed), 2);
         assert_eq!(worker_init_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(panic_calls.load(Ordering::Relaxed), 0);
         assert!(!created.get());
     }
 }

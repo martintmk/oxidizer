@@ -8,14 +8,16 @@ use std::error::Error as _;
 use std::fmt;
 use std::future::{Ready, pending, poll_fn, ready};
 use std::marker::PhantomPinned;
+use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use arty_executor::{
-    CycleOutcome, Executor, PanicAction, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskCompletion, TaskPanicPayload, TaskSet,
+    CycleOutcome, Executor, PanicAction, PanicPolicy, Shutdown, ShutdownCause, ShutdownError, TaskCompletion, TaskInstrumentation,
+    TaskPanicPayload, TaskSet,
 };
 
 use super::support::{CompletionHandle, TaskBuilderExt as _, TaskOutcome};
@@ -788,6 +790,211 @@ fn submission_during_shutdown_returns_shutdown_error() {
     let mut handle = tasks.task(async { 42 }).register_test();
 
     assert!(matches!(poll_once(&mut handle), Poll::Ready(TaskOutcome::Cancelled(_))));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstrumentationEvent {
+    PollStart,
+    PollEnd(Poll<()>),
+    Completed,
+    Panicked,
+    Cancelled,
+}
+
+#[derive(Clone)]
+struct RecordingInstrumentation(Rc<RefCell<Vec<InstrumentationEvent>>>);
+
+impl TaskInstrumentation for RecordingInstrumentation {
+    fn poll_start(&mut self) {
+        self.0.borrow_mut().push(InstrumentationEvent::PollStart);
+    }
+
+    fn poll_end(&mut self, outcome: Poll<()>) {
+        self.0.borrow_mut().push(InstrumentationEvent::PollEnd(outcome));
+    }
+
+    fn completed(&mut self) {
+        self.0.borrow_mut().push(InstrumentationEvent::Completed);
+    }
+
+    fn panicked(&mut self) {
+        self.0.borrow_mut().push(InstrumentationEvent::Panicked);
+    }
+
+    fn cancelled(&mut self) {
+        self.0.borrow_mut().push(InstrumentationEvent::Cancelled);
+    }
+}
+
+#[test]
+fn task_instrumentation_receives_each_poll_and_terminal_event() {
+    let mut executor = Executor::builder().build();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let ready = Rc::new(Cell::new(false));
+    let retained = Rc::new(RefCell::new(None));
+    let mut completion = executor
+        .tasks()
+        .task(poll_fn({
+            let ready = Rc::clone(&ready);
+            let retained = Rc::clone(&retained);
+            move |cx| {
+                if ready.get() {
+                    Poll::Ready(())
+                } else {
+                    retained.borrow_mut().replace(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }))
+        .instrument(RecordingInstrumentation(Rc::clone(&events)))
+        .inspect(|_| Some(()))
+        .register_test();
+
+    assert!(matches!(executor.execute_cycle(), CycleOutcome::Suspend));
+    ready.set(true);
+    retained.borrow().as_ref().unwrap().wake_by_ref();
+    let _ = executor.execute_cycle();
+    assert!(matches!(poll_once(&mut completion), Poll::Ready(TaskOutcome::Completed(()))));
+    assert_eq!(
+        *events.borrow(),
+        [
+            InstrumentationEvent::PollStart,
+            InstrumentationEvent::PollEnd(Poll::Pending),
+            InstrumentationEvent::PollStart,
+            InstrumentationEvent::PollEnd(Poll::Ready(())),
+            InstrumentationEvent::Completed,
+        ]
+    );
+}
+
+#[derive(Clone, Copy)]
+enum PanickingCallback {
+    Completed,
+    Panicked,
+    Cancelled,
+}
+
+struct PanicOn(PanickingCallback);
+
+impl TaskInstrumentation for PanicOn {
+    #[expect(clippy::panic, reason = "this test injects a completion callback panic")]
+    fn completed(&mut self) {
+        if matches!(self.0, PanickingCallback::Completed) {
+            panic!("completion callback");
+        }
+    }
+
+    #[expect(clippy::panic, reason = "this test injects a panic callback panic")]
+    fn panicked(&mut self) {
+        if matches!(self.0, PanickingCallback::Panicked) {
+            panic!("panic callback");
+        }
+    }
+
+    #[expect(clippy::panic, reason = "this test injects a cancellation callback panic")]
+    fn cancelled(&mut self) {
+        if matches!(self.0, PanickingCallback::Cancelled) {
+            panic!("cancellation callback");
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ObserveCancellation(Rc<Cell<bool>>);
+
+impl TaskCompletion<()> for ObserveCancellation {
+    fn completed(self, _result: ()) {}
+
+    fn panicked(self, _panic: TaskPanicPayload, _cause: Option<ShutdownCause>) {}
+
+    fn cancelled(self, _cause: ShutdownCause) {
+        self.0.set(true);
+    }
+}
+
+#[test]
+fn instrumentation_panics_do_not_prevent_task_completion_notifications() {
+    let mut executor = Executor::builder().build();
+    let mut completed = executor
+        .tasks()
+        .task(async {})
+        .instrument(PanicOn(PanickingCallback::Completed))
+        .inspect(|_| Some(()))
+        .register_test();
+    let _panic = catch_unwind(AssertUnwindSafe(|| executor.execute_cycle())).unwrap_err();
+    assert!(matches!(poll_once(&mut completed), Poll::Ready(TaskOutcome::Completed(()))));
+    drop(executor);
+
+    let mut executor = Executor::builder().build();
+    let mut panicked = executor
+        .tasks()
+        .task(poll_fn(|_| -> Poll<()> { panic!("task panic") }))
+        .instrument(PanicOn(PanickingCallback::Panicked))
+        .inspect(|_| Some(()))
+        .register_test();
+    let _panic = catch_unwind(AssertUnwindSafe(|| executor.execute_cycle())).unwrap_err();
+    let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut panicked) else {
+        panic!("panicking task must publish its payload");
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"task panic"));
+    drop(executor);
+
+    let executor = Executor::builder().build();
+    executor.shutdown().trigger(ShutdownCause::default());
+    let cancelled = Rc::new(Cell::new(false));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        executor
+            .tasks()
+            .task(async {})
+            .instrument(PanicOn(PanickingCallback::Cancelled))
+            .inspect(|_| Some(()))
+            .register(ObserveCancellation(Rc::clone(&cancelled)));
+    }));
+    let _panic = result.unwrap_err();
+    assert!(cancelled.get());
+}
+
+struct PanickingPayloadDrop(Arc<AtomicUsize>);
+
+impl Drop for PanickingPayloadDrop {
+    #[expect(clippy::panic, reason = "this test injects a panic-payload destructor panic")]
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        panic_any("panic payload destructor");
+    }
+}
+
+struct PollAndDropPanicPayload(Arc<AtomicUsize>);
+
+impl Future for PollAndDropPanicPayload {
+    type Output = ();
+
+    #[expect(clippy::panic, reason = "this test injects a task poll panic")]
+    fn poll(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        panic_any("primary task panic");
+    }
+}
+
+impl Drop for PollAndDropPanicPayload {
+    #[expect(clippy::panic, reason = "this test injects a secondary future destructor panic")]
+    fn drop(&mut self) {
+        panic_any(PanickingPayloadDrop(Arc::clone(&self.0)));
+    }
+}
+
+#[test]
+fn dropping_a_secondary_panic_payload_preserves_the_task_panic() {
+    let mut executor = Executor::builder().build();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut completion = executor.tasks().task(PollAndDropPanicPayload(Arc::clone(&drops))).register_test();
+
+    let _ = executor.execute_cycle();
+
+    let Poll::Ready(TaskOutcome::Panicked(payload)) = poll_once(&mut completion) else {
+        panic!("panicking task must publish its payload");
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"primary task panic"));
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
 }
 
 struct ReentrantIntoFuture {

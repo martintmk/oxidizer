@@ -17,9 +17,9 @@ use seismograph_runtime::snapshot::{
 };
 use seismograph_runtime::worker::WorkerRole;
 use testing_aids::{TEST_TIMEOUT, is_mutation_testing};
-use thread_aware::Unaware;
+use thread_aware::{Thread, ThreadAware, Unaware};
 
-use crate::runtime::hook::Panic;
+use crate::runtime::hook::{HookFn, Panic, TaskObserver, TaskSpawn};
 use crate::runtime::{BlockingPoolPolicy, MonitorPolicy, Runtime, WorkersPolicy};
 
 struct RecorderGuard {
@@ -56,6 +56,41 @@ fn receive<T>(receiver: &mpsc::Receiver<T>) -> T {
         receiver.recv().unwrap()
     } else {
         receiver.recv_timeout(TEST_TIMEOUT).unwrap()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedPoll {
+    Started,
+    Finished(Poll<()>),
+}
+
+#[derive(Clone)]
+struct PollObservation(mpsc::Sender<ObservedPoll>);
+
+impl ThreadAware for PollObservation {
+    fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+}
+
+struct MonitoredPollObserver {
+    destination: Option<std::thread::ThreadId>,
+    observed: PollObservation,
+}
+
+impl ThreadAware for MonitoredPollObserver {
+    fn relocate(&mut self, _source: Option<&Thread>, destination: &Thread) {
+        self.destination = Some(destination.id());
+    }
+}
+
+impl TaskObserver for MonitoredPollObserver {
+    fn poll_start(&mut self) {
+        assert_eq!(self.destination, Some(std::thread::current().id()));
+        self.observed.0.send(ObservedPoll::Started).unwrap();
+    }
+
+    fn poll_end(&mut self, outcome: Poll<()>) {
+        self.observed.0.send(ObservedPoll::Finished(outcome)).unwrap();
     }
 }
 
@@ -114,6 +149,39 @@ fn explicit_monitor_policies_preserve_runtime_behavior() {
         assert_eq!(runtime.scheduler().block_on(async |_| 42).unwrap(), 42);
         runtime.stop().unwrap();
     }
+}
+
+#[test]
+fn monitored_tasks_forward_poll_observers() {
+    let _recording = RecorderGuard::new();
+    let (observed, observations) = mpsc::channel();
+    let runtime = Runtime::builder()
+        .monitor(MonitorPolicy::enabled())
+        .workers(WorkersPolicy::exactly(1))
+        .on(Panic::IGNORE)
+        .on(HookFn::<TaskSpawn, _>::new(PollObservation(observed), |event, observed| {
+            if event.thread().is_some() {
+                event.observe(MonitoredPollObserver {
+                    destination: None,
+                    observed: observed.clone(),
+                });
+            }
+        }))
+        .build()
+        .unwrap();
+
+    runtime
+        .scheduler()
+        .block_on(async |cx| {
+            cx.scheduler().spawn(async |_| {}).await.unwrap();
+        })
+        .unwrap();
+
+    assert_eq!(
+        [receive(&observations), receive(&observations)],
+        [ObservedPoll::Started, ObservedPoll::Finished(Poll::Ready(()))]
+    );
+    runtime.stop().unwrap();
 }
 
 #[cfg(feature = "macros")]

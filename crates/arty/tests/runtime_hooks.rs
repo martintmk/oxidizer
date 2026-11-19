@@ -110,10 +110,35 @@ impl ThreadAware for SharedLog {
 }
 
 #[derive(Clone)]
-struct SpawnSourceProbe(mpsc::Sender<Option<ThreadId>>);
+struct SpawnSourceProbe {
+    events: mpsc::Sender<Option<ThreadId>>,
+    observers: mpsc::Sender<(Option<ThreadId>, ThreadId, ThreadId)>,
+}
 
 impl ThreadAware for SpawnSourceProbe {
     fn relocate(&mut self, _source: Option<&Thread>, _destination: &Thread) {}
+}
+
+struct SpawnSourceObserver {
+    source: Option<ThreadId>,
+    destination: Option<ThreadId>,
+    observations: mpsc::Sender<(Option<ThreadId>, ThreadId, ThreadId)>,
+}
+
+impl ThreadAware for SpawnSourceObserver {
+    fn relocate(&mut self, _source: Option<&Thread>, destination: &Thread) {
+        self.destination = Some(destination.id());
+    }
+}
+
+impl TaskObserver for SpawnSourceObserver {
+    fn poll_start(&mut self) {
+        self.observations
+            .send((self.source, self.destination.unwrap(), thread::current().id()))
+            .unwrap();
+    }
+
+    fn poll_end(&mut self, _outcome: Poll<()>) {}
 }
 
 struct PollRecorder {
@@ -383,32 +408,43 @@ fn spawn_hook_covers_runtime_local_relocating_and_specific_worker_submissions() 
 #[test]
 fn spawn_hook_uses_the_actual_submitting_worker() {
     let (observed, observations) = mpsc::channel();
+    let (observed_observer, observer_observations) = mpsc::channel();
     let runtime = Runtime::builder()
         .workers(WorkersPolicy::exactly(2))
-        .on(HookFn::<TaskSpawn, _>::new(SpawnSourceProbe(observed), |event, probe| {
-            probe.0.send(event.thread().map(Thread::id)).unwrap();
-        }))
+        .on(HookFn::<TaskSpawn, _>::new(
+            SpawnSourceProbe {
+                events: observed,
+                observers: observed_observer,
+            },
+            |event, probe| {
+                let source = event.thread().map(Thread::id);
+                probe.events.send(source).unwrap();
+                event.observe(SpawnSourceObserver {
+                    source,
+                    destination: None,
+                    observations: probe.observers.clone(),
+                });
+            },
+        ))
         .build()
         .unwrap();
-    let (scheduler, destination) = runtime
+    let (scheduler, destination, target) = runtime
         .scheduler()
         .block_on(async |cx| {
-            let destination = cx
-                .control()
-                .workers()
-                .into_iter()
-                .find(|worker| worker.id() != cx.thread().id())
-                .unwrap()
-                .clone();
-            (cx.scheduler().clone(), destination)
+            let workers = cx.control().workers();
+            let destination = workers.into_iter().find(|worker| worker.id() != cx.thread().id()).unwrap().clone();
+            let target = workers.into_iter().find(|worker| worker.id() == cx.thread().id()).unwrap().clone();
+            (cx.scheduler().clone(), destination, target)
         })
         .unwrap();
     for _ in observations.try_iter() {}
+    for _ in observer_observations.try_iter() {}
 
     let bound = scheduler.clone();
+    let other_worker = target.clone();
     scheduler
-        .spawn_at(&destination, bound, |bound| async move {
-            bound.spawn_anywhere((), |()| async {}).await.unwrap();
+        .spawn_at(&destination, (bound, other_worker), |(bound, other_worker)| async move {
+            bound.spawn_at(&other_worker, (), |()| async {}).await.unwrap();
         })
         .join()
         .unwrap();
@@ -416,6 +452,11 @@ fn spawn_hook_uses_the_actual_submitting_worker() {
     let sources: Vec<_> = (0..2).map(|_| observations.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
     assert!(sources.contains(&None));
     assert!(sources.contains(&Some(destination.id())));
+    let relocated: Vec<_> = (0..2)
+        .map(|_| observer_observations.recv_timeout(Duration::from_secs(5)).unwrap())
+        .collect();
+    assert!(relocated.contains(&(None, destination.id(), destination.id())));
+    assert!(relocated.contains(&(Some(destination.id()), target.id(), target.id())));
     runtime.stop().unwrap();
 }
 
