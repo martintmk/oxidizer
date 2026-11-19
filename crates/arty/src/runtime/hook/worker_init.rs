@@ -3,7 +3,7 @@
 
 use thread_aware::Thread;
 
-/// An event that runs once on each async worker after the worker initializes.
+/// ⓘ An event that runs once on each async worker after the worker initializes.
 ///
 /// Arty retains each registered callback. The callback runs once on every
 /// current worker and once on each worker that starts after registration.
