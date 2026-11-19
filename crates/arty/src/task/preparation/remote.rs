@@ -70,12 +70,7 @@ pub(crate) struct RemoteFutureFactory {
 pub(crate) struct RegisteredRemoteTask;
 
 impl RemoteFutureFactory {
-    #[cfg(test)]
-    pub(crate) fn new(factory: impl FnOnce(Context, &TaskSet) + Send + 'static) -> Self {
-        Self::new_observed(move |cx, tasks, _observers| factory(cx, tasks), false)
-    }
-
-    fn new_observed(factory: impl FnOnce(Context, &TaskSet, Option<TaskObservers>) + Send + 'static, requires_spawn: bool) -> Self {
+    pub(crate) fn new(factory: impl FnOnce(Context, &TaskSet, Option<TaskObservers>) + Send + 'static, requires_spawn: bool) -> Self {
         let factory = Cell::new(Some(factory));
         // A pooled box cannot move an erased FnOnce out of its slot. Take the concrete
         // closure through Cell instead, without requiring its captures to be Unpin.
@@ -140,7 +135,7 @@ where
 {
     let (handle, result_tx) = result_pool.handle();
     let future_factory = TaskFactory::new(future_factory);
-    let future_factory = RemoteFutureFactory::new_observed(
+    let future_factory = RemoteFutureFactory::new(
         move |cx, tasks, observers| {
             let observers = observers.map(|mut observers| {
                 observers.relocate_to(cx.thread());
@@ -181,7 +176,7 @@ mod tests {
 
     impl Drop for FactoryOnDrop {
         fn drop(&mut self) {
-            drop(RemoteFutureFactory::new(|_, _| {}));
+            drop(RemoteFutureFactory::new(|_, _, _| {}, false));
             self.0.send(()).unwrap();
         }
     }
@@ -190,11 +185,11 @@ mod tests {
     fn remote_factory_reuses_its_pool_slot() {
         fn factory(_: Context, _: &TaskSet) {}
 
-        let first = RemoteFutureFactory::new(factory);
+        let first = RemoteFutureFactory::new(move |cx, tasks, _| factory(cx, tasks), false);
         let address = std::ptr::from_ref(&*first.inner).cast::<()>();
         let chunks = FUTURE_FACTORIES.with(MultiPool::chunks_allocated);
         drop(first);
-        let second = RemoteFutureFactory::new(factory);
+        let second = RemoteFutureFactory::new(move |cx, tasks, _| factory(cx, tasks), false);
 
         assert_eq!(std::ptr::from_ref(&*second.inner).cast::<()>(), address);
         assert_eq!(FUTURE_FACTORIES.with(MultiPool::chunks_allocated), chunks);
