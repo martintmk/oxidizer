@@ -118,6 +118,7 @@ struct TaskIdentity {
 pub(crate) struct TaskInfo {
     metadata: TaskMetadata,
     identity: OnceLock<TaskIdentity>,
+    queued_at: OnceLock<EventTimestamp>,
     execution_events: OnceLock<EventContext>,
 }
 
@@ -128,6 +129,7 @@ impl TaskInfo {
         Self {
             metadata,
             identity,
+            queued_at: OnceLock::new(),
             execution_events: OnceLock::new(),
         }
     }
@@ -137,14 +139,38 @@ impl TaskInfo {
     }
 
     pub(crate) fn describe(&self, state: TaskActivityState) -> Task {
-        self.metadata
-            .describe(self.identity.get_or_init(|| self.metadata.identity()), state)
+        let mut task = self
+            .metadata
+            .describe(self.identity.get_or_init(|| self.metadata.identity()), state);
+        if state == TaskActivityState::Ready
+            && let Some(queued_at) = self.queued_at.get().copied()
+        {
+            let activity = task.activity.as_mut().expect("Task::new always supplies activity");
+            activity.ready_since = Some(queued_at);
+            activity.queued_since = Some(queued_at);
+        }
+        task
     }
 
-    pub(crate) fn started_on(&self, events: EventContext) {
+    pub(crate) fn queued(&self, queue_depth: usize) {
+        self.queued_at
+            .set(EventTimestamp::now())
+            .expect("a blocking function enters the scheduler queue once");
+        if seismograph::recorder::is_enabled(EventClass::RuntimeTask) {
+            self.metadata
+                .events
+                .enqueued(self.id(), u64::try_from(queue_depth).unwrap_or(u64::MAX));
+        }
+    }
+
+    pub(crate) fn started_on(&self, events: EventContext) -> EventTimestamp {
         self.execution_events
             .set(events)
             .expect("a blocking function starts on exactly one worker");
+        self.queued_at
+            .get()
+            .copied()
+            .expect("a blocking worker executes functions only after the queue accepts them")
     }
 
     pub(crate) fn completed(&self) {

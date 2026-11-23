@@ -29,9 +29,9 @@ pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) use asynchronous::WorkerDiagnostics;
-#[cfg(any(test, feature = "monitor"))]
 pub(crate) use blocking::MonitoredBlockingJob;
-pub(crate) use blocking::{BlockingJob, BlockingPoolMonitoring, BlockingTaskEvents, BlockingTaskMonitoring, BlockingWorkerMonitoring};
+#[cfg(any(test, feature = "monitor"))]
+pub(crate) use blocking::{BlockingJob, BlockingPoolMonitoring, BlockingTaskMonitoring, BlockingTaskOutcome, BlockingWorkerMonitoring};
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) use runtime::RuntimeDiagnostics;
 #[cfg(any(test, feature = "monitor"))]

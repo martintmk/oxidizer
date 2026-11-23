@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use super::super::app::{RUNTIME_HISTOGRAM_BINS, RuntimeFocus, RuntimeViewState, TaskHistogram};
-use super::super::data::{CapturedSnapshot, RuntimeMonitorSnapshot, RuntimeTaskSummary, RuntimeWorkerSummary};
+use super::super::data::{CapturedSnapshot, RuntimeMonitorSnapshot, RuntimeTaskSummary, RuntimeWorkerMode, RuntimeWorkerSummary};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::runtime_timeline::{ExecutionMetrics, HistogramBin, Interval, TimeWindow, bins, histogram};
 use super::{draw_empty_panel_with_message, format_count, format_runtime_duration};
@@ -17,16 +17,16 @@ use super::{draw_empty_panel_with_message, format_count, format_runtime_duration
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
     mouse: &MouseRows,
-    [workers, tasks, worker_activity, task_activity, events_area]: [Rect; 5],
+    [workers_area, tasks, worker_statistics, task_activity, events_area]: [Rect; 5],
     capture: Option<&CapturedSnapshot>,
     unavailable: Option<&str>,
     view: RuntimeViewState,
 ) {
     let Some(capture) = capture else {
         for (area, title) in [
-            (workers, " Runtime Workers "),
+            (workers_area, " Runtime Workers "),
             (tasks, " Tasks "),
-            (worker_activity, " Worker Activity "),
+            (worker_statistics, " Worker Statistics "),
             (task_activity, " Task Statistics "),
         ] {
             draw_empty_panel_with_message(frame, area, title, unavailable);
@@ -35,18 +35,30 @@ pub(super) fn draw(
         return;
     };
     let runtime = &capture.runtime;
-    let selected = view.worker_selected.min(runtime.workers.len().saturating_sub(1));
-    let worker = runtime.workers.get(selected);
-    draw_workers(frame, mouse, workers, runtime, view, capture.filter_summary.active);
-    let sorted = worker.map_or_else(Vec::new, |worker| worker.sorted_tasks(view.task_sort, view.task_sort_descending));
-    draw_tasks(frame, mouse, tasks, &sorted, view);
+    let workers = runtime
+        .workers
+        .iter()
+        .filter(|worker| worker.is_visible_in(view.worker_mode))
+        .collect::<Vec<_>>();
+    let selected = view.worker_selected.min(workers.len().saturating_sub(1));
+    let worker = workers.get(selected).copied();
+    draw_workers(frame, mouse, workers_area, runtime, &workers, view, capture.filter_summary.active);
+    let blocking = worker.is_some_and(RuntimeWorkerSummary::is_blocking);
+    let sorted = worker.map_or_else(Vec::new, |worker| {
+        if blocking {
+            worker.sorted_blocking_tasks(view.task_sort, view.task_sort_descending)
+        } else {
+            worker.sorted_tasks(view.task_sort, view.task_sort_descending)
+        }
+    });
+    draw_tasks(frame, mouse, tasks, &sorted, blocking, view);
     let selected = view.task_selected.min(sorted.len().saturating_sub(1));
     let task = sorted.get(selected).copied();
     if let Some(worker) = worker {
-        draw_worker_activity(frame, mouse, worker_activity, worker, view);
-        draw_task_details(frame, mouse, task_activity, task, worker.window, view);
+        draw_worker_activity(frame, mouse, worker_statistics, worker, view);
+        draw_task_details(frame, mouse, task_activity, task, worker.window, blocking, view);
     } else {
-        draw_empty_panel_with_message(frame, worker_activity, " Worker Activity ", Some("Select a worker."));
+        draw_empty_panel_with_message(frame, worker_statistics, " Worker Statistics ", Some("Select a worker."));
         draw_empty_panel_with_message(frame, task_activity, " Task Statistics ", Some("Select a task."));
     }
     super::task_events_ui::draw(frame, mouse, events_area, task, Some(&capture.task_events), view);
@@ -101,11 +113,89 @@ fn axis(window: Option<TimeWindow>) -> String {
     )
 }
 
+fn draw_worker_mode_toggle(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, mode: RuntimeWorkerMode) {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Async", selection(mode == RuntimeWorkerMode::Async)),
+            Span::raw(" | "),
+            Span::styled("Blocking", selection(mode == RuntimeWorkerMode::Blocking)),
+            Span::raw(" · w toggle"),
+        ])),
+        area,
+    );
+    for (offset, width, mode) in [(0, 5, RuntimeWorkerMode::Async), (8, 8, RuntimeWorkerMode::Blocking)] {
+        mouse.register_tab(
+            Rect::new(area.x.saturating_add(offset), area.y, width, area.height).intersection(area),
+            ListTarget::RuntimeWorkerMode(mode),
+        );
+    }
+}
+
+fn worker_row(worker: &RuntimeWorkerSummary, mode: RuntimeWorkerMode) -> Row<'static> {
+    let thread = if worker.worker_id.is_none() {
+        "unassigned".into()
+    } else {
+        worker.thread_id.map_or_else(|| "?".into(), |id| format!("#{id}"))
+    };
+    let name = match worker.worker_id {
+        None => format!("unassigned / {}", worker.runtime_name),
+        Some(id) => format!("{}:w{id} / {thread} {}", worker.runtime_id, worker.runtime_name),
+    };
+    let mut cells = vec![Cell::from(name)];
+    if mode == RuntimeWorkerMode::Blocking {
+        cells.extend([
+            Cell::from(Line::from(format_count(worker.metrics.poll_count)).right_aligned()),
+            Cell::from(Line::from(worker.max_queued_tasks.map_or_else(|| "-".into(), format_count)).right_aligned()),
+            Cell::from(Line::from(duration(worker.metrics.max_poll_nanos)).right_aligned()),
+            Cell::from(Line::from(duration(worker.max_blocking_queue_nanos())).right_aligned()),
+        ]);
+    } else {
+        cells.push(Cell::from(worker.state.clone()));
+        cells.extend([
+            Cell::from(Line::from(worker.observed_tasks.to_string()).right_aligned()),
+            Cell::from(Line::from(format_count(worker.metrics.poll_count)).right_aligned()),
+            Cell::from(Line::from(fraction(worker.metrics.executing_fraction)).right_aligned()),
+            Cell::from(Line::from(duration(worker.metrics.median_poll_nanos)).right_aligned()),
+            Cell::from(Line::from(duration(worker.metrics.max_poll_nanos)).right_aligned()),
+        ]);
+    }
+    Row::new(cells)
+}
+
+fn worker_columns(mode: RuntimeWorkerMode) -> (Vec<Constraint>, Vec<&'static str>) {
+    if mode == RuntimeWorkerMode::Blocking {
+        (
+            vec![
+                Constraint::Length(20),
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(8),
+            ],
+            vec!["Runtime / thread", "Exec #", "Queue peak", "Exec max", "Wait max"],
+        )
+    } else {
+        (
+            [20, 9, 5, 6, 10, 11, 11].map(Constraint::Length).into(),
+            vec![
+                "Runtime / thread",
+                "State",
+                "Tasks",
+                "Polls",
+                "Observed %",
+                "Median poll",
+                "Max poll",
+            ],
+        )
+    }
+}
+
 fn draw_workers(
     frame: &mut ratatui::Frame<'_>,
     mouse: &MouseRows,
     area: Rect,
     runtime: &RuntimeMonitorSnapshot,
+    workers: &[&RuntimeWorkerSummary],
     view: RuntimeViewState,
     filtered: bool,
 ) {
@@ -116,7 +206,12 @@ fn draw_workers(
         " Runtime Workers · {} runtime events · source retained {}/{} accepted · {} overwritten · Enter tasks · F1 ",
         runtime.runtime_events, runtime.retained_events, runtime.total_events, runtime.lost_events
     );
-    if runtime.workers.is_empty() {
+    let shell = block(title, view.focus == RuntimeFocus::Workers);
+    let inner = shell.inner(area);
+    frame.render_widget(shell, area);
+    let [mode_area, table_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    draw_worker_mode_toggle(frame, mouse, mode_area, view.worker_mode);
+    if workers.is_empty() {
         let lines = if filtered {
             vec![
                 "No matching runtime activity.",
@@ -127,70 +222,47 @@ fn draw_workers(
                 "No runtime source or runtime events in this snapshot.",
                 "Use an instrumented runtime (e.g. oxidizer_rt); the recorder alone does not instrument executors.",
             ]
-        } else {
+        } else if runtime.workers.is_empty() {
             vec![
                 "No runtime workers or tasks were recorded.",
                 "Enable Runtime tasks and capture instrumented activity.",
             ]
+        } else {
+            vec![match view.worker_mode {
+                RuntimeWorkerMode::Async => "No async workers were recorded.",
+                RuntimeWorkerMode::Blocking => "No blocking workers were recorded.",
+            }]
         };
-        frame.render_widget(
-            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()).block(block(title, view.focus == RuntimeFocus::Workers)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()), table_area);
         return;
     }
-    let selected = view.worker_selected.min(runtime.workers.len().saturating_sub(1));
-    let visible = usize::from(area.height.saturating_sub(3));
+    let selected = view.worker_selected.min(workers.len().saturating_sub(1));
+    let visible = usize::from(table_area.height.saturating_sub(1));
     let first = selected.saturating_sub(visible.saturating_sub(1));
-    let wide = area.width >= 110;
-    let graph_width = usize::from(area.width.saturating_sub(if wide { 93 } else { 67 }));
-    let rows = runtime.workers.iter().skip(first).take(visible).map(|worker| {
-        let thread = if worker.worker_id.is_none() {
-            "unassigned".into()
-        } else {
-            worker.thread_id.map_or_else(|| "?".into(), |id| format!("#{id}"))
-        };
-        let name = match worker.worker_id {
-            None => format!("unassigned / {}", worker.runtime_name),
-            Some(id) => format!("{}:w{id} / {thread} {}", worker.runtime_id, worker.runtime_name),
-        };
-        let mut cells = vec![Cell::from(name)];
-        if wide {
-            cells.extend([Cell::from(worker.role.clone()), Cell::from(worker.state.clone())]);
-        }
-        cells.extend([
-            Cell::from(Line::from(worker.observed_tasks.to_string()).right_aligned()),
-            Cell::from(Line::from(format_count(worker.metrics.poll_count)).right_aligned()),
-            Cell::from(Line::from(fraction(worker.metrics.executing_fraction)).right_aligned()),
-            Cell::from(Line::from(duration(worker.metrics.median_poll_nanos)).right_aligned()),
-            Cell::from(Line::from(duration(worker.metrics.max_poll_nanos)).right_aligned()),
-            Cell::from(timeline(&worker.metrics.polls, worker.window, graph_width, Color::Cyan)),
-        ]);
-        Row::new(cells)
-    });
-    let mut widths = vec![Constraint::Length(if wide { 22 } else { 16 })];
-    let mut headers = vec!["Runtime / thread"];
-    if wide {
-        widths.extend([Constraint::Length(9), Constraint::Length(9)]);
-        headers.extend(["Role", "State"]);
-    }
-    widths.extend([5, 6, 10, 11, 11].map(Constraint::Length));
-    widths.push(Constraint::Min(1));
-    headers.extend(["Tasks", "Polls", "Observed %", "Median poll", "Max poll", "Poll timeline"]);
+    let rows = workers
+        .iter()
+        .skip(first)
+        .take(visible)
+        .map(|worker| worker_row(worker, view.worker_mode));
+    let (widths, headers) = worker_columns(view.worker_mode);
     let table = Table::new(rows, widths)
         .header(Row::new(headers).bold())
         .column_spacing(1)
-        .row_highlight_style(selection(view.focus == RuntimeFocus::Workers))
-        .block(block(title, view.focus == RuntimeFocus::Workers));
+        .row_highlight_style(selection(view.focus == RuntimeFocus::Workers));
     let mut state = TableState::default().with_selected(Some(selected.saturating_sub(first)));
-    frame.render_stateful_widget(table, area, &mut state);
-    mouse.register(
-        area,
-        1,
-        first.saturating_add(state.offset()),
-        runtime.workers.len(),
-        ListTarget::RuntimeWorkers,
-    );
+    frame.render_stateful_widget(table, table_area, &mut state);
+    let data_y = table_area.y.saturating_add(1);
+    for offset in 0..table_area.height.saturating_sub(1) {
+        let index = first.saturating_add(state.offset()).saturating_add(usize::from(offset));
+        if index >= workers.len() {
+            break;
+        }
+        mouse.register_item(
+            Rect::new(table_area.x, data_y.saturating_add(offset), table_area.width, 1),
+            ListTarget::RuntimeWorkers,
+            index,
+        );
+    }
 }
 
 fn selection(focused: bool) -> Style {
@@ -221,18 +293,78 @@ fn task_row(task: &RuntimeTaskSummary) -> Row<'static> {
     )
 }
 
-fn draw_tasks(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, tasks: &[&RuntimeTaskSummary], view: RuntimeViewState) {
+fn blocking_task_row(task: &RuntimeTaskSummary) -> Row<'static> {
+    Row::new(
+        [
+            format!("#{}", task.task_id),
+            task.state.clone(),
+            duration(task.blocking_execution_nanos()),
+            duration(task.blocking_queue_nanos()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let line = Line::from(value);
+            Cell::from(if index >= 2 { line.right_aligned() } else { line })
+        }),
+    )
+}
+
+fn draw_tasks(
+    frame: &mut ratatui::Frame<'_>,
+    mouse: &MouseRows,
+    area: Rect,
+    tasks: &[&RuntimeTaskSummary],
+    blocking: bool,
+    view: RuntimeViewState,
+) {
     if area.is_empty() {
         return;
     }
     let selected = view.task_selected.min(tasks.len().saturating_sub(1));
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
+    let sort = if blocking {
+        view.task_sort.blocking()
+    } else {
+        view.task_sort.asynchronous()
+    };
     let title = format!(
-        " Tasks · this worker · {} {} · [/] sort · r reverse · Enter details · Backspace workers ",
-        view.task_sort.label(),
+        " {}Tasks · this worker · {} {} · [/] sort · r reverse · Enter details · Backspace workers ",
+        if blocking { "Blocking " } else { "" },
+        sort.label(),
         if view.task_sort_descending { "desc" } else { "asc" }
     );
+    if blocking {
+        let table = Table::new(
+            tasks.iter().skip(first).take(visible).map(|task| blocking_task_row(task)),
+            [
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+        .header(
+            Row::new(
+                ["ID", "State", "Exec time", "Queue time"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        let line = Line::from(label);
+                        Cell::from(if index >= 2 { line.right_aligned() } else { line })
+                    }),
+            )
+            .bold(),
+        )
+        .column_spacing(1)
+        .row_highlight_style(selection(view.focus == RuntimeFocus::Tasks))
+        .block(block(title, view.focus == RuntimeFocus::Tasks));
+        let mut state = TableState::default().with_selected((!tasks.is_empty()).then_some(selected.saturating_sub(first)));
+        frame.render_stateful_widget(table, area, &mut state);
+        mouse.register(area, 1, first.saturating_add(state.offset()), tasks.len(), ListTarget::RuntimeTasks);
+        return;
+    }
     let table = Table::new(
         tasks.iter().skip(first).take(visible).map(|task| task_row(task)),
         [9, 13, 10, 7, 10, 11, 11].map(Constraint::Length),
@@ -275,7 +407,25 @@ fn draw_worker_activity(
     if area.is_empty() {
         return;
     }
-    let shell = block(" Worker Activity · F1 ", false);
+    if worker.is_blocking() {
+        let shell = block(" Blocking Worker Statistics · F1 ", false);
+        let inner = shell.inner(area);
+        frame.render_widget(shell, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("Exec total {}", worker.metrics.poll_count)),
+                Line::from(format!(
+                    "Queue peak {}",
+                    worker.max_queued_tasks.map_or_else(|| "-".into(), format_count)
+                )),
+                Line::from(format!("Exec max {}", duration(worker.metrics.max_poll_nanos))),
+                Line::from(format!("Wait max {}", duration(worker.max_blocking_queue_nanos()))),
+            ]),
+            inner,
+        );
+        return;
+    }
+    let shell = block(" Worker Statistics · F1 ", false);
     let inner = shell.inner(area);
     frame.render_widget(shell, area);
     let summary_height = inner.height.saturating_sub(5).min(4);
@@ -295,12 +445,14 @@ fn draw_worker_activity(
     if summary_height >= 4 {
         lines.push(Line::from(axis(worker.window)));
     }
-    lines.push(timeline(
+    let mut poll_timeline = timeline(
         &worker.metrics.polls,
         worker.window,
-        usize::from(inner.width),
+        usize::from(inner.width.saturating_sub(14)),
         Color::Cyan,
-    ));
+    );
+    poll_timeline.spans.insert(0, Span::raw("Poll timeline "));
+    lines.push(poll_timeline);
     frame.render_widget(Paragraph::new(lines), summary);
     draw_histogram(frame, mouse, distribution, "Poll · worker", &worker.metrics.poll_samples, view);
 }
@@ -311,6 +463,7 @@ fn draw_task_details(
     area: Rect,
     task: Option<&RuntimeTaskSummary>,
     window: Option<TimeWindow>,
+    blocking: bool,
     view: RuntimeViewState,
 ) {
     if area.is_empty() {
@@ -320,6 +473,23 @@ fn draw_task_details(
         draw_empty_panel_with_message(frame, area, " Task Statistics ", Some("Select a task."));
         return;
     };
+    if blocking {
+        let shell = block(
+            format!(" Blocking Task Statistics · #{} · F1 ", task.task_id),
+            view.focus == RuntimeFocus::Activity,
+        );
+        let inner = shell.inner(area);
+        frame.render_widget(shell, area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!("State {}", task.state)),
+                Line::from(format!("Execution time {}", duration(task.blocking_execution_nanos()))),
+                Line::from(format!("Queue time {}", duration(task.blocking_queue_nanos()))),
+            ]),
+            inner,
+        );
+        return;
+    }
     let shell = block(
         format!(" Task Statistics · #{} · F1 ", task.task_id),
         view.focus == RuntimeFocus::Activity,
@@ -598,13 +768,13 @@ mod tests {
         for (row, title) in [
             (0, "Runtime Workers"),
             (6, "Tasks"),
-            (12, "Worker Activity"),
+            (12, "Worker Statistics"),
             (18, "Task Statistics"),
         ] {
             assert!(lines[row].contains(title), "{}", lines[row]);
         }
         let (buffer, _) = render(40, 8, |frame, mouse, area| {
-            draw_task_details(frame, mouse, area, None, None, view);
+            draw_task_details(frame, mouse, area, None, None, false, view);
         });
         assert!(text(&buffer).contains("Task Statistics"));
         assert!(text(&buffer).contains("Select a task."));
@@ -626,10 +796,13 @@ mod tests {
             ..RuntimeMonitorSnapshot::default()
         };
         view.worker_selected = 2;
-        let (buffer, mouse) = render(120, 5, |frame, mouse, area| draw_workers(frame, mouse, area, &runtime, view, false));
-        assert_eq!(mouse.at(buffer.area, 1, 2), Some((ListTarget::RuntimeWorkers, 1)));
-        assert_eq!(mouse.at(buffer.area, 1, 3), Some((ListTarget::RuntimeWorkers, 2)));
-        assert_eq!(buffer[(1, 3)].bg, Color::Cyan);
+        let workers = runtime.workers.iter().collect::<Vec<_>>();
+        let (buffer, mouse) = render(120, 6, |frame, mouse, area| {
+            draw_workers(frame, mouse, area, &runtime, &workers, view, false);
+        });
+        assert_eq!(mouse.at(buffer.area, 1, 3), Some((ListTarget::RuntimeWorkers, 1)));
+        assert_eq!(mouse.at(buffer.area, 1, 4), Some((ListTarget::RuntimeWorkers, 2)));
+        assert_eq!(buffer[(1, 4)].bg, Color::Cyan);
         let output = text(&buffer);
         assert!(output.contains("worker2"));
         assert!(output.contains("worker3"));
@@ -644,13 +817,173 @@ mod tests {
         let tasks = tasks.iter().collect::<Vec<_>>();
         view.focus = RuntimeFocus::Tasks;
         view.task_selected = 2;
-        let (buffer, mouse) = render(100, 5, |frame, mouse, area| draw_tasks(frame, mouse, area, &tasks, view));
+        let (buffer, mouse) = render(100, 5, |frame, mouse, area| draw_tasks(frame, mouse, area, &tasks, false, view));
         assert_eq!(mouse.at(buffer.area, 1, 2), Some((ListTarget::RuntimeTasks, 1)));
         assert_eq!(mouse.at(buffer.area, 1, 3), Some((ListTarget::RuntimeTasks, 2)));
         assert_eq!(buffer[(1, 3)].bg, Color::Cyan);
         assert!(text(&buffer).contains("#2"));
         assert!(text(&buffer).contains("#3"));
         assert!(!text(&buffer).contains("#4"));
+    }
+
+    #[test]
+    fn blocking_worker_uses_dedicated_tasks_activity_and_statistics() {
+        let (io, _) = seismograph_protocol::io::MonitorIo::new_mocked();
+        let view = super::super::super::app::App::with_io(io).runtime_view;
+        let tasks = [
+            RuntimeTaskSummary {
+                task_id: 7,
+                state: "Completed".into(),
+                metrics: ExecutionMetrics {
+                    poll_samples: vec![25],
+                    ready_samples: vec![10].into(),
+                    ..ExecutionMetrics::default()
+                },
+                ..RuntimeTaskSummary::default()
+            },
+            RuntimeTaskSummary {
+                task_id: 8,
+                state: "Ready".into(),
+                activity: super::super::super::runtime::TaskActivitySummary {
+                    state: "Ready".into(),
+                    ready_for: Some(15),
+                    ..Default::default()
+                },
+                ..RuntimeTaskSummary::default()
+            },
+        ];
+        let task_refs = tasks.iter().collect::<Vec<_>>();
+        let worker = RuntimeWorkerSummary {
+            role: "Blocking".into(),
+            max_queued_tasks: Some(3),
+            metrics: ExecutionMetrics {
+                poll_count: 4,
+                max_poll_nanos: Some(25),
+                ..ExecutionMetrics::default()
+            },
+            tasks: tasks.to_vec(),
+            ..RuntimeWorkerSummary::default()
+        };
+
+        let (tasks, _) = render(60, 8, |frame, mouse, area| {
+            draw_tasks(frame, mouse, area, &task_refs, true, view);
+        });
+        let tasks = text(&tasks);
+        for expected in ["Blocking Tasks", "ID", "State", "Exec time", "Queue time", "25ns", "10ns", "15ns"] {
+            assert!(tasks.contains(expected), "{tasks}");
+        }
+        for absent in ["Future B", "Polls", "Observed %", "Median poll", "Max poll"] {
+            assert!(!tasks.contains(absent), "{tasks}");
+        }
+
+        let (activity, _) = render(60, 6, |frame, mouse, area| {
+            draw_worker_activity(frame, mouse, area, &worker, view);
+        });
+        let activity = text(&activity);
+        assert!(activity.contains("Blocking Worker Statistics"));
+        assert!(activity.contains("Exec total 4"));
+        assert!(activity.contains("Queue peak 3"));
+        assert!(activity.contains("Exec max 25ns"));
+        assert!(activity.contains("Wait max 15ns"));
+
+        let (statistics, _) = render(60, 7, |frame, mouse, area| {
+            draw_task_details(frame, mouse, area, Some(&worker.tasks[0]), None, true, view);
+        });
+        let statistics = text(&statistics);
+        assert!(statistics.contains("Blocking Task Statistics"));
+        assert!(statistics.contains("State Completed"));
+        assert!(statistics.contains("Execution time 25ns"));
+        assert!(statistics.contains("Queue time 10ns"));
+        assert!(!statistics.contains("Poll | Ready"));
+    }
+
+    #[test]
+    fn worker_mode_toggle_filters_rows_and_changes_columns() {
+        let (io, _) = seismograph_protocol::io::MonitorIo::new_mocked();
+        let mut view = super::super::super::app::App::with_io(io).runtime_view;
+        let runtime = RuntimeMonitorSnapshot {
+            workers: vec![
+                RuntimeWorkerSummary {
+                    runtime_name: "async".into(),
+                    worker_id: Some(1),
+                    role: "Core".into(),
+                    tasks: vec![RuntimeTaskSummary {
+                        task_id: 1,
+                        state: "Completed".into(),
+                        ..RuntimeTaskSummary::default()
+                    }],
+                    ..RuntimeWorkerSummary::default()
+                },
+                RuntimeWorkerSummary {
+                    runtime_name: "block".into(),
+                    worker_id: Some(2),
+                    role: "Blocking".into(),
+                    max_queued_tasks: Some(4),
+                    metrics: ExecutionMetrics {
+                        poll_count: 7,
+                        max_poll_nanos: Some(50),
+                        ..ExecutionMetrics::default()
+                    },
+                    tasks: vec![RuntimeTaskSummary {
+                        activity: super::super::super::runtime::TaskActivitySummary {
+                            state: "Ready".into(),
+                            ready_for: Some(30),
+                            ..Default::default()
+                        },
+                        ..RuntimeTaskSummary::default()
+                    }],
+                    ..RuntimeWorkerSummary::default()
+                },
+            ],
+            ..RuntimeMonitorSnapshot::default()
+        };
+        assert_eq!(view.selected_task(&runtime).map(|task| task.state.as_str()), Some("Completed"));
+
+        let async_workers = runtime
+            .workers
+            .iter()
+            .filter(|worker| worker.is_visible_in(view.worker_mode))
+            .collect::<Vec<_>>();
+        let (async_buffer, mouse) = render(100, 8, |frame, mouse, area| {
+            draw_workers(frame, mouse, area, &runtime, &async_workers, view, false);
+        });
+        let async_text = text(&async_buffer);
+        assert!(async_text.contains("async"));
+        assert!(!async_text.contains("blocking"));
+        assert!(async_text.contains("Observed %"));
+        assert!(!async_text.contains("Queue peak"));
+        assert_eq!(
+            mouse.at(async_buffer.area, 1, 1),
+            Some((ListTarget::RuntimeWorkerMode(RuntimeWorkerMode::Async), 0))
+        );
+        assert_eq!(
+            mouse.at(async_buffer.area, 9, 1),
+            Some((ListTarget::RuntimeWorkerMode(RuntimeWorkerMode::Blocking), 0))
+        );
+
+        view.worker_mode = RuntimeWorkerMode::Blocking;
+        let blocking_workers = runtime
+            .workers
+            .iter()
+            .filter(|worker| worker.is_visible_in(view.worker_mode))
+            .collect::<Vec<_>>();
+        let (blocking_buffer, _) = render(60, 8, |frame, mouse, area| {
+            draw_workers(frame, mouse, area, &runtime, &blocking_workers, view, false);
+        });
+        let blocking_text = text(&blocking_buffer);
+        assert!(blocking_text.contains("0:w2"));
+        assert!(!blocking_text.contains("0:w1 / ? async"));
+        assert!(blocking_text.contains("Runtime / thread"));
+        for heading in ["Exec #", "Queue peak", "Exec max", "Wait max"] {
+            assert!(blocking_text.contains(heading), "{blocking_text}");
+        }
+        for heading in ["Tasks ", "Polls", "Observed %", "Median poll", "Max poll", "Role"] {
+            assert!(!blocking_text.contains(heading), "{blocking_text}");
+        }
+        assert!(blocking_text.contains('7'));
+        assert!(blocking_text.contains('4'));
+        assert!(blocking_text.contains("50ns"));
+        assert!(blocking_text.contains("30ns"), "{blocking_text}");
     }
 
     #[test]
@@ -683,8 +1016,9 @@ mod tests {
                 runtime_events: events,
                 ..RuntimeMonitorSnapshot::default()
             };
+            let workers = runtime.workers.iter().collect::<Vec<_>>();
             let (buffer, _) = render(120, 6, |frame, mouse, area| {
-                draw_workers(frame, mouse, area, &runtime, view, filtered);
+                draw_workers(frame, mouse, area, &runtime, &workers, view, filtered);
             });
             let output = text(&buffer);
             for phrase in expected {
@@ -735,8 +1069,9 @@ mod tests {
             let (buffer, _) = render(100, height, |frame, mouse, area| {
                 draw_worker_activity(frame, mouse, area, &worker, view);
             });
-            assert_eq!(buffer[(1, summary_height)].symbol(), "▁");
+            assert_eq!(buffer[(15, summary_height)].symbol(), "▁");
             let output = text(&buffer);
+            assert!(output.contains("Poll timeline"));
             assert_eq!(output.contains("Median - · max -"), summary_height >= 3);
             assert_eq!(output.contains("Window 1s · lower bound"), summary_height >= 4);
         }
@@ -753,7 +1088,7 @@ mod tests {
             assert_eq!(output.contains("Ready global "), height >= 10);
         }
         let (buffer, _) = render(100, 3, |frame, mouse, area| {
-            draw_task_details(frame, mouse, area, Some(&task), worker.window, view);
+            draw_task_details(frame, mouse, area, Some(&task), worker.window, false, view);
         });
         assert!(text(&buffer).contains("Poll | Ready · t"));
     }
@@ -892,7 +1227,7 @@ mod tests {
         let mut view = super::super::super::app::App::new().runtime_view;
         view.task_histogram = TaskHistogram::Ready;
         let (buffer, _) = render(40, 24, |frame, mouse, area| {
-            draw_task_details(frame, mouse, area, Some(&task), None, view);
+            draw_task_details(frame, mouse, area, Some(&task), None, false, view);
         });
         let text = text(&buffer);
         assert!(text.contains("Wake-to-poll (raw)"));
@@ -1040,7 +1375,7 @@ mod tests {
             let mut view = super::super::super::app::App::new().runtime_view;
             view.task_histogram = selected;
             let (buffer, mouse) = render(40, 24, |frame, mouse, area| {
-                draw_task_details(frame, mouse, area, Some(&task), None, view);
+                draw_task_details(frame, mouse, area, Some(&task), None, false, view);
             });
             assert!(text(&buffer).contains(&format!("{heading} · n={count}")));
             assert!(!text(&buffer).contains("Wake-to-poll"));
@@ -1065,7 +1400,7 @@ mod tests {
             }
 
             let (compact, _) = render(40, 11, |frame, mouse, area| {
-                draw_task_details(frame, mouse, area, Some(&task), None, view);
+                draw_task_details(frame, mouse, area, Some(&task), None, false, view);
             });
             assert!(text(&compact).contains(if selected == TaskHistogram::Poll {
                 "Poll worker"
@@ -1095,7 +1430,7 @@ mod tests {
                 draw_worker_activity(frame, mouse, area, &worker, view);
             });
             let (task, _) = render(40, height, |frame, mouse, area| {
-                draw_task_details(frame, mouse, area, Some(&task), None, view);
+                draw_task_details(frame, mouse, area, Some(&task), None, false, view);
             });
             for buffer in [worker, task] {
                 let baseline = baseline(&buffer);
@@ -1117,7 +1452,7 @@ mod tests {
                     let area = Rect::new(2, 2, width, height);
                     render(10, 12, |frame, mouse, _| draw_histogram(frame, mouse, area, "Poll", samples, view));
                     render(10, 12, |frame, mouse, _| {
-                        draw_task_details(frame, mouse, area, Some(&task), None, view);
+                        draw_task_details(frame, mouse, area, Some(&task), None, false, view);
                     });
                 }
             }

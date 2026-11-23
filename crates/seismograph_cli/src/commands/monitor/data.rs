@@ -7,7 +7,9 @@ use std::time::{Instant, SystemTime};
 
 use seismograph::recorder::event::{Event, EventKind};
 
-pub(super) use super::runtime::{RuntimeMonitorSnapshot, RuntimeTaskSort, RuntimeTaskSummary, RuntimeWorkerSummary, runtime_task_id};
+pub(super) use super::runtime::{
+    RuntimeMonitorSnapshot, RuntimeTaskSort, RuntimeTaskSummary, RuntimeWorkerMode, RuntimeWorkerSummary, runtime_task_id,
+};
 
 pub(super) struct CapturedSnapshot {
     pub(super) native: Option<Arc<seismograph_rallocator::native::Snapshot>>,

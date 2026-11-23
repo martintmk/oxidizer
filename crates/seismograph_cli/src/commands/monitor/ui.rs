@@ -2709,7 +2709,7 @@ mod tests {
         let panels = app.panels.arrange(MonitorTab::Runtime, content).areas;
         assert_eq!(panels[1].width, 68);
         for (pane, target) in [(panels[0], ListTarget::RuntimeWorkers), (panels[1], ListTarget::RuntimeTasks)] {
-            let first_row = pane.y + 2;
+            let first_row = pane.y + if target == ListTarget::RuntimeWorkers { 3 } else { 2 };
             let first_column = pane.x + 1;
             assert_eq!(app.panels.rows.at(area, first_column, first_row - 1), None);
             let mut visible = 0;
@@ -3951,7 +3951,7 @@ mod tests {
         assert_eq!(app.runtime_view.events.event_selected, 0);
         assert!(text.contains("MutexAccess"));
         assert!(!text.contains("MutexRelease"));
-        assert!(text.contains("Worker Activity"));
+        assert!(text.contains("Worker Statistics"));
         assert!(text.contains("Statistics"));
         assert!(!text.contains("Object history"));
         let rows = text.chars().collect::<Vec<_>>();
@@ -4102,9 +4102,10 @@ mod tests {
         };
         let text = render(&app);
         assert!(text.contains("unassigned"));
-        assert!(text.contains("Unbound"));
+        assert!(text.contains("Async | Blocking"));
+        assert!(text.contains("Worker Statistics"));
         assert!(text.contains("Task Statistics"));
-        assert!(text.contains("Window unobserved"));
+        assert!(text.contains("Poll timeline"));
         assert!(text.contains("No completed samples"));
     }
 
@@ -5121,6 +5122,6 @@ mod tests {
             }));
         }
 
-        assert_eq!(stable_digest(&output), (690_177, 2_507_612_830_443_821_740));
+        assert_eq!(stable_digest(&output), (611_930, 1_707_120_671_637_225_584));
     }
 }

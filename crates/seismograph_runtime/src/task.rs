@@ -109,6 +109,26 @@ impl EventContext {
         assigned
     }
 
+    /// Emits a task enqueue with the queue depth after insertion.
+    #[inline]
+    pub fn enqueued(&self, task: TaskId, queue_depth: u64) {
+        seismograph::record(EventClass::RuntimeTask, || {
+            Some(Record::runtime(
+                EventTimestamp::now(),
+                EventKind::TaskEnqueued,
+                RuntimeEvent {
+                    runtime_id: self.runtime,
+                    worker_id: self.worker,
+                    subject_id: task.get(),
+                    related_id: 0,
+                    value_0: queue_depth,
+                    value_1: 0,
+                },
+                BacktraceCapture::Never,
+            ))
+        });
+    }
+
     /// Emits a real successful outcome without retaining task state.
     #[inline]
     pub fn completed(&self, task: TaskId) {
@@ -255,4 +275,14 @@ impl Drop for TaskPoll {
                 .compare_exchange(self.task.get(), 0, Ordering::AcqRel, Ordering::Acquire);
         }
     }
+}
+
+/// One observed blocking-task execution.
+///
+/// Dropping an unfinished token clears its worker slot without publishing an
+/// execution duration.
+#[derive(Debug)]
+#[must_use = "finish the execution with WorkerHandle::blocking_task_finished, or drop it to cancel observation"]
+pub struct BlockingTaskExecution {
+    pub(crate) poll: TaskPoll,
 }

@@ -59,6 +59,10 @@ impl Queue {
             drop(job);
             return false;
         }
+        #[cfg(any(test, feature = "monitor"))]
+        if let Some(body) = job.body.monitoring() {
+            body.info().queued(state.jobs.len().saturating_add(1));
+        }
         state.jobs.push_back(job);
         drop(state);
         self.ready.notify_one();
@@ -329,7 +333,9 @@ mod tests {
             &self.0
         }
 
-        fn run(&self) {}
+        fn run(&self) -> crate::runtime::monitoring::BlockingTaskOutcome {
+            crate::runtime::monitoring::BlockingTaskOutcome::Completed
+        }
     }
 
     #[test]
@@ -483,7 +489,11 @@ mod tests {
 
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].id, body.info().id());
-        assert_eq!(snapshot.tasks[0].activity.unwrap().state, TaskActivityState::Ready);
+        let activity = snapshot.tasks[0].activity.unwrap();
+        assert_eq!(activity.state, TaskActivityState::Ready);
+        assert_eq!(activity.ready_since, activity.queued_since);
+        assert!(activity.queued_since.is_some());
+        assert!(activity.queued_since.unwrap().ticks() <= activity.observed_at.ticks());
         assert_eq!(snapshot.workers[0].task_collection, TaskCollection::Complete);
         drop(running);
     }
@@ -720,7 +730,9 @@ mod tests {
                 &self.0
             }
 
-            fn run(&self) {}
+            fn run(&self) -> crate::runtime::monitoring::BlockingTaskOutcome {
+                crate::runtime::monitoring::BlockingTaskOutcome::Completed
+            }
         }
 
         let _monitoring = crate::runtime::monitoring::TEST_LOCK.lock().unwrap();

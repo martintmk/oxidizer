@@ -301,6 +301,9 @@ pub enum EventKind {
     /// known zero-byte body. Excludes runtime wrappers and separate allocations.
     TaskSpawned,
     /// A task was enqueued for execution.
+    ///
+    /// In the fixed runtime payload, `value_0` is the queue depth after this
+    /// enqueue. Zero means unavailable.
     TaskEnqueued,
     /// A task instance was materialized.
     TaskMaterialized,

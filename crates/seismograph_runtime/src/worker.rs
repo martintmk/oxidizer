@@ -11,7 +11,7 @@ use seismograph::recorder::runtime::{TaskId, TransferId, WorkerId};
 use seismograph::recorder::{is_enabled, without_recording};
 
 use crate::snapshot::WorkerState;
-use crate::task::TaskPoll;
+use crate::task::{BlockingTaskExecution, TaskPoll};
 use crate::{RuntimeHandle, WorkerControl, duration_nanos, lock, next_transfer_id, record_at, record_now};
 
 /// Functional role assigned to a runtime worker.
@@ -198,13 +198,65 @@ impl WorkerHandle {
         self.poll_started_with(task_id, EventTimestamp::now)
     }
 
+    /// Starts a blocking-task execution and records its scheduler queue wait.
+    ///
+    /// `queued_at` is the time when the task entered the blocking queue.
+    #[inline]
+    pub fn blocking_task_started(&self, task_id: TaskId, queued_at: EventTimestamp) -> BlockingTaskExecution {
+        self.blocking_task_started_with(task_id, queued_at, EventTimestamp::now)
+    }
+
+    /// Finishes an observed blocking-task execution.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the token belongs to another worker.
+    #[inline]
+    pub fn blocking_task_finished(&self, execution: BlockingTaskExecution) {
+        assert_eq!(
+            execution.poll.worker.id,
+            self.id(),
+            "finish a blocking task on the worker that started it"
+        );
+        self.task_poll_finished(execution.poll);
+    }
+
     pub(crate) fn poll_started_with(&self, task_id: TaskId, now: impl FnOnce() -> EventTimestamp) -> TaskPoll {
+        self.poll_started_with_queue(task_id, None, now)
+    }
+
+    pub(crate) fn blocking_task_started_with(
+        &self,
+        task_id: TaskId,
+        queued_at: EventTimestamp,
+        now: impl FnOnce() -> EventTimestamp,
+    ) -> BlockingTaskExecution {
+        BlockingTaskExecution {
+            poll: self.poll_started_with_queue(task_id, Some(queued_at), now),
+        }
+    }
+
+    fn poll_started_with_queue(
+        &self,
+        task_id: TaskId,
+        queued_at: Option<EventTimestamp>,
+        now: impl FnOnce() -> EventTimestamp,
+    ) -> TaskPoll {
         // Acquire pairs with the observer's Release publication of the active window.
         let window = self.runtime.control.timing_window.load(Ordering::Acquire);
         let started_at = (window != 0 || is_enabled(EventClass::RuntimeTask)).then(now);
         self.worker.current_task.store(task_id.get(), Ordering::Release);
         if let Some(at) = started_at {
-            self.record_at(at, EventKind::TaskPollStarted, task_id.get(), 0, 0, 0, BacktraceCapture::Never);
+            let (queue_duration, queue_kind) = queued_at.map_or((0, 0), |queued_at| (duration_nanos(at, queued_at), 2));
+            self.record_at(
+                at,
+                EventKind::TaskPollStarted,
+                task_id.get(),
+                0,
+                queue_duration,
+                queue_kind,
+                BacktraceCapture::Never,
+            );
         }
         TaskPoll {
             task: task_id,
@@ -474,6 +526,67 @@ pub(crate) mod gamma_round2_tests {
     }
 
     #[test]
+    fn blocking_task_start_records_scheduler_wait_duration() {
+        let _test = crate::tests::test_lock();
+        seismograph::recorder(seismograph::recorder::Configuration {
+            runtime_tasks: seismograph::recorder::Policy::all(false),
+            ..seismograph::recorder::Configuration::default()
+        });
+        seismograph::recorder::clear_buffers().unwrap();
+        let worker = worker();
+        let task = TaskId::from_raw(23).unwrap();
+        let execution = worker.blocking_task_started_with(task, EventTimestamp::from_ticks(40), || EventTimestamp::from_ticks(100));
+        drop(execution);
+
+        let bytes = seismograph::snapshot(seismograph::snapshot::SnapshotOptions::default()).unwrap();
+        let decoded = seismograph::snapshot::decode(bytes.as_bytes()).unwrap();
+        let event = decoded
+            .events
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::TaskPollStarted)
+            .unwrap();
+        assert_eq!(
+            event.runtime().unwrap(),
+            seismograph::recorder::runtime::RuntimeEvent {
+                runtime_id: worker.runtime.id(),
+                worker_id: Some(worker.id()),
+                subject_id: task.get(),
+                related_id: 0,
+                value_0: 60,
+                value_1: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn dropping_blocking_execution_clears_the_worker_slot() {
+        without_recording(|| {
+            let worker = worker();
+            let task = TaskId::from_raw(23).unwrap();
+            let execution = worker.blocking_task_started(task, EventTimestamp::from_ticks(40));
+            assert_eq!(worker.worker.current_task.load(Ordering::Acquire), task.get());
+
+            drop(execution);
+
+            assert_eq!(worker.worker.current_task.load(Ordering::Acquire), 0);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "finish a blocking task on the worker that started it")]
+    fn blocking_execution_must_finish_on_its_starting_worker() {
+        let _test = crate::tests::test_lock();
+        let runtime = crate::register_runtime(crate::RuntimeMetadata::new("blocking-token-owner", 2));
+        let first = runtime.register_worker(WorkerMetadata::new(WorkerRole::Blocking));
+        let second = runtime.register_worker(WorkerMetadata::new(WorkerRole::Blocking));
+        let task = TaskId::from_raw(23).unwrap();
+        let execution = first.handle().blocking_task_started(task, EventTimestamp::from_ticks(40));
+
+        second.handle().blocking_task_finished(execution);
+    }
+
+    #[test]
     fn gamma_round2_frozen_poll_finishes_accumulate_exact_durations_and_stop_once() {
         let _test = crate::tests::test_lock();
         seismograph::recorder(seismograph::recorder::Configuration {
@@ -489,6 +602,7 @@ pub(crate) mod gamma_round2_tests {
             worker.poll_finished_with(poll, || EventTimestamp::from_ticks(finish));
             assert_eq!(worker.worker.current_task.load(Ordering::Acquire), 0);
         }
+
         {
             let measurements = lock(&worker.worker.measurements);
             let measured = &measurements.tasks[&task];

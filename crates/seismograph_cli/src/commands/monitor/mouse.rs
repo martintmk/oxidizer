@@ -11,6 +11,7 @@ use super::app::{
     AllocatorBackend, App, CacheFocus, HeapFocus, IoFocus, MonitorTab, PrimitiveFocus, RuntimeFocus, Screen, TaskEventsFocus,
     TaskHistogram, ThreadFocus,
 };
+use super::data::RuntimeWorkerMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ListTarget {
@@ -28,6 +29,7 @@ pub(super) enum ListTarget {
     ThreadOperations,
     ThreadParticipants,
     ThreadObjects,
+    RuntimeWorkerMode(RuntimeWorkerMode),
     RuntimeWorkers,
     RuntimeTasks,
     RuntimeActivity,
@@ -49,7 +51,8 @@ impl ListTarget {
             Self::Allocations => Some(MonitorTab::Allocations),
             Self::PrimitiveTypes | Self::PrimitiveOperations | Self::PrimitiveHotspots => Some(MonitorTab::Primitives),
             Self::Threads | Self::ThreadOperations | Self::ThreadParticipants | Self::ThreadObjects => Some(MonitorTab::Threads),
-            Self::RuntimeWorkers
+            Self::RuntimeWorkerMode(_)
+            | Self::RuntimeWorkers
             | Self::RuntimeTasks
             | Self::RuntimeActivity
             | Self::RuntimeHistogram(_)
@@ -177,6 +180,10 @@ impl App {
             self.runtime_view.task_histogram = histogram;
             return;
         }
+        if let ListTarget::RuntimeWorkerMode(mode) = target {
+            self.runtime_view.select_worker_mode(mode);
+            return;
+        }
         self.activate_selectable_mouse_row(target, index);
     }
 
@@ -255,6 +262,7 @@ impl App {
             | ListTarget::NativeClasses
             | ListTarget::NativeMemory
             | ListTarget::InfoThreads
+            | ListTarget::RuntimeWorkerMode(_)
             | ListTarget::RuntimeActivity
             | ListTarget::RuntimeHistogram(_) => return,
         };
@@ -355,6 +363,17 @@ mod tests {
         app.activate_mouse_row(ListTarget::RuntimeHistogram(TaskHistogram::Poll), 0);
         assert_eq!(app.runtime_view.task_histogram, TaskHistogram::Poll);
         assert_eq!(app.runtime_view.focus, RuntimeFocus::Activity);
+        app.runtime_view.worker_selected = 3;
+        app.runtime_view.task_selected = 4;
+        app.activate_mouse_row(ListTarget::RuntimeWorkerMode(RuntimeWorkerMode::Blocking), 0);
+        assert_eq!(
+            (
+                app.runtime_view.worker_mode,
+                app.runtime_view.worker_selected,
+                app.runtime_view.task_selected
+            ),
+            (RuntimeWorkerMode::Blocking, 0, 0)
+        );
         if let Screen::Offline { tab, .. } = &mut app.screen {
             *tab = MonitorTab::Info;
         }

@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::marker::PhantomData;
-
 #[cfg(any(test, feature = "monitor"))]
 use super::TaskInfo;
 use crate::runtime::shutdown::Shutdown;
@@ -17,11 +15,14 @@ pub(crate) enum BlockingJob {
 }
 
 impl BlockingJob {
-    pub(crate) fn run(self) {
+    pub(crate) fn run(self) -> Option<BlockingTaskOutcome> {
         match self {
-            Self::Plain(body) => body(),
+            Self::Plain(body) => {
+                body();
+                None
+            }
             #[cfg(any(test, feature = "monitor"))]
-            Self::Monitored(body) => body.run(),
+            Self::Monitored(body) => Some(body.run()),
         }
     }
 
@@ -37,7 +38,22 @@ impl BlockingJob {
 #[cfg(any(test, feature = "monitor"))]
 pub(crate) trait MonitoredBlockingJob: Send + Sync {
     fn info(&self) -> &TaskInfo;
-    fn run(&self);
+    fn run(&self) -> BlockingTaskOutcome;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BlockingTaskOutcome {
+    Completed,
+    Panicked,
+}
+
+impl BlockingTaskOutcome {
+    fn publish(self, info: &TaskInfo) {
+        match self {
+            Self::Completed => info.completed(),
+            Self::Panicked => info.panicked(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,34 +116,9 @@ impl BlockingTaskMonitoring {
                 info,
             }));
         }
-        BlockingJob::Plain(Box::new(move || task.run(BlockingTaskEvents::default())))
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct BlockingTaskEvents<'a> {
-    #[cfg(any(test, feature = "monitor"))]
-    info: Option<&'a TaskInfo>,
-    marker: PhantomData<&'a ()>,
-}
-
-#[cfg_attr(
-    not(any(test, feature = "monitor")),
-    expect(clippy::unused_self, reason = "Task events do nothing when monitoring is compiled out.")
-)]
-impl BlockingTaskEvents<'_> {
-    pub(crate) fn completed(self) {
-        #[cfg(any(test, feature = "monitor"))]
-        if let Some(info) = self.info {
-            info.completed();
-        }
-    }
-
-    pub(crate) fn panicked(self) {
-        #[cfg(any(test, feature = "monitor"))]
-        if let Some(info) = self.info {
-            info.panicked();
-        }
+        BlockingJob::Plain(Box::new(move || {
+            let _outcome = task.run();
+        }))
     }
 }
 
@@ -149,15 +140,12 @@ where
         &self.info
     }
 
-    fn run(&self) {
+    fn run(&self) -> BlockingTaskOutcome {
         let task = std::mem::replace(
             &mut *self.task.lock().expect("taking a blocking callback does not execute user code"),
             BlockingTask { pending: None },
         );
-        task.run(BlockingTaskEvents {
-            info: Some(&self.info),
-            marker: PhantomData,
-        });
+        task.run()
     }
 }
 
@@ -204,31 +192,41 @@ impl BlockingWorkerMonitoring {
     pub(crate) fn run(&self, body: BlockingJob, canceled: bool) -> std::thread::Result<()> {
         #[cfg(any(test, feature = "monitor"))]
         let observation = self.handle.as_ref().filter(|_| !canceled).and_then(|worker| {
-            body.monitoring().map(|body| {
+            body.monitoring().cloned().map(|body| {
                 let info = body.info();
-                info.started_on(worker.task_events());
-                let poll = worker.is_observed().then(|| worker.task_poll_started(info.id()));
-                (worker, poll)
+                let queued_at = info.started_on(worker.task_events());
+                let poll = worker.is_observed().then(|| worker.blocking_task_started(info.id(), queued_at));
+                (worker, poll, body)
             })
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(any(test, feature = "monitor"))]
             let _current = observation
                 .as_ref()
-                .and_then(|(_, poll)| poll.as_ref())
-                .and_then(|_| body.monitoring())
+                .and_then(|(_, poll, body)| poll.as_ref().map(|_| body))
                 .map(|body| super::task::enter_current(body.info().id()));
             if canceled {
                 drop(body);
+                None
             } else {
-                body.run();
+                body.run()
             }
         }));
         #[cfg(any(test, feature = "monitor"))]
-        if let Some((worker, Some(poll))) = observation {
-            worker.task_poll_finished(poll);
+        if let Some((worker, poll, body)) = observation {
+            if let Some(poll) = poll {
+                worker.blocking_task_finished(poll);
+            }
+            return match outcome {
+                Ok(Some(outcome)) => {
+                    outcome.publish(body.info());
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(panic) => Err(panic),
+            };
         }
-        outcome
+        outcome.map(|_| ())
     }
 }
 
@@ -250,7 +248,7 @@ mod tests {
         let pool = crate::task::handle::JoinHandlePool::new(shutdown.clone());
         let (body, handle) = crate::task::preparation::prepare_blocking(&pool, || 42, monitoring.task::<()>(&shutdown));
 
-        body.run();
+        let _outcome = body.run();
 
         assert_eq!(handle.join().unwrap(), 42);
     }

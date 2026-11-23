@@ -36,6 +36,7 @@ pub(super) struct RuntimeWorkerSummary {
     pub(super) thread_id: Option<u64>,
     pub(super) current_task: Option<u64>,
     pub(super) observed_tasks: usize,
+    pub(super) max_queued_tasks: Option<u64>,
     pub(super) metrics: ExecutionMetrics,
     pub(super) window: Option<TimeWindow>,
     pub(super) tasks: Vec<RuntimeTaskSummary>,
@@ -53,6 +54,22 @@ pub(super) struct RuntimeTaskSummary {
     pub(super) spawn_stack: Vec<String>,
     pub(super) metrics: ExecutionMetrics,
     pub(super) activity: TaskActivitySummary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum RuntimeWorkerMode {
+    #[default]
+    Async,
+    Blocking,
+}
+
+impl RuntimeWorkerMode {
+    pub(super) const fn toggle(self) -> Self {
+        match self {
+            Self::Async => Self::Blocking,
+            Self::Blocking => Self::Async,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,6 +101,8 @@ pub(super) enum RuntimeTaskSort {
     Executing,
     MedianPoll,
     MaximumPoll,
+    ExecutionTime,
+    QueueTime,
 }
 
 impl RuntimeTaskSort {
@@ -94,18 +113,50 @@ impl RuntimeTaskSort {
             Self::Polls => Self::Executing,
             Self::Executing => Self::MedianPoll,
             Self::MedianPoll => Self::MaximumPoll,
-            Self::MaximumPoll => Self::Task,
+            Self::MaximumPoll | Self::ExecutionTime | Self::QueueTime => Self::Task,
         }
     }
 
     pub(super) const fn previous(self) -> Self {
         match self {
-            Self::Task => Self::MaximumPoll,
             Self::FutureSize => Self::Task,
             Self::Polls => Self::FutureSize,
             Self::Executing => Self::Polls,
             Self::MedianPoll => Self::Executing,
             Self::MaximumPoll => Self::MedianPoll,
+            Self::Task | Self::ExecutionTime | Self::QueueTime => Self::MaximumPoll,
+        }
+    }
+
+    pub(super) const fn next_blocking(self) -> Self {
+        match self.blocking() {
+            Self::Task => Self::ExecutionTime,
+            Self::ExecutionTime => Self::QueueTime,
+            Self::QueueTime => Self::Task,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) const fn previous_blocking(self) -> Self {
+        match self.blocking() {
+            Self::Task => Self::QueueTime,
+            Self::ExecutionTime => Self::Task,
+            Self::QueueTime => Self::ExecutionTime,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) const fn asynchronous(self) -> Self {
+        match self {
+            Self::ExecutionTime | Self::QueueTime => Self::Polls,
+            sort => sort,
+        }
+    }
+
+    pub(super) const fn blocking(self) -> Self {
+        match self {
+            Self::Task | Self::ExecutionTime | Self::QueueTime => self,
+            _ => Self::Task,
         }
     }
 
@@ -117,12 +168,31 @@ impl RuntimeTaskSort {
             Self::Executing => "observed execution",
             Self::MedianPoll => "median poll",
             Self::MaximumPoll => "maximum poll",
+            Self::ExecutionTime => "execution time",
+            Self::QueueTime => "queue time",
         }
     }
 }
 
 impl RuntimeWorkerSummary {
+    pub(super) fn is_blocking(&self) -> bool {
+        self.role == "Blocking"
+    }
+
+    pub(super) fn is_visible_in(&self, mode: RuntimeWorkerMode) -> bool {
+        self.is_blocking() == (mode == RuntimeWorkerMode::Blocking)
+    }
+
+    pub(super) fn queued_tasks(&self) -> usize {
+        self.tasks.iter().filter(|task| task.activity.state == "Ready").count()
+    }
+
+    pub(super) fn max_blocking_queue_nanos(&self) -> Option<u64> {
+        self.tasks.iter().filter_map(RuntimeTaskSummary::blocking_queue_nanos).max()
+    }
+
     pub(super) fn sorted_tasks(&self, sort: RuntimeTaskSort, descending: bool) -> Vec<&RuntimeTaskSummary> {
+        let sort = sort.asynchronous();
         let mut tasks = self.tasks.iter().collect::<Vec<_>>();
         tasks.sort_unstable_by(|left, right| {
             let missing = |task: &RuntimeTaskSummary| match sort {
@@ -147,12 +217,49 @@ impl RuntimeWorkerSummary {
                     .unwrap_or(std::cmp::Ordering::Equal),
                 RuntimeTaskSort::MedianPoll => left.metrics.median_poll_nanos.cmp(&right.metrics.median_poll_nanos),
                 RuntimeTaskSort::MaximumPoll => left.metrics.max_poll_nanos.cmp(&right.metrics.max_poll_nanos),
+                RuntimeTaskSort::ExecutionTime | RuntimeTaskSort::QueueTime => unreachable!(),
             };
             let ordering = if descending { ordering.reverse() } else { ordering };
             ordering.then_with(|| left.task_id.cmp(&right.task_id))
         });
         tasks
     }
+
+    pub(super) fn sorted_blocking_tasks(&self, sort: RuntimeTaskSort, descending: bool) -> Vec<&RuntimeTaskSummary> {
+        let sort = sort.blocking();
+        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
+        tasks.sort_unstable_by(|left, right| {
+            let value = |task: &RuntimeTaskSummary| match sort {
+                RuntimeTaskSort::ExecutionTime => task.blocking_execution_nanos(),
+                RuntimeTaskSort::QueueTime => task.blocking_queue_nanos(),
+                _ => Some(task.task_id),
+            };
+            let left_value = value(left);
+            let right_value = value(right);
+            let availability = left_value.is_none().cmp(&right_value.is_none());
+            if !availability.is_eq() {
+                return availability;
+            }
+            let ordering = left_value.cmp(&right_value);
+            let ordering = if descending { ordering.reverse() } else { ordering };
+            ordering.then_with(|| left.task_id.cmp(&right.task_id))
+        });
+        tasks
+    }
+}
+
+impl RuntimeTaskSummary {
+    pub(super) fn blocking_execution_nanos(&self) -> Option<u64> {
+        self.activity.running_for.or_else(|| sum_durations(&self.metrics.poll_samples))
+    }
+
+    pub(super) fn blocking_queue_nanos(&self) -> Option<u64> {
+        self.activity.ready_for.or_else(|| sum_durations(&self.metrics.ready_samples))
+    }
+}
+
+fn sum_durations(samples: &[u64]) -> Option<u64> {
+    (!samples.is_empty()).then(|| samples.iter().copied().fold(0, u64::saturating_add))
 }
 
 #[derive(Default)]
@@ -195,6 +302,45 @@ impl TaskBuilder {
 
 type Workers = BTreeMap<(u64, Option<u64>), RuntimeWorkerSummary>;
 
+fn record_queue_depth(
+    workers: &Workers,
+    maximums: &mut HashMap<u64, u64>,
+    runtime_id: u64,
+    worker_id: Option<u64>,
+    kind: EventKind,
+    depth: u64,
+) {
+    if kind != EventKind::TaskEnqueued
+        || depth == 0
+        || !worker_id
+            .and_then(|worker_id| workers.get(&(runtime_id, Some(worker_id))))
+            .is_some_and(RuntimeWorkerSummary::is_blocking)
+    {
+        return;
+    }
+    maximums
+        .entry(runtime_id)
+        .and_modify(|maximum| *maximum = (*maximum).max(depth))
+        .or_insert(depth);
+}
+
+fn apply_max_queued_tasks(workers: &mut Workers, mut maximums: HashMap<u64, u64>) {
+    for worker in workers.values() {
+        if worker.is_blocking() {
+            let queued = u64::try_from(worker.queued_tasks()).unwrap_or(u64::MAX);
+            maximums
+                .entry(worker.runtime_id)
+                .and_modify(|maximum| *maximum = (*maximum).max(queued))
+                .or_insert(queued);
+        }
+    }
+    for worker in workers.values_mut() {
+        if worker.is_blocking() {
+            worker.max_queued_tasks = maximums.get(&worker.runtime_id).copied();
+        }
+    }
+}
+
 impl RuntimeMonitorSnapshot {
     pub(super) fn from_events(
         events: &Events,
@@ -204,6 +350,7 @@ impl RuntimeMonitorSnapshot {
         let lookups = addresses.iter().map(|lookup| (lookup.address, lookup)).collect::<HashMap<_, _>>();
         let mut workers = Workers::new();
         let mut tasks = BTreeMap::<(u64, u64), TaskBuilder>::new();
+        let mut max_queued_tasks = HashMap::<u64, u64>::new();
         import_source(source, &mut workers, &mut tasks);
         for event in &events.events {
             let Some(runtime) = event.runtime() else { continue };
@@ -216,6 +363,7 @@ impl RuntimeMonitorSnapshot {
                     .entry((runtime_id, Some(worker_id)))
                     .or_insert_with(|| worker_row(runtime_id, Some(worker_id)));
             }
+            record_queue_depth(&workers, &mut max_queued_tasks, runtime_id, worker_id, event.kind, runtime.value_0);
             let Some(task_id) = runtime_task_id(event.kind, runtime.subject_id, runtime.related_id) else {
                 continue;
             };
@@ -270,6 +418,7 @@ impl RuntimeMonitorSnapshot {
             }
         }
         distribute_tasks(&mut workers, tasks);
+        apply_max_queued_tasks(&mut workers, max_queued_tasks);
         let windows = display_windows(events, source);
         let mut snapshot = Self {
             total_events: events.total_events,
@@ -1165,6 +1314,100 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!((ids(false), ids(true)), (vec![3, 1, 2], vec![1, 3, 2]));
+    }
+
+    #[test]
+    fn blocking_task_times_and_sorts_use_only_execution_and_queue_evidence() {
+        let worker = RuntimeWorkerSummary {
+            role: "Blocking".into(),
+            tasks: vec![
+                RuntimeTaskSummary {
+                    task_id: 1,
+                    metrics: ExecutionMetrics {
+                        poll_samples: vec![30, 20],
+                        ready_samples: vec![7, 3].into(),
+                        wake_samples: vec![1_000].into(),
+                        ..ExecutionMetrics::default()
+                    },
+                    ..RuntimeTaskSummary::default()
+                },
+                RuntimeTaskSummary {
+                    task_id: 2,
+                    activity: TaskActivitySummary {
+                        state: "Ready".into(),
+                        ready_for: Some(5),
+                        ..TaskActivitySummary::default()
+                    },
+                    ..RuntimeTaskSummary::default()
+                },
+                RuntimeTaskSummary {
+                    task_id: 3,
+                    activity: TaskActivitySummary {
+                        state: "Running".into(),
+                        running_for: Some(40),
+                        ..TaskActivitySummary::default()
+                    },
+                    ..RuntimeTaskSummary::default()
+                },
+            ],
+            ..RuntimeWorkerSummary::default()
+        };
+
+        assert!(worker.is_blocking());
+        assert_eq!(worker.queued_tasks(), 1);
+        assert_eq!(worker.max_blocking_queue_nanos(), Some(10));
+        assert_eq!(
+            worker
+                .tasks
+                .iter()
+                .map(|task| (task.blocking_execution_nanos(), task.blocking_queue_nanos()))
+                .collect::<Vec<_>>(),
+            [(Some(50), Some(10)), (None, Some(5)), (Some(40), None)]
+        );
+        assert_eq!(
+            worker
+                .sorted_blocking_tasks(RuntimeTaskSort::ExecutionTime, false)
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            [3, 1, 2]
+        );
+        assert_eq!(
+            worker
+                .sorted_blocking_tasks(RuntimeTaskSort::QueueTime, true)
+                .into_iter()
+                .map(|task| task.task_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            [RuntimeTaskSort::Task, RuntimeTaskSort::ExecutionTime, RuntimeTaskSort::QueueTime]
+                .map(|sort| (sort.next_blocking(), sort.previous_blocking())),
+            [
+                (RuntimeTaskSort::ExecutionTime, RuntimeTaskSort::QueueTime),
+                (RuntimeTaskSort::QueueTime, RuntimeTaskSort::Task),
+                (RuntimeTaskSort::Task, RuntimeTaskSort::ExecutionTime),
+            ]
+        );
+    }
+
+    #[test]
+    fn blocking_workers_share_the_largest_recorded_queue_depth() {
+        let mut source = source(None);
+        source.runtimes[0].workers[0].role = WorkerRole::Blocking;
+        source.runtimes[0].tasks.clear();
+        let events = Events {
+            events: vec![
+                event(EventKind::TaskEnqueued, Some(1), 10, 2, 0),
+                event(EventKind::TaskEnqueued, Some(1), 20, 5, 0),
+                event(EventKind::TaskEnqueued, Some(1), 30, 3, 0),
+            ],
+            ..Events::default()
+        };
+
+        let snapshot = RuntimeMonitorSnapshot::from_events(&events, Some(&source), &[]);
+
+        assert_eq!(snapshot.workers[0].max_queued_tasks, Some(5));
     }
 
     #[test]

@@ -18,7 +18,9 @@ use super::client::{
     Discovery, capture_snapshot, capture_snapshot_and_stop, clear_event_buffers, discover, handshake, recorder_activity, save_snapshot,
     set_recording,
 };
-use super::data::{AllocationSort, AllocationStackFilter, CapturedSnapshot, MemoryTier, MemoryTierData, PrimitiveSort, RuntimeTaskSort};
+use super::data::{
+    AllocationSort, AllocationStackFilter, CapturedSnapshot, MemoryTier, MemoryTierData, PrimitiveSort, RuntimeTaskSort, RuntimeWorkerMode,
+};
 use super::live_activity::{LiveActivity, RecorderUpdate};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -669,6 +671,7 @@ pub(super) enum ThreadFocus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RuntimeViewState {
     pub(super) focus: RuntimeFocus,
+    pub(super) worker_mode: RuntimeWorkerMode,
     pub(super) worker_selected: usize,
     pub(super) task_selected: usize,
     pub(super) activity_scroll: usize,
@@ -685,6 +688,7 @@ impl RuntimeViewState {
     const fn new() -> Self {
         Self {
             focus: RuntimeFocus::Workers,
+            worker_mode: RuntimeWorkerMode::Async,
             worker_selected: 0,
             task_selected: 0,
             activity_scroll: 0,
@@ -706,6 +710,12 @@ impl RuntimeViewState {
         self.reset_details();
     }
 
+    pub(super) fn select_worker_mode(&mut self, mode: RuntimeWorkerMode) {
+        self.worker_mode = mode;
+        self.worker_selected = 0;
+        self.reset_task();
+    }
+
     fn reset_details(&mut self) {
         self.activity_scroll = 0;
         self.events.reset();
@@ -715,11 +725,24 @@ impl RuntimeViewState {
         &self,
         runtime: &'a super::data::RuntimeMonitorSnapshot,
     ) -> Option<&'a super::data::RuntimeTaskSummary> {
-        let worker = runtime
-            .workers
-            .get(self.worker_selected.min(runtime.workers.len().saturating_sub(1)))?;
-        let tasks = worker.sorted_tasks(self.task_sort, self.task_sort_descending);
+        let worker = self.selected_worker(runtime)?;
+        let tasks = if worker.is_blocking() {
+            worker.sorted_blocking_tasks(self.task_sort, self.task_sort_descending)
+        } else {
+            worker.sorted_tasks(self.task_sort, self.task_sort_descending)
+        };
         tasks.get(self.task_selected.min(tasks.len().saturating_sub(1))).copied()
+    }
+
+    pub(super) fn selected_worker<'a>(
+        &self,
+        runtime: &'a super::data::RuntimeMonitorSnapshot,
+    ) -> Option<&'a super::data::RuntimeWorkerSummary> {
+        runtime
+            .workers
+            .iter()
+            .filter(|worker| worker.is_visible_in(self.worker_mode))
+            .nth(self.worker_selected)
     }
 }
 
@@ -2010,18 +2033,25 @@ fn handle_thread_key(code: KeyCode, view: &mut ThreadViewState, snapshot: Option
     true
 }
 
+fn handle_runtime_shortcut(code: KeyCode, view: &mut RuntimeViewState) -> bool {
+    match code {
+        KeyCode::Char('w') => view.select_worker_mode(view.worker_mode.toggle()),
+        KeyCode::Char('e') => view.focus = RuntimeFocus::Events,
+        KeyCode::Char('t') => {
+            view.task_histogram = view.task_histogram.toggle();
+            view.focus = RuntimeFocus::Activity;
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Option<&CapturedSnapshot>) -> bool {
     let runtime = snapshot.map(|snapshot| &snapshot.runtime);
-    let worker = runtime.and_then(|runtime| runtime.workers.get(view.worker_selected));
-    if code == KeyCode::Char('e') {
-        view.focus = RuntimeFocus::Events;
+    if handle_runtime_shortcut(code, view) {
         return true;
     }
-    if code == KeyCode::Char('t') {
-        view.task_histogram = view.task_histogram.toggle();
-        view.focus = RuntimeFocus::Activity;
-        return true;
-    }
+    let worker = runtime.and_then(|runtime| view.selected_worker(runtime));
     if view.focus == RuntimeFocus::Events {
         let task = runtime.and_then(|runtime| view.selected_task(runtime));
         let events = snapshot.and_then(|snapshot| task.and_then(|task| snapshot.task_events.tasks.get(&(task.runtime_id, task.task_id))));
@@ -2050,7 +2080,13 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
         },
         KeyCode::Down => match focus {
             RuntimeDashboardFocus::Workers => {
-                let count = runtime.map_or(0, |runtime| runtime.workers.len());
+                let count = runtime.map_or(0, |runtime| {
+                    runtime
+                        .workers
+                        .iter()
+                        .filter(|worker| worker.is_visible_in(view.worker_mode))
+                        .count()
+                });
                 view.worker_selected = advance_selection(view.worker_selected, count);
                 view.reset_task();
             }
@@ -2082,11 +2118,19 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
             view.activity_scroll = view.activity_scroll.saturating_add(5).min(RUNTIME_HISTOGRAM_BINS - 1);
         }
         KeyCode::Char('[') => {
-            view.task_sort = view.task_sort.previous();
+            view.task_sort = if worker.is_some_and(super::runtime::RuntimeWorkerSummary::is_blocking) {
+                view.task_sort.previous_blocking()
+            } else {
+                view.task_sort.previous()
+            };
             view.reset_task();
         }
         KeyCode::Char(']') => {
-            view.task_sort = view.task_sort.next();
+            view.task_sort = if worker.is_some_and(super::runtime::RuntimeWorkerSummary::is_blocking) {
+                view.task_sort.next_blocking()
+            } else {
+                view.task_sort.next()
+            };
             view.reset_task();
         }
         KeyCode::Char('r') => {
@@ -4905,6 +4949,15 @@ mod tests {
         let mut unchanged = original;
         assert!(!handle_runtime_key(KeyCode::Tab, &mut unchanged, None));
         assert_eq!(unchanged, original);
+
+        let mut mode = RuntimeViewState::new();
+        mode.worker_selected = 3;
+        mode.task_selected = 4;
+        assert!(handle_runtime_key(KeyCode::Char('w'), &mut mode, None));
+        assert_eq!(
+            (mode.worker_mode, mode.worker_selected, mode.task_selected),
+            (RuntimeWorkerMode::Blocking, 0, 0)
+        );
 
         let mut events = TaskEventsViewState::new();
         assert!(!handle_task_events_key(KeyCode::Backspace, &mut events, None));

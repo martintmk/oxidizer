@@ -154,12 +154,11 @@ impl Panels {
                 areas = [threads, operations, participants, objects, stack];
             }
             MonitorTab::Runtime => {
-                let [workers, rest] = split(Split::RuntimeRows, Direction::Vertical, area, Constraint::Length(10));
+                let [top, rest] = split(Split::RuntimeRows, Direction::Vertical, area, Constraint::Length(10));
+                let [workers, worker_statistics] = split(Split::RuntimeColumns, Direction::Horizontal, top, Constraint::Percentage(55));
                 let [middle, events] = split(Split::RuntimeActivityRows, Direction::Vertical, rest, Constraint::Percentage(45));
-                let [tasks, charts] = split(Split::RuntimeColumns, Direction::Horizontal, middle, Constraint::Percentage(55));
-                let [worker_activity, statistics] =
-                    split(Split::RuntimeStatistics, Direction::Horizontal, charts, Constraint::Percentage(50));
-                areas = [workers, tasks, worker_activity, statistics, events];
+                let [tasks, statistics] = split(Split::RuntimeStatistics, Direction::Horizontal, middle, Constraint::Percentage(55));
+                areas = [workers, tasks, worker_statistics, statistics, events];
             }
             MonitorTab::Io => {
                 [areas[0], areas[1]] = split(Split::Io, Direction::Horizontal, area, Constraint::Percentage(48));
@@ -604,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_divider_resizes_only_the_two_compact_charts() {
+    fn statistics_divider_resizes_only_tasks_and_task_statistics() {
         let mut panels = Panels::default();
         let area = Rect::new(0, 3, 180, 56);
         let before = panels.arrange_runtime(area, RuntimeFocus::Events).areas;
@@ -625,24 +624,23 @@ mod tests {
             area,
         );
         let after = panels.arrange_runtime(area, RuntimeFocus::Events).areas;
-        assert_eq!((after[0], after[1], after[4]), (before[0], before[1], before[4]));
-        assert_eq!((after[2].width, after[3].width), (before[2].width + 8, before[3].width - 8));
-        assert_eq!(after[2].right(), after[3].x);
+        assert_eq!((after[0], after[2], after[4]), (before[0], before[2], before[4]));
+        assert_eq!((after[1].width, after[3].width), (before[1].width + 8, before[3].width - 8));
+        assert_eq!(after[1].right(), after[3].x);
     }
 
     #[test]
-    fn runtime_dashboard_places_half_width_charts_above_events_and_retains_dragging() {
+    fn runtime_dashboard_places_statistics_beside_workers_and_tasks() {
         let mut panels = Panels::default();
         let area = Rect::new(0, 3, 180, 56);
         let before = panels.arrange_runtime(area, RuntimeFocus::Tasks).areas;
         assert_eq!((before[0].height, before[4].width), (10, 180));
-        assert_eq!(before[2].right(), before[3].x);
-        assert!(before[2].width.abs_diff(before[3].width) <= 1);
-        assert!(before[2].width <= 41);
-        assert_eq!(
-            (before[1].bottom(), before[2].bottom(), before[3].bottom()),
-            (before[4].y, before[4].y, before[4].y)
-        );
+        assert_eq!(before[0].right(), before[2].x);
+        assert_eq!(before[1].right(), before[3].x);
+        assert_eq!((before[0].y, before[2].y), (area.y, area.y));
+        assert_eq!(before[0].bottom(), before[2].bottom());
+        assert_eq!((before[1].bottom(), before[3].bottom()), (before[4].y, before[4].y));
+        assert_eq!((before[1].y, before[3].y), (before[0].bottom(), before[2].bottom()));
         panels.handle_mouse(
             mouse(MouseEventKind::Down(MouseButton::Left), 5, before[4].y),
             MonitorTab::Runtime,
@@ -651,11 +649,8 @@ mod tests {
         panels.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 35), MonitorTab::Runtime, area);
         panels.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 35), MonitorTab::Runtime, area);
         let after = panels.arrange_runtime(area, RuntimeFocus::Activity).areas;
-        assert_eq!(after[0], before[0]);
-        assert_eq!(
-            (after[1].bottom(), after[2].bottom(), after[3].bottom(), after[4].y),
-            (35, 35, 35, 35)
-        );
+        assert_eq!((after[0], after[2]), (before[0], before[2]));
+        assert_eq!((after[1].bottom(), after[3].bottom(), after[4].y), (35, 35, 35));
         assert_eq!(after[4].right(), area.right());
     }
 }

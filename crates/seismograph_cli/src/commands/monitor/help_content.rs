@@ -378,20 +378,20 @@ const THREAD_OBJECTS: &Section = section!("THREAD OBJECTS / STACKS";
 
 const RUNTIME_WORKERS: &Section = section!("RUNTIME WORKERS";
     "Runtime / thread" => "Runtime ID:worker ID / recorder-thread ID, followed by the runtime name. A '?' thread is unknown, not the notifier's OS thread.",
-    "Role" => "Core executes general tasks; Blocking executes blocking work; Io drives runtime I/O.",
+    "Async | Blocking" => "Async shows Core and Io workers, plus workers with an unknown role. Blocking shows workers that execute blocking work. Press w or select a label.",
     "State" => "Running means available to execute, not necessarily polling now. Parked means parked; Stopped means stopped. Event-only workers can have blank metadata.",
     "Tasks" => "Distinct tasks observed polling on this worker, not all source-associated tasks. A task can be listed below with zero observed polls. Migrated tasks can appear on multiple workers.",
     "Polls" => "Retained completed polls on this worker, not a lifetime count. An ongoing poll contributes to the timeline, not this count.",
     "Median poll" => "Median retained completed poll duration across this worker's tasks; '-' without samples and 0ns for measured zero.",
     "Max poll" => "Longest retained completed poll duration on this worker; an ongoing poll is not a completed sample.",
     "Observed %" => "Union of observed poll intervals, clipped to the displayed per-runtime window, divided by that same window's duration. A lower bound, never above 100%; NOT CPU utilization. No valid window or no observation is '-', not zero.",
-    "Poll timeline" => "Each row bins that worker's observed polls on its runtime's common time window. Eight rising bar heights show occupied fraction (0..100%). Every positive fraction rises above the zero baseline. Dim baseline bars are unobserved, not proof of idle. Different runtimes may have different windows.",
-    "Worker Activity" => "Selected worker's window axis, observed poll timeline and completed poll duration histogram. Duration runs horizontally across 12 fixed log10 buckets; count is vertical. Every nonempty bucket has at least a tiny visible sliver. The selected bucket's range and exact count appear above the bars. Open source polls contribute only to the timeline and observed fraction.",
+    "Blocking worker columns" => "Exec # is the retained executed-task count. Queue peak is the largest recorded queue depth. Exec max and Wait max are the longest task execution and queue times.",
+    "Worker Statistics" => "For an async worker, this panel shows the poll timeline and completed poll duration histogram. For a blocking worker, it shows the retained execution total, queue peak, and maximum execution and wait times.",
     "unassigned / Unbound" => "Tasks with no worker association. '-' poll metrics are unavailable, not zero.",
     "runtime events / source retained" => "Retained runtime-class count / retained all-class source-event count.",
     "accepted / overwritten / loss %" => "All-class source totals. Loss percentage = overwritten / accepted; zero when accepted is zero.",
     "No runtime data" => "A recorder does not instrument executors automatically. Runtime source presence alone is not event history.",
-    "Up/Down / Enter" => "Select worker / enter Tasks. Backspace returns from Tasks. On narrow terminals only the focused panel is shown.",
+    "Up/Down / Enter / w" => "Select worker / enter Tasks / switch between async and blocking workers. Backspace returns from Tasks. On narrow terminals only the focused panel is shown.",
 );
 
 const RUNTIME_TASKS: &Section = section!("RUNTIME TASKS";
@@ -402,9 +402,11 @@ const RUNTIME_TASKS: &Section = section!("RUNTIME TASKS";
     "Observed %" => "Union of this task's observed polls on THIS worker / the same displayed per-runtime window duration. Open coherent source polls can contribute. Lower bound, not CPU utilization; unavailable is '-'.",
     "Median poll" => "Median completed poll duration on THIS worker. Even populations use the midpoint rounded down to nanoseconds. '-' means no samples, while 0ns is a genuine measured zero.",
     "Max poll" => "Largest completed retained poll duration on THIS worker; '-' without samples. Open polls are not completed duration samples.",
+    "Blocking task columns" => "A Blocking worker uses ID, State, Execution time, and Queue time. Queue time is '-' when the source does not expose scheduler queue time.",
+    "Blocking Task Statistics" => "Shows the selected blocking task state, execution time, and scheduler queue time. Missing times are '-'.",
     "Units / zero" => "Durations use ns/us/ms/s; histogram ranges use inclusive nanoseconds. Zero completed polls is 0. Missing durations are '-', never an invented zero.",
     "Up/Down / Enter / Backspace" => "Select task / focus Statistics / return to Workers. Press e to focus the task's operations below, or t to switch its Poll/Ready histogram.",
-    "[ / ] / r" => "Cycle Task, Future B, Polls, Observed %, Median poll and Max poll sorts / reverse direction. Unknown values stay last in either direction. Task selection and detail positions reset.",
+    "[ / ] / r" => "Cycle the visible task sorts / reverse direction. Blocking tasks use ID, execution time, and queue time. Other tasks use Task, Future B, Polls, Observed %, Median poll, and Max poll. Unknown values stay last. Task selection and detail positions reset.",
 );
 
 const RUNTIME_ACTIVITY: &Section = section!("RUNTIME ACTIVITY";
@@ -784,14 +786,15 @@ mod tests {
             Context::RuntimeWorkers,
             &[
                 "Runtime / thread",
-                "Role",
+                "Async | Blocking",
                 "State",
                 "Tasks",
                 "Polls",
                 "Observed %",
                 "Median poll",
                 "Max poll",
-                "Poll timeline",
+                "Blocking worker columns",
+                "Worker Statistics",
             ],
         ),
         (

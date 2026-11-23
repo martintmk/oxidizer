@@ -362,17 +362,25 @@ fn queued_and_running_blocking_tasks_come_from_native_pool_storage() {
                 .iter()
                 .find(|worker| Some(worker.id) == task.last_worker_id)
                 .unwrap();
-            (worker.role, task.activity.unwrap().state, task.metrics_scope)
+            let activity = task.activity.unwrap();
+            (
+                worker.role,
+                activity.state,
+                activity.queued_since.map(seismograph::recorder::event::EventTimestamp::ticks),
+                activity.observed_at.ticks(),
+                task.metrics_scope,
+            )
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        states,
-        [
-            (WorkerRole::Blocking, TaskActivityState::Running, TaskMetricsScope::Uncollected),
-            (WorkerRole::Blocking, TaskActivityState::Ready, TaskMetricsScope::Uncollected),
-        ]
-    );
+    assert_eq!(states[0].0, WorkerRole::Blocking);
+    assert_eq!(states[0].1, TaskActivityState::Running);
+    assert_eq!(states[0].2, None);
+    assert_eq!(states[0].4, TaskMetricsScope::Uncollected);
+    assert_eq!(states[1].0, WorkerRole::Blocking);
+    assert_eq!(states[1].1, TaskActivityState::Ready);
+    assert!(states[1].2.is_some_and(|queued| queued <= states[1].3));
+    assert_eq!(states[1].4, TaskMetricsScope::Uncollected);
 }
 
 #[test]
@@ -427,6 +435,19 @@ fn draining_queued_blocking_tasks_does_not_report_worker_resumes() {
         .skip_while(|event| event.kind != EventKind::TaskPollStarted)
         .collect::<Vec<_>>();
     let polls = events.iter().filter(|event| event.kind == EventKind::TaskPollStarted).count();
+    let queue_samples = events
+        .iter()
+        .filter(|event| event.kind == EventKind::TaskPollStarted)
+        .map(|event| {
+            let payload = event.runtime().unwrap();
+            (payload.value_0, payload.value_1)
+        })
+        .collect::<Vec<_>>();
+    let peak_queue = events
+        .iter()
+        .filter(|event| event.kind == EventKind::TaskEnqueued)
+        .filter_map(|event| event.runtime().map(|payload| payload.value_0))
+        .max();
     let transitions = events
         .iter()
         .filter_map(|event| match event.kind {
@@ -435,6 +456,8 @@ fn draining_queued_blocking_tasks_does_not_report_worker_resumes() {
         })
         .collect::<Vec<_>>();
     assert_eq!((worker.thread_id, polls, transitions), (Some(thread_id), 4, Vec::new()));
+    assert!(queue_samples.iter().all(|(_, kind)| *kind == 2));
+    assert!(peak_queue.is_some_and(|depth| depth >= 2));
 }
 
 #[test]
@@ -660,6 +683,34 @@ fn recording_reports_real_async_and_blocking_outcomes() {
     }
     starts.sort_unstable();
     finishes.sort_unstable();
+    let blocking = snapshot
+        .events
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::TaskEnqueued)
+        .filter_map(|event| event.runtime().map(|payload| (payload.runtime_id, payload.subject_id)))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (terminal_index, terminal) in snapshot
+        .events
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.kind, EventKind::TaskCompleted | EventKind::TaskPanicked))
+    {
+        let payload = terminal.runtime().unwrap();
+        if !blocking.contains(&(payload.runtime_id, payload.subject_id)) {
+            continue;
+        }
+        assert!(
+            snapshot.events.events[..terminal_index].iter().any(|event| {
+                event.kind == EventKind::TaskPollFinished
+                    && event
+                        .runtime()
+                        .is_some_and(|candidate| candidate.runtime_id == payload.runtime_id && candidate.subject_id == payload.subject_id)
+            }),
+            "terminal task outcome must follow its execution finish"
+        );
+    }
     assert_eq!(
         (
             outcomes.iter().filter(|kind| **kind == EventKind::TaskCompleted).count(),

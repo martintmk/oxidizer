@@ -4,6 +4,7 @@
 //! Measure the duration of each async task poll.
 
 use std::task::Poll;
+use std::thread::sleep;
 use std::time::Duration;
 
 use arty::runtime::hook::{HookFn, TaskObserver, TaskSpawn};
@@ -24,15 +25,32 @@ impl TaskObserver for MeasurePoll {
 
 #[arty::main]
 async fn main(cx: Context) -> Result<(), JoinError> {
-    cx.control().on(HookFn::<TaskSpawn, _>::new(cx.clock().clone(), |event, clock| {
-        event.observe_with(clock.stopwatch(), MeasurePoll);
-    }));
+    cx.control().on(HookFn::new(cx.clock().clone(), observe_spawn));
 
-    cx.scheduler()
-        .spawn(|cx| async move {
-            cx.clock().delay(Duration::from_secs(1)).await;
-        })
-        .await?;
+    loop {
+        cx.scheduler()
+            .spawn(|cx| async move {
+                for _ in 0..300 {
+                    cx.clock().delay(Duration::from_millis(600)).await;
 
-    Ok(())
+                    let mut handles = vec![];
+                    for _ in 0..10 {
+                        handles.push(cx.scheduler().spawn_blocking(|| {
+                            sleep(Duration::from_millis(500));
+                        }));
+                    }
+
+                    for handle in handles {
+                        handle.await?;
+                    }
+                }
+
+                Ok::<(), JoinError>(())
+            })
+            .await??;
+    }
+}
+
+fn observe_spawn(event: &mut TaskSpawn, clock: &tick::Clock) {
+    event.observe_with(clock.stopwatch(), MeasurePoll);
 }
