@@ -2,8 +2,8 @@
 // Licensed under the MIT License.
 
 //! Native storage for queued blocking functions and active worker slots.
-//! Worker handles are retained on their execution thread. The pool shares one
-//! immutable task-event context so submissions do not lock this queue for it.
+//! Worker handles are retained on their execution thread. The pool uses
+//! worker-neutral submission metadata and binds each task when execution starts.
 
 use std::collections::VecDeque;
 #[cfg(not(all(test, feature = "test-util")))]
@@ -54,6 +54,9 @@ impl Queue {
             return false;
         }
         state.jobs.push_back(job);
+        if let Some(info) = state.jobs.back().and_then(|job| job.body.monitoring()) {
+            info.info().submitted(state.jobs.len());
+        }
         drop(state);
         self.ready.notify_one();
         true
@@ -153,14 +156,7 @@ impl Queue {
         for (index, slot) in state.workers.iter_mut().enumerate() {
             slot.registration = Some(self.register_worker(runtime, index));
         }
-        let events = state
-            .workers
-            .first()
-            .and_then(|slot| slot.registration.as_ref())
-            .expect("a blocking pool starts with at least one worker")
-            .handle()
-            .task_events();
-        self.monitoring.enable(events);
+        self.monitoring.enable(runtime.blocking_pool());
         state.runtime = Some(runtime.clone());
         drop(state);
         self.ready.notify_all();
@@ -234,10 +230,10 @@ mod tests {
 
     use seismograph_runtime::RuntimeMetadata;
     use seismograph_runtime::snapshot::{CaptureOptions, TaskActivityState, TaskCollection, WorkerState};
+    use seismograph_runtime::task::{BlockingTask as MonitoredBlockingTask, BlockingTaskExecution};
     use seismograph_runtime::worker::{WorkerMetadata, WorkerRole};
 
     use super::*;
-    use crate::runtime::monitoring::TaskInfo;
 
     #[derive(Default)]
     pub(super) struct ScriptedCondvar {
@@ -287,14 +283,22 @@ mod tests {
         }
     }
 
-    struct TestJob(TaskInfo);
+    fn task_info(queue: &Queue) -> MonitoredBlockingTask {
+        queue
+            .monitoring
+            .pool()
+            .unwrap()
+            .task(crate::runtime::monitoring::descriptor::<()>, None, 0)
+    }
+
+    struct TestJob(MonitoredBlockingTask);
 
     impl MonitoredBlockingJob for TestJob {
-        fn info(&self) -> &TaskInfo {
+        fn info(&self) -> &MonitoredBlockingTask {
             &self.0
         }
 
-        fn run(&self) {}
+        fn run(&self, _execution: &BlockingTaskExecution<'_>) {}
     }
 
     #[test]
@@ -403,7 +407,7 @@ mod tests {
         queue.enable_monitoring(&runtime.handle());
         queue.retire(0);
         queue.retire(2);
-        let info = TaskInfo::new::<()>(queue.monitoring.events().unwrap());
+        let info = task_info(&queue);
         let id = info.id();
         assert!(queue.push(QueuedJob {
             body: BlockingJob::Monitored(Arc::new(TestJob(info))),
@@ -432,7 +436,7 @@ mod tests {
         let mut worker = BlockingWorkerMonitoring::default();
         let running = queue.pop(index, &mut worker).unwrap();
         queue.enable_monitoring(&runtime.handle());
-        let body: Arc<dyn MonitoredBlockingJob> = Arc::new(TestJob(TaskInfo::new::<()>(queue.monitoring.events().unwrap())));
+        let body: Arc<dyn MonitoredBlockingJob> = Arc::new(TestJob(task_info(&queue)));
         assert!(queue.push(QueuedJob {
             body: BlockingJob::Monitored(Arc::clone(&body)),
             shutdown: None,
@@ -455,7 +459,7 @@ mod tests {
 
     #[test]
     #[cfg(not(miri))]
-    fn shared_submission_events_belong_to_the_worker_that_collects_the_queue() {
+    fn shared_submission_events_are_worker_neutral_and_record_queue_depth() {
         use seismograph::recorder::event::EventKind;
         use seismograph::recorder::{Configuration, Policy};
         use seismograph::snapshot::SnapshotOptions;
@@ -478,21 +482,38 @@ mod tests {
         queue.add_worker();
         queue.add_worker();
         queue.enable_monitoring(&runtime.handle());
-        let info = TaskInfo::new::<()>(queue.monitoring.events().unwrap());
-        let owner = runtime.handle().capture(CaptureOptions::default()).unwrap().workers[0].id;
+        let first = task_info(&queue);
+        let first_id = first.id();
+        let second = task_info(&queue);
+        let second_id = second.id();
+        for info in [first, second] {
+            assert!(queue.push(QueuedJob {
+                body: BlockingJob::Monitored(Arc::new(TestJob(info))),
+                shutdown: None,
+            }));
+        }
 
         let bytes = seismograph::snapshot(SnapshotOptions::default()).unwrap();
         let snapshot = seismograph::snapshot::decode(bytes.as_bytes()).unwrap();
-        let spawn = snapshot
+        let task_events = snapshot
             .events
             .events
             .iter()
-            .filter(|event| event.kind == EventKind::TaskSpawned)
-            .filter_map(seismograph::recorder::event::Event::runtime)
-            .find(|event| event.runtime_id == runtime.handle().id() && event.subject_id == info.id().get())
-            .unwrap();
+            .filter(|event| matches!(event.kind, EventKind::TaskSpawned | EventKind::TaskEnqueued))
+            .filter(|event| event.runtime().is_some_and(|event| event.runtime_id == runtime.handle().id()))
+            .collect::<Vec<_>>();
 
-        assert_eq!(spawn.worker_id, Some(owner));
+        assert!(task_events.iter().all(|event| event.runtime().unwrap().worker_id.is_none()));
+        assert_eq!(
+            task_events
+                .iter()
+                .filter(|event| event.kind == EventKind::TaskEnqueued)
+                .map(|event| event.runtime().unwrap())
+                .filter(|event| matches!(event.subject_id, id if id == first_id.get() || id == second_id.get()))
+                .map(|event| event.value_0)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
     }
 
     #[test]
@@ -503,7 +524,7 @@ mod tests {
         let index = queue.add_worker();
         queue.enable_monitoring(&runtime.handle());
         queue.enable_monitoring(&runtime.handle());
-        let body: Arc<dyn MonitoredBlockingJob> = Arc::new(TestJob(TaskInfo::new::<()>(queue.monitoring.events().unwrap())));
+        let body: Arc<dyn MonitoredBlockingJob> = Arc::new(TestJob(task_info(&queue)));
         assert!(queue.push(QueuedJob {
             body: BlockingJob::Monitored(Arc::clone(&body)),
             shutdown: None,
@@ -572,7 +593,7 @@ mod tests {
         queue.add_worker();
         queue.enable_monitoring(&runtime.handle());
         assert!(queue.push(QueuedJob {
-            body: BlockingJob::Monitored(Arc::new(TestJob(TaskInfo::new::<()>(queue.monitoring.events().unwrap())))),
+            body: BlockingJob::Monitored(Arc::new(TestJob(task_info(&queue)))),
             shutdown: None,
         }));
 
@@ -677,15 +698,15 @@ mod tests {
     fn blocking_collection_handles_missing_metadata_limits_and_canceled_requests() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct InspectedJob(TaskInfo, Arc<AtomicUsize>);
+        struct InspectedJob(MonitoredBlockingTask, Arc<AtomicUsize>);
 
         impl MonitoredBlockingJob for InspectedJob {
-            fn info(&self) -> &TaskInfo {
+            fn info(&self) -> &MonitoredBlockingTask {
                 self.1.fetch_add(1, Ordering::SeqCst);
                 &self.0
             }
 
-            fn run(&self) {}
+            fn run(&self, _execution: &BlockingTaskExecution<'_>) {}
         }
 
         let _monitoring = crate::runtime::monitoring::TEST_LOCK.lock().unwrap();
@@ -696,10 +717,7 @@ mod tests {
         let inspections = Arc::new(AtomicUsize::new(0));
         for body in [
             BlockingJob::Plain(Box::new(|| {})),
-            BlockingJob::Monitored(Arc::new(InspectedJob(
-                TaskInfo::new::<()>(queue.monitoring.events().unwrap()),
-                Arc::clone(&inspections),
-            ))),
+            BlockingJob::Monitored(Arc::new(InspectedJob(task_info(&queue), Arc::clone(&inspections)))),
         ] {
             assert!(queue.push(QueuedJob { body, shutdown: None }));
         }

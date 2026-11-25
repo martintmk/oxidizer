@@ -4,12 +4,13 @@
 //! Native-storage requests, task lifecycle events, and observed poll tokens.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 
 use seismograph::recorder::event::{BacktraceCapture, EventClass, EventKind, EventTimestamp, Record};
 use seismograph::recorder::runtime::{RuntimeEvent, RuntimeId, TaskId, TypeDescriptorId, WorkerId};
 
-use crate::snapshot::{Task, TaskCollection, TaskMetrics};
+use crate::snapshot::{Task, TaskActivityState, TaskCollection, TaskMetrics};
+use crate::worker::WorkerHandle;
 use crate::{WorkerControl, collection, lock};
 
 /// Task-event identities and backtrace policy that implement [`Copy`].
@@ -35,6 +36,230 @@ pub struct TaskSpawn {
     pub descriptor: TypeDescriptorId,
     /// Timestamp used by the task creation event.
     pub timestamp: EventTimestamp,
+}
+
+/// Worker-neutral instrumentation for one blocking work queue.
+///
+/// Obtain this from [`RuntimeHandle::blocking_pool`](crate::RuntimeHandle::blocking_pool).
+/// Create a [`BlockingTask`] before adding work to the queue, then call
+/// [`BlockingTask::submitted`] with the queue depth after a successful enqueue.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockingPool {
+    events: EventContext,
+}
+
+impl BlockingPool {
+    pub(crate) const fn new(events: EventContext) -> Self {
+        Self { events }
+    }
+
+    /// Creates metadata for a blocking task before its queue accepts it.
+    ///
+    /// `body_size` is the concrete synchronous callback size before runtime
+    /// wrapping or type erasure. Call [`BlockingTask::submitted`] after the
+    /// queue accepts the task.
+    #[must_use]
+    pub fn task(&self, descriptor: fn() -> TypeDescriptorId, parent: Option<TaskId>, body_size: usize) -> BlockingTask {
+        BlockingTask::new(self.events, descriptor, parent, body_size)
+    }
+
+    /// Creates metadata and records a successful queue submission.
+    ///
+    /// `queue_depth` is the number of tasks waiting after this task enters the
+    /// queue.
+    #[must_use]
+    pub fn submitted(
+        &self,
+        descriptor: fn() -> TypeDescriptorId,
+        parent: Option<TaskId>,
+        body_size: usize,
+        queue_depth: usize,
+    ) -> BlockingTask {
+        let task = self.task(descriptor, parent, body_size);
+        task.submitted(queue_depth);
+        task
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockingTaskIdentity {
+    id: TaskId,
+    descriptor: TypeDescriptorId,
+}
+
+/// Lifecycle and inspection metadata for one queued blocking task.
+#[derive(Debug)]
+pub struct BlockingTask {
+    events: EventContext,
+    descriptor: fn() -> TypeDescriptorId,
+    parent: Option<TaskId>,
+    body_size: usize,
+    spawned_at: Option<EventTimestamp>,
+    identity: OnceLock<BlockingTaskIdentity>,
+    queued_at: OnceLock<Option<EventTimestamp>>,
+    started: AtomicBool,
+}
+
+impl BlockingTask {
+    fn new(events: EventContext, descriptor: fn() -> TypeDescriptorId, parent: Option<TaskId>, body_size: usize) -> Self {
+        let spawn = events.spawned_with(descriptor, parent, body_size);
+        Self {
+            events,
+            descriptor,
+            parent,
+            body_size,
+            spawned_at: spawn.map(|spawn| spawn.timestamp),
+            identity: spawn.map_or_else(OnceLock::new, |spawn| {
+                OnceLock::from(BlockingTaskIdentity {
+                    id: spawn.id,
+                    descriptor: spawn.descriptor,
+                })
+            }),
+            queued_at: OnceLock::new(),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// Records that the queue accepted this task.
+    ///
+    /// `queue_depth` is the number of tasks waiting after this task enters the
+    /// queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this task was already submitted or if the queue depth does not
+    /// fit in `u64`.
+    pub fn submitted(&self, queue_depth: usize) {
+        let queue_depth = u64::try_from(queue_depth).expect("a queue depth fits in u64");
+        let mut queued_at = None;
+        seismograph::record(EventClass::RuntimeTask, || {
+            let timestamp = EventTimestamp::now();
+            queued_at = Some(timestamp);
+            Some(Record::runtime(
+                timestamp,
+                EventKind::TaskEnqueued,
+                RuntimeEvent {
+                    runtime_id: self.events.runtime,
+                    worker_id: None,
+                    subject_id: self.id().get(),
+                    related_id: 0,
+                    value_0: queue_depth,
+                    value_1: 0,
+                },
+                BacktraceCapture::Never,
+            ))
+        });
+        self.queued_at
+            .set(queued_at)
+            .expect("a blocking task is submitted to its queue exactly once");
+    }
+
+    /// Returns the task identity, allocating it on first inspection if needed.
+    #[must_use]
+    pub fn id(&self) -> TaskId {
+        self.identity().id
+    }
+
+    /// Describes the task in its queue or execution slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue did not accept the task.
+    #[must_use]
+    pub fn describe(&self, state: TaskActivityState) -> Task {
+        let identity = self.identity();
+        let mut task = Task::new(identity.id, identity.descriptor, state);
+        task.parent = self.parent;
+        task.spawned_at = self.spawned_at;
+        task.future_size_bytes = Some(u64::try_from(self.body_size).expect("a task body fits the platform address space"));
+        let queued_at = *self.queued_at.get().expect("describe a blocking task only after queue submission");
+        if matches!(state, TaskActivityState::Ready)
+            && let Some(activity) = &mut task.activity
+        {
+            activity.ready_since = queued_at;
+            activity.queued_since = queued_at;
+        }
+        task
+    }
+
+    /// Binds this task to the blocking worker that starts it.
+    ///
+    /// Dropping the returned token finishes any observed poll.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the task was not submitted or already started.
+    pub fn started<'a>(&'a self, worker: &'a WorkerHandle) -> BlockingTaskExecution<'a> {
+        assert!(self.queued_at.get().is_some(), "start a blocking task only after queue submission");
+        assert!(
+            self.started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "a blocking task starts on exactly one worker"
+        );
+        let poll = worker.is_observed().then(|| worker.task_poll_started(self.id()));
+        BlockingTaskExecution { task: self, worker, poll }
+    }
+
+    /// Records cancellation before execution starts.
+    pub fn canceled(&self) {
+        if let Some(id) = self.terminal_id() {
+            self.events.canceled(id);
+        }
+    }
+
+    fn identity(&self) -> BlockingTaskIdentity {
+        *self.identity.get_or_init(|| BlockingTaskIdentity {
+            id: crate::allocate_task_id(),
+            descriptor: (self.descriptor)(),
+        })
+    }
+
+    fn terminal_id(&self) -> Option<TaskId> {
+        self.identity
+            .get()
+            .map(|identity| identity.id)
+            .or_else(|| seismograph::recorder::is_enabled(EventClass::RuntimeTask).then(|| self.id()))
+    }
+}
+
+/// One blocking task bound to its execution worker.
+#[derive(Debug)]
+#[must_use = "keep the execution token until the blocking callback finishes"]
+pub struct BlockingTaskExecution<'a> {
+    task: &'a BlockingTask,
+    worker: &'a WorkerHandle,
+    poll: Option<TaskPoll>,
+}
+
+impl BlockingTaskExecution<'_> {
+    /// Returns the task identity when this execution is observed.
+    #[must_use]
+    pub fn observed_task_id(&self) -> Option<TaskId> {
+        self.poll.as_ref().map(|poll| poll.task)
+    }
+
+    /// Records successful completion on the execution worker.
+    pub fn completed(&self) {
+        if let Some(id) = self.task.terminal_id() {
+            self.worker.task_events().completed(id);
+        }
+    }
+
+    /// Records panic completion on the execution worker.
+    pub fn panicked(&self) {
+        if let Some(id) = self.task.terminal_id() {
+            self.worker.task_events().panicked(id);
+        }
+    }
+}
+
+impl Drop for BlockingTaskExecution<'_> {
+    fn drop(&mut self) {
+        if let Some(poll) = self.poll.take() {
+            self.worker.task_poll_finished(poll);
+        }
+    }
 }
 
 impl EventContext {

@@ -34,7 +34,7 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    pub(crate) fn run(mut self, monitoring: BlockingTaskEvents<'_>) {
+    pub(crate) fn run(mut self, monitoring: BlockingTaskEvents<'_, '_>) {
         let (body, result_tx) = self.pending.take().expect("a blocking task is consumed exactly once");
         match catch_unwind(AssertUnwindSafe(body)) {
             Ok(result) => {

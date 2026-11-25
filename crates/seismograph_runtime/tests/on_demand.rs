@@ -763,6 +763,69 @@ fn recording_retains_task_creation_and_real_outcomes_without_a_task_registry() {
 }
 
 #[test]
+fn blocking_pool_records_worker_neutral_queue_depth_and_worker_execution() {
+    let _lock = RECORDING.lock().unwrap();
+    seismograph::recorder(Configuration {
+        runtime_tasks: Policy::all(false),
+        ..Configuration::default()
+    });
+    let runtime = register_runtime(RuntimeMetadata::new("blocking-pool", 1));
+    let worker = runtime.register_worker(WorkerMetadata::new(WorkerRole::Blocking));
+    let pool = runtime.handle().blocking_pool();
+    let task = pool.task(allocate_type_descriptor_id, None, 64);
+
+    task.submitted(3);
+    let ready = task.describe(TaskActivityState::Ready);
+    let worker_handle = worker.handle();
+    let execution = task.started(&worker_handle);
+    assert_eq!(execution.observed_task_id(), Some(task.id()));
+    execution.completed();
+    drop(execution);
+
+    let encoded = seismograph::snapshot(SnapshotOptions::default()).unwrap();
+    let snapshot = seismograph::snapshot::decode(encoded.as_bytes()).unwrap();
+    seismograph::recorder(Configuration::default());
+    let events = snapshot
+        .events
+        .events
+        .iter()
+        .filter(|event| {
+            event.runtime().is_some_and(|event| event.runtime_id == runtime.id())
+                && matches!(
+                    event.kind,
+                    EventKind::TaskSpawned
+                        | EventKind::TaskEnqueued
+                        | EventKind::TaskPollStarted
+                        | EventKind::TaskCompleted
+                        | EventKind::TaskPollFinished
+                )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(ready.id, task.id());
+    assert_eq!(ready.future_size_bytes, Some(64));
+    assert!(ready.activity.unwrap().queued_since.is_some());
+    assert_eq!(
+        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        [
+            EventKind::TaskSpawned,
+            EventKind::TaskEnqueued,
+            EventKind::TaskPollStarted,
+            EventKind::TaskCompleted,
+            EventKind::TaskPollFinished,
+        ]
+    );
+    assert_eq!(events[0].runtime().unwrap().worker_id, None);
+    let enqueued = events[1].runtime().unwrap();
+    assert_eq!((enqueued.worker_id, enqueued.value_0), (None, 3));
+    assert!(
+        events[2..]
+            .iter()
+            .all(|event| event.runtime().unwrap().worker_id == Some(worker.id()))
+    );
+}
+
+#[test]
 fn disabled_task_event_context_does_not_initialize_event_buffers() {
     let _lock = RECORDING.lock().unwrap();
     seismograph::recorder(Configuration {

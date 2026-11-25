@@ -4,7 +4,6 @@
 use std::any::TypeId;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use arty_executor::{TaskCompletion, TaskInstrumentation, TaskSet, TaskState};
 use seismograph::recorder::event::{EventClass, EventTimestamp};
@@ -60,121 +59,7 @@ pub(crate) fn descriptor<T: 'static>() -> TypeDescriptorId {
     })
 }
 
-#[derive(Debug)]
-struct TaskMetadata {
-    describe_type: fn() -> TypeDescriptorId,
-    body_size: usize,
-    events: EventContext,
-    parent: Option<TaskId>,
-    spawned_at: Option<EventTimestamp>,
-}
-
-impl TaskMetadata {
-    fn new<T: 'static>(events: EventContext) -> Self {
-        Self {
-            describe_type: descriptor::<T>,
-            body_size: size_of::<T>(),
-            events,
-            parent: current_task(),
-            spawned_at: None,
-        }
-    }
-
-    fn record_spawn(&mut self) -> Option<TaskIdentity> {
-        self.events
-            .spawned_with(self.describe_type, self.parent, self.body_size)
-            .map(|spawn| {
-                self.spawned_at = Some(spawn.timestamp);
-                TaskIdentity {
-                    id: spawn.id,
-                    descriptor: spawn.descriptor,
-                }
-            })
-    }
-
-    fn identity(&self) -> TaskIdentity {
-        TaskIdentity {
-            id: seismograph_runtime::allocate_task_id(),
-            descriptor: (self.describe_type)(),
-        }
-    }
-
-    fn describe(&self, identity: &TaskIdentity, state: TaskActivityState) -> Task {
-        let mut task = Task::new(identity.id, identity.descriptor, state);
-        task.parent = self.parent;
-        task.spawned_at = self.spawned_at;
-        task.future_size_bytes = Some(u64::try_from(self.body_size).expect("a task body fits the platform address space"));
-        task
-    }
-}
-
-#[derive(Debug)]
-struct TaskIdentity {
-    id: TaskId,
-    descriptor: TypeDescriptorId,
-}
-
-#[derive(Debug)]
-pub(crate) struct TaskInfo {
-    metadata: TaskMetadata,
-    identity: OnceLock<TaskIdentity>,
-    execution_events: OnceLock<EventContext>,
-}
-
-impl TaskInfo {
-    pub(crate) fn new<T: 'static>(events: EventContext) -> Self {
-        let mut metadata = TaskMetadata::new::<T>(events);
-        let identity = metadata.record_spawn().map_or_else(OnceLock::new, OnceLock::from);
-        Self {
-            metadata,
-            identity,
-            execution_events: OnceLock::new(),
-        }
-    }
-
-    pub(crate) fn id(&self) -> TaskId {
-        self.identity.get_or_init(|| self.metadata.identity()).id
-    }
-
-    pub(crate) fn describe(&self, state: TaskActivityState) -> Task {
-        self.metadata
-            .describe(self.identity.get_or_init(|| self.metadata.identity()), state)
-    }
-
-    pub(crate) fn started_on(&self, events: EventContext) {
-        self.execution_events
-            .set(events)
-            .expect("a blocking function starts on exactly one worker");
-    }
-
-    pub(crate) fn completed(&self) {
-        if let Some(id) = self.terminal_id() {
-            self.execution_events.get().unwrap_or(&self.metadata.events).completed(id);
-        }
-    }
-
-    pub(crate) fn panicked(&self) {
-        if let Some(id) = self.terminal_id() {
-            self.execution_events.get().unwrap_or(&self.metadata.events).panicked(id);
-        }
-    }
-
-    pub(crate) fn canceled(&self) {
-        if let Some(id) = self.terminal_id() {
-            self.execution_events.get().unwrap_or(&self.metadata.events).canceled(id);
-        }
-    }
-
-    fn terminal_id(&self) -> Option<TaskId> {
-        self.identity
-            .get()
-            .map(|identity| identity.id)
-            .or_else(|| seismograph::recorder::is_enabled(EventClass::RuntimeTask).then(|| self.id()))
-    }
-}
-
-// Async metadata stays in the executor's owner-only payload. Blocking metadata
-// above remains synchronized because queue inspection and execution can overlap.
+// Async metadata stays in the executor's owner-only payload.
 #[derive(Debug)]
 struct AsyncTaskInfo {
     events: EventContext,
@@ -312,7 +197,7 @@ mod tests {
     use seismograph_runtime::RuntimeMetadata;
     use seismograph_runtime::worker::{WorkerMetadata, WorkerRole};
 
-    use super::{AsyncTaskInfo, TaskInfo, TaskMonitor, current_task, enter_current};
+    use super::{AsyncTaskInfo, TaskMonitor, current_task, enter_current};
 
     struct Recorder(Rc<RefCell<Vec<&'static str>>>);
 
@@ -383,28 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn async_metadata_is_smaller_and_stays_owner_local() {
+    fn async_metadata_stays_owner_local() {
         static_assertions::assert_not_impl_any!(AsyncTaskInfo: Sync);
-        static_assertions::assert_impl_all!(TaskInfo: Send, Sync);
-        assert!(size_of::<AsyncTaskInfo>() < size_of::<TaskInfo>());
         #[cfg(target_pointer_width = "64")]
         assert!(size_of::<AsyncTaskInfo>() <= 56);
-    }
-
-    #[test]
-    fn unobserved_blocking_outcomes_do_not_allocate_task_identities() {
-        let _monitoring = crate::runtime::monitoring::TEST_LOCK.lock().unwrap();
-        let runtime = seismograph_runtime::register_runtime(seismograph_runtime::RuntimeMetadata::new("idle-outcomes", 1));
-        let worker = runtime.register_worker(seismograph_runtime::worker::WorkerMetadata::new(
-            seismograph_runtime::worker::WorkerRole::Blocking,
-        ));
-        seismograph::recorder::without_recording(|| {
-            let info = TaskInfo::new::<()>(worker.handle().task_events());
-            info.completed();
-            info.panicked();
-            info.canceled();
-            assert!(info.identity.get().is_none());
-        });
     }
 
     #[test]

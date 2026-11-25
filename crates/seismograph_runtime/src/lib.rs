@@ -30,6 +30,8 @@
 //! Stopping event recording does not freeze the actual runtime's current state.
 //! [`worker::WorkerHandle::task_events`] supplies a [`Copy`] context for task
 //! creation and real outcomes, without per-task registration or shared ownership.
+//! [`RuntimeHandle::blocking_pool`] supplies worker-neutral queue instrumentation
+//! and binds each blocking task to its worker when execution starts.
 //!
 //! # Example
 //!
@@ -159,6 +161,12 @@ impl RuntimeHandle {
     #[inline]
     pub fn id(&self) -> RuntimeId {
         self.control.id
+    }
+
+    /// Creates worker-neutral instrumentation for one blocking work queue.
+    #[must_use]
+    pub fn blocking_pool(&self) -> task::BlockingPool {
+        task::BlockingPool::new(task::EventContext::new(self.id(), None, self.control.lifecycle_backtraces))
     }
 
     /// Registers worker metadata without registering any tasks.
