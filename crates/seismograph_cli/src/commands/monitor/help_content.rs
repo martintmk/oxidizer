@@ -194,8 +194,8 @@ pub(super) fn document(context: Context, offline: bool) -> Vec<&'static Section>
 }
 
 const VERSIONS: &Section = section!("CRATE VERSIONS";
-    "Monitor (seismograph_cli)" => "Semantic version compiled into this local monitor executable. Shown in the Info view for live connections and saved snapshots.",
-    "Server (seismograph)" => "Semantic version of the seismograph crate in the connected application, queried during discovery after the OS-authorized handshake, before any capture. Shown in the Info view. This is not the protocol crate version or the application's own version.",
+    "Monitor version" => "Semantic version compiled into this local seismograph_cli executable. Shown in the Info view for live connections and saved snapshots.",
+    "Server version" => "Semantic version of the seismograph crate in the connected application, queried during discovery after the OS-authorized handshake, before any capture. Shown in the Info view. This is not the protocol crate version or the application's own version.",
     "unknown (not recorded in snapshot)" => "Saved snapshots do not contain the server crate version. The local monitor version is not the snapshot producer's version.",
 );
 
@@ -212,24 +212,25 @@ const BROWSER: &Section = section!("APPLICATIONS";
 );
 
 const INFO: &Section = section!("INFO / SOURCE";
+    "Connection / Recording / Statistics" => "Info groups process identity, recorder configuration, and live or captured counters.",
     "Name" => "Connected application name.",
     "Instance" => "Application-supplied instance name; '-' means absent.",
     "PID" => "Operating-system process ID.",
     "OS owner" => "Verified owning Unix UID or Windows user SID. Access is enforced by the operating system, not an authentication token.",
     "Endpoint" => "Local Unix socket path or Windows named-pipe name. Knowing the name does not grant connection access.",
-    "Event ring buffer" => "Capacity in events per recording thread.",
+    "Event buffer" => "Ring capacity in events per recording thread.",
     "Allocations / General events / Arc dereferences / Runtime tasks / I/O / Cache" => "Independent recording policies. Each shows enabled state, backtraces on/off, and sample 1/N (percentage = 100/N).",
-    "Telemetry memory / thread" => "Ring-buffer memory for the configured capacity, not application heap usage.",
-    "Active recorder threads" => "Current recorder-thread count from live server statistics. It excludes retired source threads retained in a snapshot.",
-    "Live telemetry memory total" => "Current allocated recorder storage from live server statistics.",
+    "Memory / thread" => "Ring-buffer memory for the configured capacity, not application heap usage.",
+    "Recorder threads" => "Current recorder-thread count from live server statistics. It excludes retired source threads retained in a snapshot.",
+    "Telemetry memory" => "Current allocated recorder storage from live server statistics.",
     "telemetry sources hidden" => "Internal monitor recorder sources are omitted from application thread tables. The count can include retired sources. It is not an active OS-thread count.",
-    "Captured source threads" => "Recorder threads retained in the current snapshot, including retired sources.",
-    "Estimated buffer memory" => "Configured memory per thread multiplied by captured source-thread count. This estimate is not live allocated memory.",
-    "Accepted telemetry events" => "Cumulative accepted records, excluding disabled, suppressed and sampled-out activity.",
-    "Retained telemetry events" => "Records still stored in the source buffers.",
-    "Overwritten telemetry events" => "Records displaced by ring reuse.",
-    "All-class source accepted / overwritten" => "Fallback counts from the captured allocation source before live statistics arrive. They span event classes, not just allocations.",
-    "Retained allocator events" => "Fallback retained count covers allocator records only; its scope differs from all-class source counters.",
+    "Captured threads" => "Recorder threads retained in the current snapshot, including retired sources.",
+    "Estimated memory" => "Configured memory per thread multiplied by captured source-thread count. This estimate is not live allocated memory.",
+    "Accepted events" => "Cumulative accepted records, excluding disabled, suppressed and sampled-out activity.",
+    "Retained events" => "Records still stored in the source buffers.",
+    "Overwritten events" => "Records displaced by ring reuse.",
+    "Source accepted / overwritten" => "Fallback counts from the captured allocation source before live statistics arrive. They span event classes, not just allocations.",
+    "Allocator retained" => "Fallback retained count covers allocator records only; its scope differs from all-class source counters.",
 );
 
 const ACTIVITY: &Section = section!("LIVE ACTIVITY";
@@ -407,20 +408,26 @@ const RUNTIME_WORKERS: &Section = section!("RUNTIME WORKERS";
     "Tasks" => "Distinct asynchronous tasks with a retained poll on this worker. A migrated task can count on more than one worker.",
     "Runs" => "Blocking executions with a retained start on this worker.",
     "Succeeded / Canceled / Panicked" => "Retained terminal outcomes for blocking tasks that started on this worker.",
-    "Polls" => "Retained completed polls on this worker, not a lifetime count. An ongoing poll contributes to the timeline, not this count.",
+    "Polls" => "Retained completed polls on this worker, not a lifetime count. An ongoing poll is not counted.",
+    "Parks" => "Retained events where this worker entered its parked state.",
+    "Unparks" => "Retained events where this worker left its parked state.",
     "Median poll" => "Median retained completed poll duration across this worker's tasks; '-' without samples and 0ns for measured zero.",
     "Max poll" => "Longest retained completed poll duration on this worker; an ongoing poll is not a completed sample.",
-    "Poll timeline" => "Each async worker row bins retained poll intervals on the runtime window. A dim baseline means unobserved time, not measured idle time.",
-    "Sortable headers" => "Click a heading to sort by that column. Poll timeline sorts by total retained poll interval time. Click a heading again to reverse the order.",
+    "Avg sched" => "Mean recorded delay from enqueue to first activation on this worker. Later polls do not add scheduling samples.",
+    "Max sched" => "Maximum recorded delay from enqueue to first activation on this worker.",
+    "Avg ready" => "Mean recorded queue wait assigned to this worker. Samples include first activation and explicitly recorded waits before later polls.",
+    "Max ready" => "Maximum recorded queue wait assigned to this worker. Raw wake latency is excluded.",
+    "Sortable headers" => "Click a heading to sort by that column. Click a heading again to reverse the order.",
     "Avg queue / Max queue" => "Mean and maximum retained time that blocking tasks waited before this worker started them.",
     "Avg exec / Max exec" => "Mean and maximum retained blocking execution duration on this worker.",
-    "Worker Activity" => "The panel beside the worker list shows the selected worker's category-specific totals and durations.",
+    "Worker Activity" => "The async panel shows the recorder thread, current task, delay sample counts, and poll histogram. The blocking panel shows the thread, current task, sample counts, and total durations without repeating grid values.",
     "No runtime data" => "A recorder does not instrument executors automatically. Runtime source presence alone is not event history.",
     "a / b / Up / Down / Enter" => "Select async or blocking workers, move the worker selection, or open the matching task-type page.",
 );
 
 const RUNTIME_TASK_GROUPS: &Section = section!("RUNTIME TASK TYPES";
     "Spawned at" => "Source file, line and column for the task descriptor. A numeric descriptor appears when the source location is unavailable.",
+    "Descriptor not retained" => "The retained ring lost the enqueue event that carried the descriptor. New lifecycle events repeat the descriptor so later captures keep the task type.",
     "Future B" => "Inline future size shared by this asynchronous task type.",
     "Closure B" => "Inline closure size shared by this blocking task type.",
     "Async tasks" => "Groups are inferred from retained poll events. Poll totals include retained finished and unfinished polls.",
@@ -433,20 +440,27 @@ const RUNTIME_TASK_GROUPS: &Section = section!("RUNTIME TASK TYPES";
     "Workers" => "Distinct workers that executed a retained poll or blocking execution.",
     "Polls" => "Retained async polls. An unfinished poll is included but has no duration sample.",
     "Runs" => "Blocking executions with a retained start event. A canceled queue entry has no run.",
-    "Avg ready / Max ready" => "Mean and maximum retained queue wait before an async poll. Raw wake latency is excluded.",
+    "Avg ready / Max ready" => "Mean and maximum recorded queue wait for this type. Samples include first activation and explicitly recorded waits before later polls. Raw wake latency is excluded.",
     "Avg poll" => "Mean duration from retained finished async polls.",
     "Max poll" => "Maximum duration from retained finished async polls.",
     "Avg queue" => "Mean retained blocking queue duration. The duration ends when a blocking worker starts the task.",
     "Max queue" => "Maximum retained blocking queue duration.",
     "Avg exec" => "Mean retained blocking execution duration.",
     "Max exec" => "Maximum retained blocking execution duration. An unfinished execution has no duration sample.",
+    "Task Type Statistics" => "Details align captions so their colons share one column. The full spawn location and descriptor identify the type. Sample counts, totals, and medians describe completed durations.",
+    "Task Statistics" => "Async details show execution workers, completed poll samples, and a duration histogram. Blocking details use aligned caption: value lines and do not show a histogram.",
+    "Scheduling delay" => "Recorded delay from enqueue to first activation. The value is '-' when the first-activation event is absent.",
+    "Missing ready values" => "Arty records initial queue delay in first-activation events. It does not record queue waits before later polls. Without either kind of evidence, ready values are '-'.",
+    "Spawn hierarchy" => "The numbered list starts at the oldest recorded parent and ends at the selected task. Each task shows its source location, captured stack frame, or descriptor. Missing parents, missing locations, and cycles are marked.",
+    "Missing spawn location" => "Older captures can omit locations after a runtime stopped. New captures keep a process-wide location catalog. A captured stack frame or descriptor remains as a fallback.",
+    "PgUp / PgDn / t" => "Scroll detail lines / switch an async task or task-type histogram. These keys work in Runtime and Runtime Task.",
     "a / b / Up / Down" => "Select the async or blocking task-type page, then move the descriptor selection.",
 );
 
 const TASK_EVENTS: &Section = section!("RUNTIME TASK EVENTS";
     "Operations" => "Inferred operation categories attributed to the selected task.",
     "Events" => "Retained occurrences attributed to that operation and task.",
-    "Time (ns)" => "Process-monotonic event timestamp in nanoseconds. It is not wall-clock time.",
+    "Offset" => "Elapsed time from the first inferred event retained for this task. Sorting still uses chronological event time.",
     "Thread" => "Recorder thread that emitted the retained event.",
     "Sequence" => "Per-thread retained event sequence.",
     "Object" => "Recorded object identity associated with the event.",
@@ -475,7 +489,7 @@ const IO_OPERATIONS: &Section = section!("I/O OPERATIONS";
     "Thread" => "Latest retained event's recorder thread, not necessarily initiating or OS thread.",
     "Requested" => "Requested bytes from that event.",
     "Completed" => "Completed bytes from that event.",
-    "Interval" => "Retained finish timestamp minus retained start timestamp, in ns/us/ms/s. This interval includes start-event recording overhead, including backtrace capture. It is not pure device latency. '-' means the pair is incomplete, not zero latency.",
+    "Interval" => "Retained finish timestamp minus retained start timestamp, formatted as a Jiff duration. This interval includes start-event recording overhead, including backtrace capture. It is not pure device latency. '-' means the pair is incomplete, not zero latency.",
     "buffer / span(s) / resource" => "Bottom details: buffer ID ('-' if absent), length in bytes, span count and resource kind. Multiple spans describe a logical buffer, not separate completed operations.",
     "Pending / missing duration" => "May reflect a truncated or filtered window, not only an operation still running.",
     "Up/Down / Backspace" => "Select operation / return to Resources.",
@@ -569,7 +583,7 @@ const ERROR: &Section = section!("SNAPSHOT ERRORS / UNAVAILABLE DATA";
 const COMMON: &Section = section!("UNITS / SCOPE / MISSING DATA";
     "Counts" => "Recorded events or identities, not extrapolated totals.",
     "Bytes" => "Binary units: KiB = 1024 B, MiB = 1024 KiB, GiB = 1024 MiB.",
-    "Durations" => "ns/us/ms/s = nanoseconds/microseconds/milliseconds/seconds.",
+    "Durations" => "Jiff formats durations with compact units from nanoseconds through hours.",
     "Retained window" => "Available records, not process lifetime.",
     "Accepted / overwritten" => "Source counters span event classes and exclude suppressed, sampled-out, disabled and non-producing activity.",
     "Loss percentage" => "Overwritten / accepted is ring loss, not sampling rate or percentage of all application work.",
@@ -660,11 +674,7 @@ mod tests {
     fn version_labels_are_explained_only_in_info_help() {
         for (context, offline) in [(Context::Info, false), (Context::Info, true)] {
             let help = text(context, offline);
-            for label in [
-                "Monitor (seismograph_cli)",
-                "Server (seismograph)",
-                "unknown (not recorded in snapshot)",
-            ] {
+            for label in ["Monitor version", "Server version", "unknown (not recorded in snapshot)"] {
                 assert!(help.contains(label), "{context:?}: missing {label}");
             }
         }
@@ -743,15 +753,15 @@ mod tests {
                 "PID",
                 "OS owner",
                 "Endpoint",
-                "Event ring buffer",
-                "Telemetry memory / thread",
-                "Active recorder threads",
-                "Live telemetry memory total",
-                "Captured source threads",
-                "Estimated buffer memory",
-                "Accepted telemetry events",
-                "Retained telemetry events",
-                "Overwritten telemetry events",
+                "Event buffer",
+                "Memory / thread",
+                "Recorder threads",
+                "Telemetry memory",
+                "Captured threads",
+                "Estimated memory",
+                "Accepted events",
+                "Retained events",
+                "Overwritten events",
                 "events/s",
                 "total",
             ],
@@ -804,9 +814,14 @@ mod tests {
                 "Runs",
                 "Succeeded / Canceled / Panicked",
                 "Polls",
+                "Parks",
+                "Unparks",
                 "Median poll",
                 "Max poll",
-                "Poll timeline",
+                "Avg sched",
+                "Max sched",
+                "Avg ready",
+                "Max ready",
                 "Avg queue / Max queue",
                 "Avg exec / Max exec",
             ],

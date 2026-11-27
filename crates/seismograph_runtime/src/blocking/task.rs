@@ -259,7 +259,7 @@ fn record(
             data.runtime,
             worker,
             data.identity.id().get(),
-            0,
+            data.identity.descriptor().get(),
             value_0,
             value_1,
             backtrace,

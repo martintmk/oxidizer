@@ -17,6 +17,7 @@ use super::super::mouse::{ListTarget, MouseRows};
 use super::super::runtime_timeline::histogram;
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
+use super::runtime_group_ui::aligned_details;
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -73,16 +74,14 @@ fn compare_workers(left: &RuntimeWorkerSummary, right: &RuntimeWorkerSummary, so
         RuntimeWorkerSort::Types => table_ui::directed(left.task_types.cmp(&right.task_types), descending),
         RuntimeWorkerSort::Tasks => table_ui::directed(left.observed_tasks.cmp(&right.observed_tasks), descending),
         RuntimeWorkerSort::Polls => table_ui::directed(left.metrics.poll_count.cmp(&right.metrics.poll_count), descending),
-        RuntimeWorkerSort::Activity => {
-            let activity = |worker: &RuntimeWorkerSummary| {
-                worker.metrics.polls.iter().fold(0_u64, |total, interval| {
-                    total.saturating_add(interval.end.saturating_sub(interval.start))
-                })
-            };
-            table_ui::directed(activity(left).cmp(&activity(right)), descending)
-        }
+        RuntimeWorkerSort::Parks => table_ui::directed(left.park_events.cmp(&right.park_events), descending),
+        RuntimeWorkerSort::Unparks => table_ui::directed(left.unpark_events.cmp(&right.unpark_events), descending),
         RuntimeWorkerSort::MedianPoll => optional(left.metrics.median_poll_nanos, right.metrics.median_poll_nanos, descending),
         RuntimeWorkerSort::MaxPoll => optional(left.metrics.max_poll_nanos, right.metrics.max_poll_nanos, descending),
+        RuntimeWorkerSort::AverageScheduling => optional(left.scheduling_time.mean_nanos(), right.scheduling_time.mean_nanos(), descending),
+        RuntimeWorkerSort::MaximumScheduling => optional(left.scheduling_time.max_nanos, right.scheduling_time.max_nanos, descending),
+        RuntimeWorkerSort::AverageReady => optional(left.ready_time.mean_nanos(), right.ready_time.mean_nanos(), descending),
+        RuntimeWorkerSort::MaximumReady => optional(left.ready_time.max_nanos, right.ready_time.max_nanos, descending),
         RuntimeWorkerSort::Runs => table_ui::directed(left.blocking.executions.cmp(&right.blocking.executions), descending),
         RuntimeWorkerSort::Succeeded => table_ui::directed(left.blocking.succeeded.cmp(&right.blocking.succeeded), descending),
         RuntimeWorkerSort::Canceled => table_ui::directed(left.blocking.canceled.cmp(&right.blocking.canceled), descending),
@@ -132,34 +131,6 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
 
 fn task_count_label(count: u64) -> String {
     format!("{} live {}", format_count(count), if count == 1 { "task" } else { "tasks" })
-}
-
-fn timeline(
-    intervals: &[super::super::runtime_timeline::Interval],
-    window: Option<super::super::runtime_timeline::TimeWindow>,
-    width: usize,
-) -> Line<'static> {
-    Line::from(
-        super::super::runtime_timeline::bins(intervals, window, width)
-            .into_iter()
-            .map(|value| {
-                let glyph = match value {
-                    None | Some(0.0) => "▁",
-                    Some(value) if value < 0.25 => "▂",
-                    Some(value) if value < 0.375 => "▃",
-                    Some(value) if value < 0.5 => "▄",
-                    Some(value) if value < 0.625 => "▅",
-                    Some(value) if value < 0.75 => "▆",
-                    Some(value) if value < 0.875 => "▇",
-                    Some(_) => "█",
-                };
-                Span::styled(
-                    glyph,
-                    Style::default().fg(if value.is_some() { Color::Cyan } else { Color::DarkGray }),
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
 }
 
 #[expect(
@@ -259,13 +230,13 @@ fn draw_workers(
         );
         return;
     }
-    let wide = table.width >= 125;
+    let wide = table.width >= 145;
     let rows = workers
         .iter()
         .skip(first)
         .take(visible)
         .map(|worker| worker_row(worker, view.focus, wide, table.width));
-    let (headers, sorts, widths) = worker_columns(view.focus, wide);
+    let (headers, sorts, widths) = worker_columns(view.focus, wide, table.width);
     let targets = sorts
         .iter()
         .copied()
@@ -298,7 +269,11 @@ fn draw_workers(
     );
 }
 
-fn worker_columns(focus: RuntimeWorkersFocus, wide: bool) -> (Vec<&'static str>, Vec<RuntimeWorkerSort>, Vec<Constraint>) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "responsive worker columns keep their sort targets and widths aligned"
+)]
+fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'static str>, Vec<RuntimeWorkerSort>, Vec<Constraint>) {
     match (focus, wide) {
         (RuntimeWorkersFocus::Asynchronous, true) => (
             vec![
@@ -307,9 +282,14 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool) -> (Vec<&'static str>,
                 "Types",
                 "Tasks",
                 "Polls",
+                "Parks",
+                "Unparks",
                 "Median poll",
                 "Max poll",
-                "Poll timeline",
+                "Avg sched",
+                "Max sched",
+                "Avg ready",
+                "Max ready",
             ],
             vec![
                 RuntimeWorkerSort::WorkerId,
@@ -317,34 +297,74 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool) -> (Vec<&'static str>,
                 RuntimeWorkerSort::Types,
                 RuntimeWorkerSort::Tasks,
                 RuntimeWorkerSort::Polls,
+                RuntimeWorkerSort::Parks,
+                RuntimeWorkerSort::Unparks,
                 RuntimeWorkerSort::MedianPoll,
                 RuntimeWorkerSort::MaxPoll,
-                RuntimeWorkerSort::Activity,
+                RuntimeWorkerSort::AverageScheduling,
+                RuntimeWorkerSort::MaximumScheduling,
+                RuntimeWorkerSort::AverageReady,
+                RuntimeWorkerSort::MaximumReady,
             ],
             vec![
-                Constraint::Length(24),
+                Constraint::Length(10),
                 Constraint::Length(9),
-                Constraint::Length(7),
-                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length(6),
                 Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Length(9),
                 Constraint::Length(12),
                 Constraint::Length(12),
-                Constraint::Min(8),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
             ],
         ),
-        (RuntimeWorkersFocus::Asynchronous, false) => (
-            vec!["Worker ID", "Types", "Polls", "Max poll"],
+        (RuntimeWorkersFocus::Asynchronous, false) if width >= 95 => (
             vec![
-                RuntimeWorkerSort::WorkerId,
-                RuntimeWorkerSort::Types,
-                RuntimeWorkerSort::Polls,
-                RuntimeWorkerSort::MaxPoll,
+                "Worker ID",
+                "State",
+                "Types",
+                "Tasks",
+                "Polls",
+                "Max poll",
+                "Avg sched",
+                "Max sched",
+                "Avg ready",
+                "Max ready",
             ],
             vec![
-                Constraint::Min(18),
-                Constraint::Length(7),
-                Constraint::Length(8),
-                Constraint::Length(12),
+                RuntimeWorkerSort::WorkerId,
+                RuntimeWorkerSort::State,
+                RuntimeWorkerSort::Types,
+                RuntimeWorkerSort::Tasks,
+                RuntimeWorkerSort::Polls,
+                RuntimeWorkerSort::MaxPoll,
+                RuntimeWorkerSort::AverageScheduling,
+                RuntimeWorkerSort::MaximumScheduling,
+                RuntimeWorkerSort::AverageReady,
+                RuntimeWorkerSort::MaximumReady,
+            ],
+            vec![8, 8, 4, 5, 6, 10, 10, 10, 10, 10]
+                .into_iter()
+                .map(Constraint::Length)
+                .collect(),
+        ),
+        (RuntimeWorkersFocus::Asynchronous, false) => (
+            vec!["Worker ID", "Polls", "Avg sched", "Max ready"],
+            vec![
+                RuntimeWorkerSort::WorkerId,
+                RuntimeWorkerSort::Polls,
+                RuntimeWorkerSort::AverageScheduling,
+                RuntimeWorkerSort::MaximumReady,
+            ],
+            vec![
+                Constraint::Min(8),
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Length(10),
             ],
         ),
         (RuntimeWorkersFocus::Blocking, true) => (
@@ -356,6 +376,8 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool) -> (Vec<&'static str>,
                 "Succeeded",
                 "Canceled",
                 "Panicked",
+                "Parks",
+                "Unparks",
                 "Avg queue",
                 "Max queue",
                 "Avg exec",
@@ -369,12 +391,14 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool) -> (Vec<&'static str>,
                 RuntimeWorkerSort::Succeeded,
                 RuntimeWorkerSort::Canceled,
                 RuntimeWorkerSort::Panicked,
+                RuntimeWorkerSort::Parks,
+                RuntimeWorkerSort::Unparks,
                 RuntimeWorkerSort::AverageQueue,
                 RuntimeWorkerSort::MaximumQueue,
                 RuntimeWorkerSort::AverageExecution,
                 RuntimeWorkerSort::MaximumExecution,
             ],
-            vec![24, 9, 7, 8, 10, 9, 9, 12, 12, 12, 12]
+            vec![10, 9, 5, 6, 9, 8, 8, 7, 9, 12, 12, 12, 12]
                 .into_iter()
                 .map(Constraint::Length)
                 .collect(),
@@ -410,26 +434,34 @@ fn worker_row(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: b
                 worker.task_types.to_string(),
                 worker.observed_tasks.to_string(),
                 format_count(worker.metrics.poll_count),
+                format_count(worker.park_events),
+                format_count(worker.unpark_events),
                 duration(worker.metrics.median_poll_nanos),
                 duration(worker.metrics.max_poll_nanos),
+                duration(worker.scheduling_time.mean_nanos()),
+                duration(worker.scheduling_time.max_nanos),
+                duration(worker.ready_time.mean_nanos()),
+                duration(worker.ready_time.max_nanos),
             ]);
-            let graph_width = usize::from(width.saturating_sub(86));
-            let mut cells = cells
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    let line = Line::from(value);
-                    Cell::from(if index >= 2 { line.right_aligned() } else { line })
-                })
-                .collect::<Vec<_>>();
-            cells.push(Cell::from(timeline(&worker.metrics.polls, worker.window, graph_width)));
-            return Row::new(cells);
+        }
+        (RuntimeWorkersFocus::Asynchronous, false) if width >= 95 => {
+            cells.extend([
+                worker.state.clone(),
+                worker.task_types.to_string(),
+                worker.observed_tasks.to_string(),
+                format_count(worker.metrics.poll_count),
+                duration(worker.metrics.max_poll_nanos),
+                duration(worker.scheduling_time.mean_nanos()),
+                duration(worker.scheduling_time.max_nanos),
+                duration(worker.ready_time.mean_nanos()),
+                duration(worker.ready_time.max_nanos),
+            ]);
         }
         (RuntimeWorkersFocus::Asynchronous, false) => {
             cells.extend([
-                worker.task_types.to_string(),
                 format_count(worker.metrics.poll_count),
-                duration(worker.metrics.max_poll_nanos),
+                duration(worker.scheduling_time.mean_nanos()),
+                duration(worker.ready_time.max_nanos),
             ]);
         }
         (RuntimeWorkersFocus::Blocking, true) => {
@@ -440,6 +472,8 @@ fn worker_row(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: b
                 format_count(worker.blocking.succeeded),
                 format_count(worker.blocking.canceled),
                 format_count(worker.blocking.panicked),
+                format_count(worker.park_events),
+                format_count(worker.unpark_events),
                 duration(worker.blocking.queue_time.mean_nanos()),
                 duration(worker.blocking.queue_time.max_nanos),
                 duration(worker.blocking.execution_time.mean_nanos()),
@@ -475,51 +509,55 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
         return;
     };
     if focus == RuntimeWorkersFocus::Asynchronous {
-        let [summary, chart] = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
+        let [summary, chart] = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
         let lines = vec![
-            Line::from(worker_name(worker)),
             Line::from(format!(
-                "{} task types · {} tasks · {} polls",
-                worker.task_types,
-                worker.observed_tasks,
-                format_count(worker.metrics.poll_count)
+                "Thread: {}",
+                worker.thread_id.map_or_else(|| "-".into(), |id| id.to_string())
             )),
             Line::from(format!(
-                "Poll duration: median {} · max {}",
-                duration(worker.metrics.median_poll_nanos),
-                duration(worker.metrics.max_poll_nanos)
+                "Current task: {}",
+                worker.current_task.map_or_else(|| "-".into(), |id| format!("#{id}"))
             )),
-            timeline(&worker.metrics.polls, worker.window, usize::from(area.width.saturating_sub(2))),
+            Line::from(format!("Scheduling samples: {}", format_count(worker.scheduling_time.samples))),
+            Line::from(format!("Ready wait samples: {}", format_count(worker.ready_time.samples))),
+            Line::from(format!("Park events: {}", format_count(worker.park_events))),
+            Line::from(format!("Unpark events: {}", format_count(worker.unpark_events))),
         ];
-        frame.render_widget(Paragraph::new(lines).block(table_ui::focused_block(title, false)), summary);
+        frame.render_widget(
+            Paragraph::new(aligned_details(lines)).block(table_ui::focused_block(title, false)),
+            summary,
+        );
         draw_poll_histogram(frame, chart, &worker.metrics.poll_samples);
         return;
     }
     let lines = vec![
-        Line::from(worker_name(worker)),
         Line::from(format!(
-            "{} task types · {} runs",
-            worker.task_types,
-            format_count(worker.blocking.executions),
+            "Thread: {}",
+            worker.thread_id.map_or_else(|| "-".into(), |id| id.to_string())
         )),
         Line::from(format!(
-            "{} succeeded · {} canceled · {} panicked",
-            format_count(worker.blocking.succeeded),
-            format_count(worker.blocking.canceled),
-            format_count(worker.blocking.panicked),
+            "Current task: {}",
+            worker.current_task.map_or_else(|| "-".into(), |id| format!("#{id}"))
+        )),
+        Line::from(format!("Queue samples: {}", format_count(worker.blocking.queue_time.samples))),
+        Line::from(format!(
+            "Total queue wait: {}",
+            duration((worker.blocking.queue_time.samples != 0).then_some(worker.blocking.queue_time.total_nanos))
         )),
         Line::from(format!(
-            "Queue: avg {} · max {}",
-            duration(worker.blocking.queue_time.mean_nanos()),
-            duration(worker.blocking.queue_time.max_nanos),
+            "Execution samples: {}",
+            format_count(worker.blocking.execution_time.samples)
         )),
         Line::from(format!(
-            "Execution: avg {} · max {}",
-            duration(worker.blocking.execution_time.mean_nanos()),
-            duration(worker.blocking.execution_time.max_nanos),
+            "Total execution: {}",
+            duration((worker.blocking.execution_time.samples != 0).then_some(worker.blocking.execution_time.total_nanos))
         )),
     ];
-    frame.render_widget(Paragraph::new(lines).block(table_ui::focused_block(title, false)), area);
+    frame.render_widget(
+        Paragraph::new(aligned_details(lines)).block(table_ui::focused_block(title, false)),
+        area,
+    );
 }
 
 fn draw_poll_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, samples: &[u64]) {
@@ -566,15 +604,15 @@ mod tests {
     fn histogram_duration_labels_fit_fixed_width_bars() {
         for (nanos, expected) in [
             (999, "999ns"),
-            (1_000, "1us"),
-            (999_999, "999us"),
+            (1_000, "1µs"),
+            (999_999, "999µs"),
             (1_000_000, "1ms"),
             (999_999_999, "999ms"),
-            (1_000_000_000, "1.0s"),
+            (1_000_000_000, "1s"),
             (10_000_000_000, "10s"),
         ] {
             assert_eq!(format_histogram_duration(nanos), expected);
-            assert!(expected.len() <= 5);
+            assert!(expected.chars().count() <= 5);
         }
     }
 
@@ -591,8 +629,20 @@ mod tests {
                     worker_id: Some(1),
                     role: "Core".into(),
                     state: "Running".into(),
+                    park_events: 5,
+                    unpark_events: 6,
                     observed_tasks: 3,
                     task_types: 2,
+                    scheduling_time: DurationSummary {
+                        samples: 2,
+                        total_nanos: 80,
+                        max_nanos: Some(60),
+                    },
+                    ready_time: DurationSummary {
+                        samples: 3,
+                        total_nanos: 150,
+                        max_nanos: Some(90),
+                    },
                     metrics: ExecutionMetrics {
                         poll_count: 7,
                         median_poll_nanos: Some(20),
@@ -607,6 +657,8 @@ mod tests {
                     worker_id: Some(2),
                     role: "Blocking".into(),
                     state: "Running".into(),
+                    park_events: 7,
+                    unpark_events: 8,
                     task_types: 1,
                     blocking: BlockingWorkerSummary {
                         executions: 4,
@@ -629,6 +681,60 @@ mod tests {
             ],
             ..RuntimeMonitorSnapshot::default()
         }
+    }
+
+    #[test]
+    fn runtime_worker_grid_shows_scheduling_and_ready_delays_at_each_width() {
+        let runtime = runtime();
+        let view = RuntimeViewState::new();
+        let workers = workers_for(&runtime, view);
+        let mouse = MouseRows::default();
+        for width in [80, 105, 150] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    mouse.begin(frame.area());
+                    draw_workers(frame, &mouse, frame.area(), &runtime, &workers, view);
+                })
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>();
+            assert!(text.contains("Avg sched"));
+            assert!(text.contains("Max ready"));
+            assert!(text.contains("40ns"));
+            assert!(text.contains("90ns"));
+            assert!(!text.contains("Poll timeline"));
+            if width >= 95 {
+                assert!(text.contains("Max sched"));
+                assert!(text.contains("Avg ready"));
+                assert!(text.contains("60ns"));
+                assert!(text.contains("50ns"));
+            }
+            if width >= 125 {
+                assert!(text.contains("Median poll"));
+                assert!(text.contains("20ns"));
+            }
+            if width >= 145 {
+                assert!(text.contains("Parks"));
+                assert!(text.contains("Unparks"));
+            }
+        }
+        let mut other = runtime.workers[0].clone();
+        other.worker_id = Some(3);
+        other.scheduling_time.max_nanos = Some(30);
+        assert_eq!(
+            compare_workers(&runtime.workers[0], &other, RuntimeWorkerSort::MaximumScheduling, true),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_workers(&runtime.workers[0], &other, RuntimeWorkerSort::MaximumScheduling, false),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -667,11 +773,35 @@ mod tests {
                     assert!(text.contains("Async Workers"));
                     assert!(text.contains("Async Worker Activity"));
                     assert!(text.contains("50ns"));
+                    let details = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
+                    assert!(details.contains("Park events: 5"), "{details}");
+                    assert!(details.contains("Unpark events: 6"), "{details}");
                 }
                 RuntimeWorkersFocus::Blocking => {
                     assert!(text.contains("Blocking Workers"));
                     assert!(text.contains("Blocking Worker Activity"));
                     assert!(text.contains("200ns"));
+                    let details = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
+                    for expected in [
+                        "Thread: -",
+                        "Current task: -",
+                        "Queue samples: 4",
+                        "Total queue wait: 80ns",
+                        "Execution samples: 4",
+                        "Total execution: 400ns",
+                    ] {
+                        assert!(details.contains(expected), "{expected}: {details}");
+                    }
+                    for duplicate in [
+                        "Worker:",
+                        "Task types:",
+                        "Runs:",
+                        "Succeeded:",
+                        "Maximum queue:",
+                        "Maximum execution:",
+                    ] {
+                        assert!(!details.contains(duplicate), "{duplicate}: {details}");
+                    }
                 }
             }
         }

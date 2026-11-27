@@ -413,6 +413,7 @@ impl TaskBuilder {
         value_0: u64,
         value_1: u64,
     ) {
+        self.observe_descriptor(kind, related);
         match kind {
             EventKind::TaskSpawned | EventKind::TaskEnqueued => {
                 self.task.parent = TaskId::from_raw(related);
@@ -504,6 +505,22 @@ impl TaskBuilder {
         }
     }
 
+    fn observe_descriptor(&mut self, kind: EventKind, related: u64) {
+        if self.task.type_descriptor.is_none()
+            && matches!(
+                kind,
+                EventKind::TaskMaterialized
+                    | EventKind::TaskPollStarted
+                    | EventKind::TaskPollFinished
+                    | EventKind::TaskCompleted
+                    | EventKind::TaskCanceled
+                    | EventKind::TaskPanicked
+            )
+        {
+            self.task.type_descriptor = TypeDescriptorId::from_raw(related);
+        }
+    }
+
     fn asynchronous(&mut self) -> &mut AsynchronousTask {
         if !matches!(self.task.kind, TaskKind::Asynchronous(_)) {
             self.task.kind = TaskKind::Asynchronous(AsynchronousTask::default());
@@ -566,7 +583,7 @@ mod tests {
 
     use super::*;
 
-    fn event(kind: EventKind, task: u64, worker: Option<u64>, value_0: u64, value_1: u64) -> Event {
+    fn event(kind: EventKind, task: u64, worker: Option<u64>, related_id: u64, value_0: u64, value_1: u64) -> Event {
         Event {
             thread_id: ThreadId::new(1),
             sequence: EventSequence::new(1),
@@ -576,7 +593,7 @@ mod tests {
                 runtime_id: RuntimeId::from_raw(1).unwrap(),
                 worker_id: worker.and_then(WorkerId::from_raw),
                 subject_id: task,
-                related_id: 0,
+                related_id,
                 value_0,
                 value_1,
             }),
@@ -588,8 +605,8 @@ mod tests {
     fn poll_only_history_creates_an_incomplete_asynchronous_task() {
         let events = Events {
             events: vec![
-                event(EventKind::TaskPollStarted, 7, Some(3), 0, 0),
-                event(EventKind::TaskPollFinished, 7, Some(3), 11, 0),
+                event(EventKind::TaskPollStarted, 7, Some(3), 17, 0, 0),
+                event(EventKind::TaskPollFinished, 7, Some(3), 17, 11, 0),
             ],
             ..Events::default()
         };
@@ -597,6 +614,7 @@ mod tests {
         let model = RuntimeModel::from_events(&events, None);
         assert_eq!(model.runtimes[0].tasks[0].state, TaskState::Waiting);
         assert!(model.runtimes[0].tasks[0].parent.is_none());
+        assert_eq!(model.runtimes[0].tasks[0].type_descriptor, TypeDescriptorId::from_raw(17));
         let TaskKind::Asynchronous(task) = &model.runtimes[0].tasks[0].kind else {
             panic!("poll events identify an asynchronous task");
         };
@@ -608,10 +626,10 @@ mod tests {
     fn blocking_history_retains_queue_and_execution_durations() {
         let events = Events {
             events: vec![
-                event(EventKind::WorkerStarted, 3, Some(3), 2, u64::from(u32::MAX)),
-                event(EventKind::TaskEnqueued, 7, None, 17, 0),
-                event(EventKind::TaskMaterialized, 7, Some(3), 41, 9),
-                event(EventKind::TaskCompleted, 7, Some(3), 83, 0),
+                event(EventKind::WorkerStarted, 3, Some(3), 0, 2, u64::from(u32::MAX)),
+                event(EventKind::TaskEnqueued, 7, None, 0, 17, 0),
+                event(EventKind::TaskMaterialized, 7, Some(3), 17, 41, 9),
+                event(EventKind::TaskCompleted, 7, Some(3), 17, 83, 0),
             ],
             ..Events::default()
         };

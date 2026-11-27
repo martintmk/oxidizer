@@ -73,51 +73,6 @@ pub(super) fn union(intervals: &[Interval]) -> Vec<Interval> {
     merged
 }
 
-/// The union is clipped before summing, so overlapping polls cannot exceed 100 percent.
-pub(super) fn occupancy(intervals: &[Interval], window: TimeWindow) -> Option<f64> {
-    let span = window.end.checked_sub(window.start).filter(|span| *span > 0)?;
-    let clipped = intervals
-        .iter()
-        .filter_map(|interval| {
-            let start = interval.start.max(window.start);
-            let end = interval.end.min(window.end);
-            (start < end || (interval.start == interval.end && start == end)).then_some(Interval { start, end })
-        })
-        .collect::<Vec<_>>();
-    if clipped.is_empty() {
-        return None;
-    }
-    let occupied = union(&clipped).iter().map(|interval| interval.end - interval.start).sum::<u64>();
-    Some(std::time::Duration::from_nanos(occupied).as_secs_f64() / std::time::Duration::from_nanos(span).as_secs_f64())
-}
-
-/// Equal-width time bins; empty bins are unknown, including source-only legacy captures.
-pub(super) fn bins(intervals: &[Interval], window: Option<TimeWindow>, count: usize) -> Vec<Option<f64>> {
-    let Some(window) = window.filter(|window| window.end > window.start) else {
-        return vec![None; count];
-    };
-    if count == 0 {
-        return Vec::new();
-    }
-    let merged = union(intervals);
-    let span = u128::from(window.end - window.start);
-    let mut cursor = 0;
-    (0..count)
-        .map(|index| {
-            // Products use u128; every resulting offset is bounded by the original u64 span.
-            let offset = |position: usize| u64::try_from(span * position as u128 / count as u128).unwrap_or(u64::MAX);
-            let start = window.start + offset(index);
-            let end = window.start + offset(index + 1);
-            while cursor < merged.len() && merged[cursor].end < start {
-                cursor += 1;
-            }
-            let relevant = &merged[cursor..];
-            let end_index = relevant.partition_point(|interval| interval.start < end || (index + 1 == count && interval.start == end));
-            occupancy(&relevant[..end_index], TimeWindow { start, end })
-        })
-        .collect()
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct HistogramBin {
     pub(super) lower: u64,
@@ -174,24 +129,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gamma_survivor_timeline_bins_keep_zero_length_boundary_evidence() {
-        let window = Some(TimeWindow { start: 10, end: 30 });
-        assert_eq!(bins(&[Interval { start: 10, end: 10 }], window, 2), [Some(0.0), None]);
-        assert_eq!(bins(&[Interval { start: 20, end: 20 }], window, 2), [None, Some(0.0)]);
-        assert_eq!(bins(&[Interval { start: 30, end: 30 }], window, 2), [None, Some(0.0)]);
-        assert_eq!(
-            bins(&[Interval { start: 0, end: 0 }, Interval { start: 25, end: 30 }], window, 2),
-            [None, Some(0.5)]
-        );
-        assert_eq!(bins(&[Interval { start: 15, end: 20 }], window, 2), [Some(0.5), None]);
-        assert!(bins(&[Interval { start: 10, end: 20 }], window, 0).is_empty());
-        assert_eq!(
-            bins(&[Interval { start: 10, end: 10 }], Some(TimeWindow { start: 10, end: 10 }), 2),
-            [None, None]
-        );
-    }
-
-    #[test]
     fn median_is_exact_not_average_and_distinguishes_zero() {
         assert_eq!(
             (
@@ -203,46 +140,6 @@ mod tests {
             ),
             (None, Some(0), Some(2), Some(3), Some(u64::MAX - 1))
         );
-    }
-
-    #[test]
-    fn occupancy_uses_clipped_union_not_sum() {
-        let intervals = [
-            Interval { start: 0, end: 60 },
-            Interval { start: 20, end: 90 },
-            Interval { start: 80, end: 200 },
-        ];
-        assert_eq!(occupancy(&intervals, TimeWindow { start: 10, end: 100 }), Some(1.0));
-        assert_eq!(occupancy(&[], TimeWindow { start: 10, end: 100 }), None);
-        assert_eq!(occupancy(&intervals, TimeWindow { start: 10, end: 10 }), None);
-        assert_eq!(
-            occupancy(&[Interval { start: 15, end: 15 }], TimeWindow { start: 10, end: 100 }),
-            Some(0.0)
-        );
-    }
-
-    #[test]
-    fn bins_preserve_unknown_gaps_and_common_axis() {
-        assert_eq!(
-            bins(&[Interval { start: 0, end: 50 }], Some(TimeWindow { start: 0, end: 100 }), 2),
-            [Some(1.0), None]
-        );
-        assert_eq!(
-            bins(
-                &[
-                    Interval { start: 5, end: 15 },
-                    Interval { start: 20, end: 20 },
-                    Interval { start: 25, end: 40 },
-                ],
-                Some(TimeWindow { start: 0, end: 40 }),
-                4,
-            ),
-            [Some(0.5), Some(0.5), Some(0.5), Some(1.0)]
-        );
-        assert_eq!(bins(&[], None, 3), [None, None, None]);
-        assert_eq!(bins(&[], Some(TimeWindow { start: 1, end: 1 }), 2), [None, None]);
-        assert_eq!(bins(&[], Some(TimeWindow { start: 0, end: 1 }), 0), []);
-        assert_eq!(bins(&[], Some(TimeWindow { start: 0, end: u64::MAX }), 2), [None, None]);
     }
 
     #[test]

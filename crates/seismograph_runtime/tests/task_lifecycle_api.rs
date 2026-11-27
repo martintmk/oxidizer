@@ -68,6 +68,38 @@ fn runtime_capture_includes_registered_task_spawn_locations() {
 }
 
 #[test]
+fn recording_an_older_task_registers_its_spawn_location() {
+    let _recording = RECORDING.lock().unwrap();
+    let runtime = Runtime::builder("late-recorded-location").configured_workers(1).build();
+    let worker = runtime.async_worker(WorkerMetadata::new(WorkerRole::Core));
+    let disabled_identity = TaskIdentity::from_location(std::panic::Location::caller());
+    let identity = TaskIdentity::from_location(std::panic::Location::caller());
+
+    let _disabled = seismograph_runtime::asynchronous::Task::unrecorded(disabled_identity, &worker);
+    assert!(
+        runtime
+            .capture()
+            .task_locations
+            .iter()
+            .all(|location| location.type_descriptor != disabled_identity.descriptor())
+    );
+
+    seismograph::recorder(Configuration {
+        runtime_tasks: Policy::all(false),
+        ..Configuration::default()
+    });
+    let _task = seismograph_runtime::asynchronous::Task::unrecorded(identity, &worker);
+    assert!(
+        runtime
+            .capture()
+            .task_locations
+            .iter()
+            .any(|location| location.type_descriptor == identity.descriptor())
+    );
+    seismograph::recorder(Configuration::default());
+}
+
+#[test]
 fn async_queue_activation_poll_and_outcome_preserve_the_supplied_context() {
     let _recording = RECORDING.lock().unwrap();
     seismograph::recorder(Configuration {
@@ -132,13 +164,14 @@ fn async_queue_activation_poll_and_outcome_preserve_the_supplied_context() {
     );
     let activated = events[1].runtime().unwrap();
     assert_eq!(
-        (activated.worker_id, activated.subject_id, activated.value_1),
-        (Some(executor.id()), identity.id().get(), 65)
+        (activated.worker_id, activated.subject_id, activated.related_id, activated.value_1),
+        (Some(executor.id()), identity.id().get(), identity.descriptor().get(), 65)
     );
+    assert_eq!(events[2].runtime().unwrap().related_id, identity.descriptor().get());
     let finished = events[3].runtime().unwrap();
     assert_eq!(
-        (finished.worker_id, finished.subject_id, finished.value_1),
-        (Some(executor.id()), identity.id().get(), 1)
+        (finished.worker_id, finished.subject_id, finished.related_id, finished.value_1),
+        (Some(executor.id()), identity.id().get(), identity.descriptor().get(), 1)
     );
 }
 
@@ -215,9 +248,10 @@ fn blocking_start_and_finish_record_queue_and_execution_context() {
     );
     let started = events[1].runtime().unwrap();
     assert_eq!(
-        (started.worker_id, started.subject_id, started.value_1),
-        (Some(executor.id()), identity.id().get(), 33)
+        (started.worker_id, started.subject_id, started.related_id, started.value_1),
+        (Some(executor.id()), identity.id().get(), identity.descriptor().get(), 33)
     );
+    assert_eq!(events[2].runtime().unwrap().related_id, identity.descriptor().get());
     let finished = events[2].runtime().unwrap();
     assert_eq!(
         (finished.worker_id, finished.subject_id, finished.value_1),

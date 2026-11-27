@@ -28,6 +28,7 @@ use std::time::Duration;
 use arty::task::{Context, JoinError};
 use seismograph::recorder::event::{EventClass, EventKind, ObjectId, Record};
 use seismograph::recorder::io::{BufferId, IoEvent, IoOperationId, IoOutcome, IoResourceId, IoResourceKind};
+use thread_aware::ThreadAware;
 
 rallocator::rallocator!(backend = dynamic, default = system);
 
@@ -45,6 +46,7 @@ const BLOCKING_TASK_DELAY: Duration = Duration::from_millis(750);
 const BLOCKING_ALLOCATION_DELAY: Duration = Duration::from_millis(1_250);
 const CYCLE_DELAY: Duration = Duration::from_millis(500);
 
+#[derive(ThreadAware)]
 struct CycleSummary {
     allocated_bytes: usize,
     active_sessions: usize,
@@ -66,7 +68,9 @@ async fn main(cx: Context) -> Result<(), JoinError> {
 
     loop {
         cycle += 1;
-        let cycle_task = cx.scheduler().spawn(move |cx| async move { run_cycle(cx, cycle).await });
+        let cycle_task = cx
+            .scheduler()
+            .spawn_anywhere((cx.clone(), cycle), |(cx, cycle)| async move { run_cycle(cx, cycle).await });
         let summary = cycle_task.await??;
 
         println!(

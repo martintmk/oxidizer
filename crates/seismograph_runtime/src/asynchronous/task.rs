@@ -154,8 +154,12 @@ impl Task {
     /// Creates a task with no retained queue lifecycle.
     ///
     /// Its polls are independent. Finishing a pending poll does not return task
-    /// state for the next poll.
+    /// state for the next poll. The first recorded poll registers the spawn
+    /// location for source snapshots.
     pub fn unrecorded(identity: TaskIdentity, worker: &super::Worker) -> Self {
+        if is_enabled(EventClass::RuntimeTask) {
+            worker.runtime().register_task_identity(identity);
+        }
         Self {
             data: TaskData {
                 identity,
@@ -188,7 +192,7 @@ impl Task {
                 self.data.runtime,
                 Some(worker.id()),
                 self.data.identity.id().get(),
-                0,
+                self.data.identity.descriptor().get(),
                 0,
                 0,
                 BacktraceCapture::Never,
@@ -302,7 +306,7 @@ fn record(
             data.runtime,
             worker,
             data.identity.id().get(),
-            0,
+            data.identity.descriptor().get(),
             value_0,
             value_1,
             backtrace,

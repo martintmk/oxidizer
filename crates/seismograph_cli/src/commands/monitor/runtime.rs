@@ -116,10 +116,14 @@ pub(super) struct RuntimeWorkerSummary {
     pub(super) state: String,
     pub(super) thread_id: Option<u64>,
     pub(super) current_task: Option<u64>,
+    pub(super) park_events: u64,
+    pub(super) unpark_events: u64,
     pub(super) observed_tasks: usize,
     pub(super) task_types: usize,
     pub(super) metrics: ExecutionMetrics,
     pub(super) blocking: BlockingWorkerSummary,
+    pub(super) scheduling_time: DurationSummary,
+    pub(super) ready_time: DurationSummary,
     pub(super) window: Option<TimeWindow>,
     pub(super) tasks: Vec<RuntimeTaskSummary>,
 }
@@ -130,6 +134,7 @@ pub(super) struct RuntimeTaskSummary {
     pub(super) runtime_id: u64,
     pub(super) parent_id: Option<u64>,
     pub(super) origin_worker_id: Option<u64>,
+    pub(super) scheduling_delay_nanos: Option<u64>,
     pub(super) type_descriptor_id: Option<u64>,
     pub(super) future_size_bytes: Option<u64>,
     pub(super) operations: u64,
@@ -298,7 +303,7 @@ fn observe_task_group(
 fn finish_task_groups(
     asynchronous_groups: BTreeMap<(u64, Option<u64>, Option<u64>), AsynchronousTaskGroupBuilder>,
     blocking_groups: BTreeMap<(u64, Option<u64>, Option<u64>), BlockingTaskGroupBuilder>,
-    task_locations: &HashMap<(u64, u64), String>,
+    task_locations: &HashMap<u64, String>,
 ) -> (Vec<AsynchronousTaskGroupSummary>, Vec<BlockingTaskGroupSummary>) {
     let mut asynchronous = asynchronous_groups
         .into_iter()
@@ -307,7 +312,7 @@ fn finish_task_groups(
                 runtime_id,
                 worker_id,
                 type_descriptor_id,
-                spawned_at: type_descriptor_id.and_then(|descriptor| task_locations.get(&(runtime_id, descriptor)).cloned()),
+                spawned_at: type_descriptor_id.and_then(|descriptor| task_locations.get(&descriptor).cloned()),
                 body_size_bytes: only_value(&group.body_sizes),
                 outcomes: group.outcomes.finish(),
                 polls: group.polls,
@@ -333,7 +338,7 @@ fn finish_task_groups(
             runtime_id,
             worker_id,
             type_descriptor_id,
-            spawned_at: type_descriptor_id.and_then(|descriptor| task_locations.get(&(runtime_id, descriptor)).cloned()),
+            spawned_at: type_descriptor_id.and_then(|descriptor| task_locations.get(&descriptor).cloned()),
             body_size_bytes: only_value(&group.body_sizes),
             outcomes: group.outcomes.finish(),
             executions: group.executions,
@@ -360,6 +365,15 @@ fn only_value(values: &BTreeSet<u64>) -> Option<u64> {
 }
 
 impl TaskBuilder {
+    fn ready_observed(&mut self, timestamp: u64, duration: u64) {
+        self.ready_samples.push(duration);
+        if timestamp != 0
+            && let Some(start) = timestamp.checked_sub(duration)
+        {
+            self.ready.push(Interval { start, end: timestamp });
+        }
+    }
+
     fn poll_started(&mut self, worker_id: Option<u64>, timestamp: u64, duration: u64, flag: u64) {
         self.executed.insert(worker_id);
         if self.unassigned_poll.is_some_and(|poll| poll.start == timestamp)
@@ -386,6 +400,27 @@ impl TaskBuilder {
 
 type Workers = BTreeMap<(u64, Option<u64>), RuntimeWorkerSummary>;
 
+fn observe_ready_delay(
+    runtime_id: u64,
+    worker_id: Option<u64>,
+    descriptor: Option<u64>,
+    duration: u64,
+    initial_activation: bool,
+    workers: &mut Workers,
+    groups: &mut BTreeMap<(u64, Option<u64>, Option<u64>), AsynchronousTaskGroupBuilder>,
+) {
+    let worker = workers
+        .entry((runtime_id, worker_id))
+        .or_insert_with(|| worker_row(runtime_id, worker_id));
+    worker.ready_time.observe(Some(duration));
+    if initial_activation {
+        worker.scheduling_time.observe(Some(duration));
+    }
+    let group = groups.entry((runtime_id, worker_id, descriptor)).or_default();
+    group.ready_time.observe(Some(duration));
+    group.ready_samples.push(duration);
+}
+
 #[derive(Default)]
 struct RuntimeSeed {
     runtimes: Vec<RuntimeSummary>,
@@ -393,7 +428,7 @@ struct RuntimeSeed {
     tasks: BTreeMap<(u64, u64), TaskBuilder>,
     asynchronous_groups: BTreeMap<(u64, Option<u64>, Option<u64>), AsynchronousTaskGroupBuilder>,
     blocking_groups: BTreeMap<(u64, Option<u64>, Option<u64>), BlockingTaskGroupBuilder>,
-    task_locations: HashMap<(u64, u64), String>,
+    task_locations: HashMap<u64, String>,
     asynchronous_worker_types: BTreeMap<(u64, u64), BTreeSet<Option<u64>>>,
     blocking_worker_types: BTreeMap<(u64, u64), BTreeSet<Option<u64>>>,
     unclassified_tasks: u64,
@@ -405,13 +440,16 @@ struct RuntimeSeed {
 )]
 fn seed_runtime_model(events: &Events, source: Option<&Snapshot>) -> RuntimeSeed {
     let mut seed = RuntimeSeed::default();
-    let mut runtime_task_locations = HashMap::new();
+    for location in source.into_iter().flat_map(|source| &source.task_locations) {
+        seed.task_locations.insert(
+            location.type_descriptor.get(),
+            format!("{}:{}:{}", location.file, location.line, location.column),
+        );
+    }
     for runtime in source.into_iter().flat_map(|source| &source.runtimes) {
         for location in &runtime.task_locations {
             let spawned_at = format!("{}:{}:{}", location.file, location.line, location.column);
-            runtime_task_locations.insert((runtime.id.get(), location.type_descriptor.get()), spawned_at.clone());
-            seed.task_locations
-                .insert((runtime.id.get(), location.type_descriptor.get()), spawned_at);
+            seed.task_locations.insert(location.type_descriptor.get(), spawned_at);
         }
     }
     for runtime in RuntimeModel::from_events(events, source).runtimes {
@@ -500,7 +538,7 @@ fn seed_runtime_model(events: &Events, source: Option<&Snapshot>) -> RuntimeSeed
                         },
                         _ => BlockingTaskSummary::default(),
                     },
-                    spawned_at: descriptor.and_then(|descriptor| runtime_task_locations.get(&(task.runtime_id.get(), descriptor)).cloned()),
+                    spawned_at: descriptor.and_then(|descriptor| seed.task_locations.get(&descriptor).cloned()),
                     ..RuntimeTaskSummary::default()
                 },
                 ..TaskBuilder::default()
@@ -582,9 +620,7 @@ impl RuntimeMonitorSnapshot {
             let executor_worker_id =
                 worker_id.filter(|_| !matches!(event.kind, EventKind::TaskSpawned | EventKind::TaskEnqueued | EventKind::TaskReady));
             if let Some(worker_id) = executor_worker_id {
-                workers
-                    .entry((runtime_id, Some(worker_id)))
-                    .or_insert_with(|| worker_row(runtime_id, Some(worker_id)));
+                observe_worker_event(&mut workers, runtime_id, worker_id, event.kind);
             }
 
             let Some(task_id) = runtime_task_id(event.kind, runtime.subject_id, runtime.related_id) else {
@@ -607,20 +643,10 @@ impl RuntimeMonitorSnapshot {
                         task.row.spawn_stack = primitive_stack(&stack, &lookups, AllocationStackFilter::All);
                     }
                 }
-                EventKind::TaskPollStarted => {
-                    task.poll_started(worker_id, timestamp, runtime.value_0, runtime.value_1);
-                    if runtime.value_1 == 2 {
-                        asynchronous_groups
-                            .entry((runtime_id, worker_id, task.row.type_descriptor_id))
-                            .or_default()
-                            .ready_time
-                            .observe(Some(runtime.value_0));
-                        asynchronous_groups
-                            .entry((runtime_id, worker_id, task.row.type_descriptor_id))
-                            .or_default()
-                            .ready_samples
-                            .push(runtime.value_0);
-                    }
+                EventKind::TaskPollStarted => task.poll_started(worker_id, timestamp, runtime.value_0, runtime.value_1),
+                EventKind::TaskMaterialized if task.row.kind == RuntimeTaskKind::Asynchronous => {
+                    task.row.scheduling_delay_nanos = Some(runtime.value_0);
+                    task.ready_observed(timestamp, runtime.value_0);
                 }
                 EventKind::TaskPollFinished => {
                     task.executed.insert(worker_id);
@@ -633,6 +659,19 @@ impl RuntimeMonitorSnapshot {
                     }
                 }
                 _ => {}
+            }
+            if (event.kind == EventKind::TaskPollStarted && runtime.value_1 == 2)
+                || (event.kind == EventKind::TaskMaterialized && task.row.kind == RuntimeTaskKind::Asynchronous)
+            {
+                observe_ready_delay(
+                    runtime_id,
+                    worker_id,
+                    task.row.type_descriptor_id,
+                    runtime.value_0,
+                    event.kind == EventKind::TaskMaterialized,
+                    &mut workers,
+                    &mut asynchronous_groups,
+                );
             }
         }
         distribute_tasks(&mut workers, tasks);
@@ -668,6 +707,17 @@ impl RuntimeMonitorSnapshot {
         for worker in &mut self.workers {
             worker.window = windows.get(&worker.runtime_id).copied();
         }
+    }
+}
+
+fn observe_worker_event(workers: &mut Workers, runtime_id: u64, worker_id: u64, kind: EventKind) {
+    let worker = workers
+        .entry((runtime_id, Some(worker_id)))
+        .or_insert_with(|| worker_row(runtime_id, Some(worker_id)));
+    match kind {
+        EventKind::WorkerParked => worker.park_events = worker.park_events.saturating_add(1),
+        EventKind::WorkerUnparked => worker.unpark_events = worker.unpark_events.saturating_add(1),
+        _ => {}
     }
 }
 

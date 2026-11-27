@@ -11,8 +11,10 @@ use crate::WorkerRole;
 
 const MAGIC: [u8; 8] = *b"SEISRUNT";
 const WIRE_VERSION: u16 = 1;
-const SCHEMA_VERSION: u16 = 11;
+const SCHEMA_VERSION: u16 = 12;
+const PREVIOUS_SCHEMA_VERSION: u16 = 11;
 const HEADER_LEN: usize = 16;
+const GLOBAL_TASK_LOCATIONS_LEN: usize = 4;
 const RUNTIME_FIXED_LEN: usize = 42;
 const WORKER_FIXED_LEN: usize = 22;
 const TASK_LOCATION_FIXED_LEN: usize = 20;
@@ -25,6 +27,12 @@ pub mod source {
     pub(crate) const NAME: &str = "runtime";
     /// Current source payload schema version.
     pub const SCHEMA_VERSION: u16 = super::SCHEMA_VERSION;
+
+    /// Returns true when this crate can decode the schema version.
+    #[must_use]
+    pub const fn supports_schema_version(version: u16) -> bool {
+        version == SCHEMA_VERSION || version == super::PREVIOUS_SCHEMA_VERSION
+    }
 }
 
 /// Logical lifecycle state of a runtime.
@@ -145,6 +153,8 @@ pub struct Runtime {
 pub struct Snapshot {
     /// Active logical runtimes.
     pub runtimes: Vec<Runtime>,
+    /// Process-wide spawn locations, including locations from stopped runtimes.
+    pub task_locations: Vec<TaskLocation>,
 }
 
 /// Error reported while decoding a runtime source payload.
@@ -204,22 +214,24 @@ pub fn decode(bytes: &[u8]) -> Result<Snapshot, Error> {
         return Err(Error::new(ErrorKind::UnsupportedWireVersion(wire)));
     }
     let schema = reader.u16()?;
-    if schema != SCHEMA_VERSION {
+    if !source::supports_schema_version(schema) {
         return Err(Error::new(ErrorKind::UnsupportedSchemaVersion(schema)));
     }
     let runtime_count = reader.u32()? as usize;
+    let task_location_count = if schema == SCHEMA_VERSION { reader.u32()? as usize } else { 0 };
     let mut runtimes = Vec::with_capacity(runtime_count);
     for _ in 0..runtime_count {
         runtimes.push(read_runtime(&mut reader)?);
     }
+    let task_locations = read_task_locations(&mut reader, task_location_count)?;
     if !reader.remaining().is_empty() {
         return Err(malformed());
     }
-    Ok(Snapshot { runtimes })
+    Ok(Snapshot { runtimes, task_locations })
 }
 
 pub(crate) fn encoded_len(snapshot: &Snapshot) -> Option<usize> {
-    let mut len = HEADER_LEN;
+    let mut len = HEADER_LEN.checked_add(GLOBAL_TASK_LOCATIONS_LEN)?;
     for runtime in &snapshot.runtimes {
         len = len.checked_add(RUNTIME_FIXED_LEN)?.checked_add(runtime.name.len())?;
         len = len.checked_add(runtime.workers.len().checked_mul(WORKER_FIXED_LEN)?)?;
@@ -228,6 +240,7 @@ pub(crate) fn encoded_len(snapshot: &Snapshot) -> Option<usize> {
         }
         u32::try_from(runtime.task_locations.len()).ok()?;
     }
+    len = task_locations_len(len, &snapshot.task_locations)?;
     u32::try_from(snapshot.runtimes.len()).ok()?;
     Some(len)
 }
@@ -241,9 +254,11 @@ pub(crate) fn encode(snapshot: &Snapshot, output: &mut [u8]) -> Result<(), ()> {
     writer.u16(WIRE_VERSION)?;
     writer.u16(SCHEMA_VERSION)?;
     writer.u32(u32::try_from(snapshot.runtimes.len()).map_err(|_overflow| ())?)?;
+    writer.u32(u32::try_from(snapshot.task_locations.len()).map_err(|_overflow| ())?)?;
     for runtime in &snapshot.runtimes {
         write_runtime(&mut writer, runtime)?;
     }
+    write_task_locations(&mut writer, &snapshot.task_locations)?;
     Ok(())
 }
 
@@ -265,7 +280,12 @@ fn write_runtime(writer: &mut Writer<'_>, runtime: &Runtime) -> Result<(), ()> {
         writer.u32(worker.processor_index.unwrap_or(u32::MAX))?;
         writer.u64(worker.thread_id.map_or(u64::MAX, ThreadId::get))?;
     }
-    for location in &runtime.task_locations {
+    write_task_locations(writer, &runtime.task_locations)?;
+    Ok(())
+}
+
+fn write_task_locations(writer: &mut Writer<'_>, task_locations: &[TaskLocation]) -> Result<(), ()> {
+    for location in task_locations {
         writer.u64(location.type_descriptor.get())?;
         writer.u32(u32::try_from(location.file.len()).map_err(|_overflow| ())?)?;
         writer.u32(location.line)?;
@@ -303,8 +323,23 @@ fn read_runtime(reader: &mut Reader<'_>) -> Result<Runtime, Error> {
             thread_id,
         });
     }
-    let mut task_locations = Vec::with_capacity(task_location_count);
-    for _ in 0..task_location_count {
+    let task_locations = read_task_locations(reader, task_location_count)?;
+    Ok(Runtime {
+        id,
+        name,
+        configured_workers,
+        lifecycle_backtraces,
+        state,
+        created_at,
+        retired_at,
+        workers,
+        task_locations,
+    })
+}
+
+fn read_task_locations(reader: &mut Reader<'_>, count: usize) -> Result<Vec<TaskLocation>, Error> {
+    let mut task_locations = Vec::with_capacity(count);
+    for _ in 0..count {
         let type_descriptor = TypeDescriptorId::from_raw(reader.u64()?).ok_or_else(malformed)?;
         let file_len = reader.u32()? as usize;
         let line = reader.u32()?;
@@ -319,17 +354,15 @@ fn read_runtime(reader: &mut Reader<'_>) -> Result<Runtime, Error> {
             column,
         });
     }
-    Ok(Runtime {
-        id,
-        name,
-        configured_workers,
-        lifecycle_backtraces,
-        state,
-        created_at,
-        retired_at,
-        workers,
-        task_locations,
-    })
+    Ok(task_locations)
+}
+
+fn task_locations_len(mut len: usize, locations: &[TaskLocation]) -> Option<usize> {
+    for location in locations {
+        len = len.checked_add(TASK_LOCATION_FIXED_LEN)?.checked_add(location.file.len())?;
+    }
+    u32::try_from(locations.len()).ok()?;
+    Some(len)
 }
 
 const fn optional_u32(value: u32) -> Option<u32> {
@@ -469,6 +502,12 @@ mod tests {
                     column: 9,
                 }],
             }],
+            task_locations: vec![TaskLocation {
+                type_descriptor: TypeDescriptorId::from_raw(10).unwrap(),
+                file: "src/stopped.rs".into(),
+                line: 11,
+                column: 12,
+            }],
         }
     }
 
@@ -477,6 +516,31 @@ mod tests {
         let snapshot = fixture();
         let mut bytes = vec![0; encoded_len(&snapshot).unwrap()];
         encode(&snapshot, &mut bytes).unwrap();
+        assert_eq!(decode(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn source_payload_round_trips_multiple_runtimes_with_global_locations() {
+        let mut snapshot = fixture();
+        let mut second = snapshot.runtimes[0].clone();
+        second.id = RuntimeId::from_raw(2).unwrap();
+        snapshot.runtimes.push(second);
+        let mut bytes = vec![0; encoded_len(&snapshot).unwrap()];
+
+        encode(&snapshot, &mut bytes).unwrap();
+
+        assert_eq!(decode(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn previous_source_payloads_remain_decodable() {
+        let mut snapshot = fixture();
+        snapshot.task_locations.clear();
+        let mut bytes = vec![0; encoded_len(&snapshot).unwrap()];
+        encode(&snapshot, &mut bytes).unwrap();
+        bytes[10..12].copy_from_slice(&PREVIOUS_SCHEMA_VERSION.to_le_bytes());
+        bytes.drain(16..20);
+
         assert_eq!(decode(&bytes).unwrap(), snapshot);
     }
 

@@ -420,6 +420,7 @@ impl App {
                 return;
             }
             ListTarget::AsynchronousTaskGroups => {
+                self.runtime_view.activity_scroll = 0;
                 self.runtime_view.focus = RuntimeWorkersFocus::Asynchronous;
                 self.runtime_view.section = RuntimeSectionFocus::TaskTypes;
                 self.runtime_view.detail_mode = RuntimeDetailMode::Group;
@@ -430,6 +431,7 @@ impl App {
                 return;
             }
             ListTarget::BlockingTaskGroups => {
+                self.runtime_view.activity_scroll = 0;
                 self.runtime_view.focus = RuntimeWorkersFocus::Blocking;
                 self.runtime_view.section = RuntimeSectionFocus::TaskTypes;
                 self.runtime_view.detail_mode = RuntimeDetailMode::Group;
@@ -440,6 +442,7 @@ impl App {
                 return;
             }
             ListTarget::RuntimeGroupTasks => {
+                self.runtime_view.activity_scroll = 0;
                 self.runtime_view.section = RuntimeSectionFocus::GroupTasks;
                 self.runtime_view.detail_mode = RuntimeDetailMode::Task;
                 self.runtime_view.task_selected = index;

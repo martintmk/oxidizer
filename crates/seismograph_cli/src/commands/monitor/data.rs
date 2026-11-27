@@ -3632,6 +3632,7 @@ mod tests {
                     column: 34,
                 }],
             }],
+            task_locations: Vec::new(),
         };
 
         let snapshot = RuntimeMonitorSnapshot::from_events(&events, Some(&source), &[]);
@@ -3643,6 +3644,113 @@ mod tests {
             .unwrap();
 
         assert_eq!(task.spawned_at.as_deref(), Some("src/main.rs:12:34"));
+    }
+
+    #[test]
+    fn runtime_tasks_resolve_spawn_locations_from_the_process_catalog() {
+        let runtime_id = RuntimeId::from_raw(1).unwrap();
+        let descriptor = TypeDescriptorId::from_raw(42).unwrap();
+        let events = Events {
+            events: vec![RuntimeEvent {
+                thread_id: ThreadId::new(1),
+                sequence: EventSequence::new(1),
+                timestamp: EventTimestamp::from_ticks(1),
+                kind: RuntimeEventKind::TaskSpawned,
+                payload: EventPayload::Runtime(RuntimeEventPayload {
+                    runtime_id,
+                    worker_id: None,
+                    subject_id: 10,
+                    related_id: 0,
+                    value_0: descriptor.get(),
+                    value_1: 1,
+                }),
+                call_stack: Vec::new(),
+            }],
+            ..Events::default()
+        };
+        let source = seismograph_runtime::snapshot::Snapshot {
+            runtimes: Vec::new(),
+            task_locations: vec![seismograph_runtime::snapshot::TaskLocation {
+                type_descriptor: descriptor,
+                file: "src/stopped.rs".into(),
+                line: 12,
+                column: 34,
+            }],
+        };
+
+        let snapshot = RuntimeMonitorSnapshot::from_events(&events, Some(&source), &[]);
+        let task = snapshot
+            .workers
+            .iter()
+            .flat_map(|worker| &worker.tasks)
+            .find(|task| task.task_id == 10)
+            .unwrap();
+
+        assert_eq!(task.spawned_at.as_deref(), Some("src/stopped.rs:12:34"));
+    }
+
+    #[test]
+    fn late_task_events_retain_the_descriptor_without_the_enqueue_event() {
+        let runtime_id = RuntimeId::from_raw(1).unwrap();
+        let descriptor = TypeDescriptorId::from_raw(42).unwrap();
+        let events = Events {
+            events: vec![
+                RuntimeEvent {
+                    thread_id: ThreadId::new(1),
+                    sequence: EventSequence::new(1),
+                    timestamp: EventTimestamp::from_ticks(10),
+                    kind: RuntimeEventKind::TaskPollStarted,
+                    payload: EventPayload::Runtime(RuntimeEventPayload {
+                        runtime_id,
+                        worker_id: Some(WorkerId::from_raw(2).unwrap()),
+                        subject_id: 10,
+                        related_id: descriptor.get(),
+                        value_0: 0,
+                        value_1: 0,
+                    }),
+                    call_stack: Vec::new(),
+                },
+                RuntimeEvent {
+                    thread_id: ThreadId::new(1),
+                    sequence: EventSequence::new(2),
+                    timestamp: EventTimestamp::from_ticks(20),
+                    kind: RuntimeEventKind::TaskPollFinished,
+                    payload: EventPayload::Runtime(RuntimeEventPayload {
+                        runtime_id,
+                        worker_id: Some(WorkerId::from_raw(2).unwrap()),
+                        subject_id: 10,
+                        related_id: descriptor.get(),
+                        value_0: 10,
+                        value_1: 0,
+                    }),
+                    call_stack: Vec::new(),
+                },
+            ],
+            ..Events::default()
+        };
+        let source = seismograph_runtime::snapshot::Snapshot {
+            runtimes: Vec::new(),
+            task_locations: vec![seismograph_runtime::snapshot::TaskLocation {
+                type_descriptor: descriptor,
+                file: "src/retained.rs".into(),
+                line: 12,
+                column: 34,
+            }],
+        };
+
+        let snapshot = RuntimeMonitorSnapshot::from_events(&events, Some(&source), &[]);
+        let task = &snapshot.workers[0].tasks[0];
+        assert_eq!(
+            (task.type_descriptor_id, task.spawned_at.as_deref()),
+            (Some(42), Some("src/retained.rs:12:34"))
+        );
+        assert_eq!(
+            (
+                snapshot.asynchronous_groups[0].type_descriptor_id,
+                snapshot.asynchronous_groups[0].spawned_at.as_deref(),
+            ),
+            (Some(42), Some("src/retained.rs:12:34"))
+        );
     }
 
     #[test]
@@ -5041,6 +5149,127 @@ mod tests {
                 ),
                 (Some(2), vec![(10, vec![0, 2], 0, "Running")]),
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_ready_metrics_include_initial_activation_and_stay_with_the_execution_worker() {
+        let events = [
+            (10, 10, RuntimeEventKind::TaskEnqueued, None, 42, 0),
+            (20, 10, RuntimeEventKind::TaskMaterialized, Some(1), 10, 9),
+            (21, 10, RuntimeEventKind::TaskPollStarted, Some(1), 0, 0),
+            (30, 10, RuntimeEventKind::TaskPollStarted, Some(2), 5, 2),
+            (40, 10, RuntimeEventKind::TaskPollStarted, Some(2), 30, 1),
+            (50, 11, RuntimeEventKind::TaskEnqueued, None, 42, 0),
+            (50, 11, RuntimeEventKind::TaskMaterialized, Some(1), 0, 9),
+            (51, 11, RuntimeEventKind::TaskPollStarted, Some(1), 0, 0),
+            (60, 12, RuntimeEventKind::TaskPollStarted, Some(2), 0, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, (timestamp, task_id, kind, worker, value_0, value_1))| RuntimeEvent {
+            thread_id: ThreadId::new(worker.unwrap_or(1)),
+            sequence: EventSequence::new(u64::try_from(sequence).unwrap()),
+            timestamp: EventTimestamp::from_ticks(timestamp),
+            kind,
+            payload: EventPayload::Runtime(RuntimeEventPayload {
+                runtime_id: RuntimeId::from_raw(1).unwrap(),
+                worker_id: worker.and_then(WorkerId::from_raw),
+                subject_id: task_id,
+                related_id: 0,
+                value_0,
+                value_1,
+            }),
+            call_stack: Vec::new(),
+        })
+        .collect();
+        let snapshot = RuntimeMonitorSnapshot::from_events(
+            &Events {
+                events,
+                ..Events::default()
+            },
+            None,
+            &[],
+        );
+        assert_eq!(
+            snapshot
+                .workers
+                .iter()
+                .map(|worker| (
+                    worker.worker_id,
+                    worker.scheduling_time.samples,
+                    worker.scheduling_time.mean_nanos(),
+                    worker.scheduling_time.max_nanos,
+                    worker.ready_time.samples,
+                    worker.ready_time.mean_nanos(),
+                    worker.ready_time.max_nanos,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some(1), 2, Some(5), Some(10), 2, Some(5), Some(10)),
+                (Some(2), 0, None, None, 1, Some(5), Some(5))
+            ]
+        );
+        let group = snapshot
+            .asynchronous_groups
+            .iter()
+            .find(|group| group.worker_id == Some(1))
+            .unwrap();
+        assert_eq!(group.ready_samples, [10, 0]);
+        assert_eq!(group.ready_time.mean_nanos(), Some(5));
+        assert_eq!(group.ready_time.max_nanos, Some(10));
+        let worker = &snapshot.workers[1];
+        let migrated = worker.tasks.iter().find(|task| task.task_id == 10).unwrap();
+        assert_eq!(migrated.scheduling_delay_nanos, Some(10));
+        assert_eq!(migrated.metrics.ready_samples.as_ref(), [10, 5]);
+        assert_eq!(migrated.metrics.wake_samples.as_ref(), [30]);
+        let unknown = worker.tasks.iter().find(|task| task.task_id == 12).unwrap();
+        assert_eq!(unknown.scheduling_delay_nanos, None);
+        assert!(unknown.metrics.ready_samples.is_empty());
+    }
+
+    #[test]
+    fn runtime_workers_count_retained_park_and_unpark_events() {
+        let events = [
+            RuntimeEventKind::WorkerStarted,
+            RuntimeEventKind::WorkerParked,
+            RuntimeEventKind::WorkerUnparked,
+            RuntimeEventKind::WorkerParked,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, kind)| RuntimeEvent {
+            thread_id: ThreadId::new(1),
+            sequence: EventSequence::new(u64::try_from(sequence).unwrap()),
+            timestamp: EventTimestamp::from_ticks(u64::try_from(sequence).unwrap()),
+            kind,
+            payload: EventPayload::Runtime(RuntimeEventPayload {
+                runtime_id: RuntimeId::from_raw(1).unwrap(),
+                worker_id: Some(WorkerId::from_raw(2).unwrap()),
+                subject_id: 0,
+                related_id: 0,
+                value_0: u64::from(kind == RuntimeEventKind::WorkerStarted) * 2,
+                value_1: u64::from(u32::MAX),
+            }),
+            call_stack: Vec::new(),
+        })
+        .collect();
+
+        let snapshot = RuntimeMonitorSnapshot::from_events(
+            &Events {
+                events,
+                ..Events::default()
+            },
+            None,
+            &[],
+        );
+        assert_eq!(
+            (
+                snapshot.workers[0].worker_id,
+                snapshot.workers[0].park_events,
+                snapshot.workers[0].unpark_events,
+            ),
+            (Some(2), 2, 1)
         );
     }
 

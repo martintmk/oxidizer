@@ -47,3 +47,6 @@ CLAUDE.md
 # local CI log dumps
 mutants-job.log
 
+# Local Seismograph captures
+*.seismograph
+

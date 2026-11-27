@@ -308,34 +308,39 @@ pub enum EventKind {
     TaskEnqueued,
     /// A task instance began its first execution.
     ///
-    /// New producers use `worker_id` for the execution worker, `value_0` for
-    /// queue duration in nanoseconds, and `value_1` for body size plus one.
+    /// New producers use `worker_id` for the execution worker, `related_id` for
+    /// the task descriptor, `value_0` for queue duration in nanoseconds, and
+    /// `value_1` for body size plus one.
     TaskMaterialized,
     /// A task poll began.
     ///
-    /// In the fixed runtime payload, `value_1` identifies the nanosecond sample
-    /// in `value_0`: `0` means unavailable, `1` is legacy raw wake-to-poll
-    /// latency, and `2` is a coherent scheduler queue wait. Value `2` excludes
-    /// time spent in a preceding poll when that poll requested another wake.
-    /// These are discriminator values, not combinable flag bits.
+    /// New producers use `related_id` for the task descriptor. `value_1`
+    /// identifies the nanosecond sample in `value_0`: `0` means unavailable,
+    /// `1` is legacy raw wake-to-poll latency, and `2` is a coherent scheduler
+    /// queue wait. Value `2` excludes time spent in a preceding poll when that
+    /// poll requested another wake. These are discriminator values, not
+    /// combinable flag bits.
     TaskPollStarted,
     /// A task poll finished.
     ///
-    /// New producers use `value_0` for poll duration in nanoseconds. `value_1`
-    /// is `0` while pending, `1` when completed, `2` when canceled, and `3`
-    /// when panicked.
+    /// New producers use `related_id` for the task descriptor and `value_0` for
+    /// poll duration in nanoseconds. `value_1` is `0` while pending, `1` when
+    /// completed, `2` when canceled, and `3` when panicked.
     TaskPollFinished,
     /// A task completed successfully.
     ///
-    /// Blocking producers use `value_0` for execution duration in nanoseconds.
+    /// New producers use `related_id` for the task descriptor. Blocking
+    /// producers use `value_0` for execution duration in nanoseconds.
     TaskCompleted,
     /// A task was canceled.
     ///
-    /// Blocking producers use `value_0` for execution duration in nanoseconds.
+    /// New producers use `related_id` for the task descriptor. Blocking
+    /// producers use `value_0` for execution duration in nanoseconds.
     TaskCanceled,
     /// A task panicked.
     ///
-    /// Blocking producers use `value_0` for execution duration in nanoseconds.
+    /// New producers use `related_id` for the task descriptor. Blocking
+    /// producers use `value_0` for execution duration in nanoseconds.
     TaskPanicked,
     /// A task instance transfer began.
     TransferStarted,

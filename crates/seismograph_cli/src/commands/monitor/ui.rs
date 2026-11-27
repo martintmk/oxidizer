@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, ListState, Paragraph, Tabs};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use seismograph_protocol::message::{RecorderStatistics, RecordingConfiguration, RecordingPolicy};
 use seismograph_protocol::monitor::MonitorDescriptor;
 
@@ -51,6 +51,7 @@ mod task_events_ui;
 
 const KEY_COLOR: Color = Color::Cyan;
 const CONTENTION_COLOR: Color = Color::Yellow;
+const INFO_LABEL_WIDTH: usize = 18;
 
 impl App {
     pub(super) fn screen_areas(&self, area: Rect) -> [Rect; 3] {
@@ -372,21 +373,10 @@ fn draw_connected(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, v
                 view.runtime_view,
             );
             runtime_tasks_ui::draw(frame, &view.panels.rows, areas[2], runtime, view.snapshot_error, view.runtime_view);
-            runtime_group_ui::draw_task_list(frame, &view.panels.rows, areas[3], runtime, view.snapshot_error, view.runtime_view);
+            let selected_task =
+                runtime_group_ui::draw_task_list(frame, &view.panels.rows, areas[3], runtime, view.snapshot_error, view.runtime_view);
             if view.runtime_view.detail_mode == super::app::RuntimeDetailMode::Task {
-                let task = view
-                    .snapshot
-                    .and_then(|snapshot| super::app::selected_runtime_task(&snapshot.runtime, &view.runtime_view));
-                let window = task.and_then(|task| {
-                    let worker = task.worker_ids.first()?;
-                    view.snapshot?
-                        .runtime
-                        .workers
-                        .iter()
-                        .find(|candidate| candidate.runtime_id == task.runtime_id && candidate.worker_id == Some(*worker))
-                        .and_then(|worker| worker.window)
-                });
-                runtime_task_detail_ui::draw(frame, areas[4], task, window, view.runtime_view);
+                runtime_task_detail_ui::draw(frame, areas[4], selected_task, runtime, view.runtime_view);
             } else if view.runtime_view.group_selected_explicitly {
                 runtime_group_ui::draw_statistics(frame, areas[4], runtime, view.snapshot_error, view.runtime_view);
             } else {
@@ -412,15 +402,7 @@ fn draw_connected(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, v
                 return;
             };
             let areas = view.panels.arrange(MonitorTab::RuntimeTask, content).areas;
-            let window = task.worker_ids.first().and_then(|worker| {
-                view.snapshot?
-                    .runtime
-                    .workers
-                    .iter()
-                    .find(|candidate| candidate.runtime_id == task.runtime_id && candidate.worker_id == Some(*worker))
-                    .and_then(|worker| worker.window)
-            });
-            runtime_task_detail_ui::draw(frame, areas[0], Some(task), window, view.runtime_view);
+            runtime_task_detail_ui::draw(frame, areas[0], Some(task), runtime, view.runtime_view);
             task_events_ui::draw(
                 frame,
                 &view.panels.rows,
@@ -471,28 +453,39 @@ fn draw_snapshot_info(frame: &mut ratatui::Frame<'_>, area: Rect, view: &Connect
         ),
         ViewOrigin::Offline(path) => {
             let mut lines = vec![
-                Line::from(format!("Monitor (seismograph_cli): {}", view.monitor_version)),
-                Line::from(format!("Server (seismograph): {}", view.server_version)),
-                Line::from(path.display().to_string()),
-                Line::from("Offline snapshot · read-only"),
-                Line::from("Capture time: not recorded in the snapshot"),
-                Line::from("No process connection; recording and capture controls are disabled."),
+                info_heading("Snapshot"),
+                metric_line("Monitor version", view.monitor_version.into()),
+                metric_line("Server version", view.server_version.into()),
+                metric_line("File", fit_tail(path.display().to_string(), info_value_width(area.width))),
+                metric_line("Mode", "offline snapshot · read-only".into()),
+                metric_line("Capture time", "not recorded in the snapshot".into()),
+                metric_line("Connection", "none; recording and capture controls are disabled".into()),
             ];
             if let Some(snapshot) = view.snapshot {
-                lines.push(Line::from(format!(
-                    "Source events: {} accepted · {} overwritten · {} threads",
-                    format_count(snapshot.primitives.total_events),
-                    format_count(snapshot.primitives.lost_events),
-                    snapshot.threads.threads.len(),
-                )));
+                lines.push(info_heading("Contents"));
+                lines.push(metric_line(
+                    "Source events",
+                    format!(
+                        "{} accepted · {} overwritten · {} threads",
+                        format_count(snapshot.primitives.total_events),
+                        format_count(snapshot.primitives.lost_events),
+                        snapshot.threads.threads.len(),
+                    ),
+                ));
                 if let Some(error) = &snapshot.heap_error {
-                    lines.push(Line::from(error.as_str()));
+                    lines.push(metric_line("Heap status", error.clone()));
                 }
             } else {
-                lines.push(Line::from(view.snapshot_error.unwrap_or("Loading and decoding snapshot…")));
+                lines.push(info_heading("Status"));
+                lines.push(metric_line(
+                    "Status",
+                    view.snapshot_error.unwrap_or("Loading and decoding snapshot…").into(),
+                ));
             }
             frame.render_widget(
-                Paragraph::new(lines).block(Block::default().title(" Snapshot file ").borders(Borders::ALL)),
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::default().title(" Snapshot file ").borders(Borders::ALL)),
                 area,
             );
         }
@@ -1258,22 +1251,26 @@ fn draw_info(
         .and_then(|bytes| u64::try_from(bytes).ok())
         .unwrap_or(u64::MAX);
     let mut lines = vec![
-        Line::from(format!("Monitor (seismograph_cli): {}", view.monitor_version)),
-        Line::from(format!("Server (seismograph): {}", view.server_version)),
+        info_heading("Connection"),
+        metric_line("Monitor version", view.monitor_version.into()),
+        metric_line("Server version", view.server_version.into()),
         metric_line("Name", descriptor.name.clone()),
         metric_line("Instance", descriptor.instance.clone().unwrap_or_else(|| "-".into())),
         metric_line("PID", descriptor.process_id.to_string()),
         metric_line("OS owner", descriptor.owner.to_string()),
-        metric_line("Endpoint", descriptor.endpoint.to_string()),
-        Line::from(""),
-        metric_line("Event ring buffer", format!("{} events / thread", format_count(event_capacity))),
+        metric_line(
+            "Endpoint",
+            fit_tail(descriptor.endpoint.to_string(), info_value_width(details_area.width)),
+        ),
+        info_heading("Recording"),
+        metric_line("Event buffer", format!("{} events / thread", format_count(event_capacity))),
         recording_policy_line("Allocations", recording.allocations),
         recording_policy_line("General events", recording.general_events),
         recording_policy_line("Arc dereferences", recording.arc_dereferences),
         recording_policy_line("Runtime tasks", recording.runtime_tasks),
         recording_policy_line("I/O", recording.io),
         recording_policy_line("Cache", recording.cache),
-        metric_line("Telemetry memory / thread", format_bytes(memory_per_thread)),
+        metric_line("Memory / thread", format_bytes(memory_per_thread)),
     ];
     if view.recording_unknown {
         lines.truncate(8);
@@ -1281,33 +1278,39 @@ fn draw_info(
             "Recording state UNKNOWN; waiting for authoritative server configuration.",
         ));
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(Block::default().title(" Info ").borders(Borders::ALL)),
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .block(Block::default().title(" Info ").borders(Borders::ALL)),
             details_area,
         );
         return;
     }
     if let Some(statistics) = view.recorder_statistics {
+        lines.push(info_heading("Statistics"));
         lines.extend([
-            metric_line("Active recorder threads", format_count(statistics.thread_count)),
-            metric_line("Live telemetry memory total", format_bytes(statistics.allocated_bytes)),
-            metric_line("Accepted telemetry events", format_count(statistics.total_events)),
-            metric_line("Retained telemetry events", format_count(statistics.retained_events)),
-            metric_line("Overwritten telemetry events", format_count(statistics.lost_events)),
+            metric_line("Recorder threads", format_count(statistics.thread_count)),
+            metric_line("Telemetry memory", format_bytes(statistics.allocated_bytes)),
+            metric_line("Accepted events", format_count(statistics.total_events)),
+            metric_line("Retained events", format_count(statistics.retained_events)),
+            metric_line("Overwritten events", format_count(statistics.lost_events)),
         ]);
     } else if let Some(allocations) = view.snapshot.and_then(|capture| capture.allocations.as_ref()) {
+        lines.push(info_heading("Captured statistics"));
         lines.extend([
-            metric_line("Captured source threads", format_count(allocations.thread_count)),
+            metric_line("Captured threads", format_count(allocations.thread_count)),
             metric_line(
-                "Estimated buffer memory",
+                "Estimated memory",
                 format_bytes(memory_per_thread.saturating_mul(allocations.thread_count)),
             ),
-            metric_line("All-class source accepted", format_count(allocations.total_events)),
-            metric_line("Retained allocator events", format_count(allocations.retained_events)),
-            metric_line("All-class source overwritten", format_count(allocations.lost_events)),
+            metric_line("Source accepted", format_count(allocations.total_events)),
+            metric_line("Allocator retained", format_count(allocations.retained_events)),
+            metric_line("Source overwritten", format_count(allocations.lost_events)),
         ]);
     }
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(Block::default().title(" Info ").borders(Borders::ALL)),
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(" Info ").borders(Borders::ALL)),
         details_area,
     );
 }
@@ -2242,9 +2245,31 @@ fn draw_empty_panel_with_message(
 
 fn metric_line(label: &'static str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{label:INFO_LABEL_WIDTH$}: "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(value),
     ])
+}
+
+fn info_heading(label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+}
+
+fn info_value_width(area_width: u16) -> usize {
+    usize::from(area_width.saturating_sub(2)).saturating_sub(INFO_LABEL_WIDTH + 2)
+}
+
+fn fit_tail(value: String, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("…{}", value.chars().skip(count - width.saturating_sub(1)).collect::<String>())
 }
 
 fn recording_policy_line(label: &'static str, policy: RecordingPolicy) -> Line<'static> {
@@ -2565,13 +2590,13 @@ mod tests {
             for label in ["PID", "OS owner", "Endpoint"] {
                 assert!(output.contains(label), "{label}");
             }
-            assert_eq!(output.contains("Event ring buffer"), !unknown);
+            assert_eq!(output.contains("Event buffer"), !unknown);
             for label in [
-                "Active recorder threads",
-                "Live telemetry memory total",
-                "Accepted telemetry events",
-                "Retained telemetry events",
-                "Overwritten telemetry events",
+                "Recorder threads",
+                "Telemetry memory",
+                "Accepted events",
+                "Retained events",
+                "Overwritten events",
             ] {
                 assert_eq!(output.contains(label), !unknown, "{label}: {output}");
             }
@@ -2579,11 +2604,11 @@ mod tests {
                 assert!(output.contains("17"));
                 assert!(output.contains("987 B"));
                 let positions = [
-                    "Active recorder threads",
-                    "Live telemetry memory total",
-                    "Accepted telemetry events",
-                    "Retained telemetry events",
-                    "Overwritten telemetry events",
+                    "Recorder threads",
+                    "Telemetry memory",
+                    "Accepted events",
+                    "Retained events",
+                    "Overwritten events",
                 ]
                 .map(|label| output.find(label).unwrap());
                 assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
@@ -2641,16 +2666,16 @@ mod tests {
         for (nanos, expected) in [
             (0, "0ns"),
             (999, "999ns"),
-            (1000, "1.00us"),
-            (1001, "1.00us"),
-            (1019, "1.01us"),
-            (999_999, "999.99us"),
+            (1000, "1.00µs"),
+            (1001, "1.00µs"),
+            (1019, "1.02µs"),
+            (999_999, "1.00ms"),
             (1_000_000, "1.00ms"),
             (1_000_001, "1.00ms"),
-            (1_009_999, "1.00ms"),
-            (999_999_999, "999.99ms"),
+            (1_009_999, "1.01ms"),
+            (999_999_999, "1.00s"),
             (1_000_000_000, "1.00s"),
-            (1_009_999_999, "1.00s"),
+            (1_009_999_999, "1.01s"),
         ] {
             assert_eq!(super::format_runtime_duration(nanos), expected, "{nanos}");
         }
@@ -3076,8 +3101,8 @@ mod tests {
             server_version: Some("12.34.56-rc.7".into()),
         });
         let browser = render(&app);
-        assert!(!browser.contains("Monitor (seismograph_cli):"));
-        assert!(!browser.contains("Server (seismograph):"));
+        assert!(!browser.contains(&format!("{:<18}: ", "Monitor version")));
+        assert!(!browser.contains(&format!("{:<18}: ", "Server version")));
         app.handle_key(KeyCode::Enter);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -3091,9 +3116,10 @@ mod tests {
             .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(output.contains("Monitor (seismograph_cli): 98.76.54"), "{output}");
-        assert!(output.contains("Server (seismograph): 12.34.56-rc.7"), "{output}");
-        assert!(!output.contains("Server (seismograph): 98.76.54"));
+        assert!(output.contains(&format!("{:<18}: 98.76.54", "Monitor version")), "{output}");
+        assert!(output.contains(&format!("{:<18}: 12.34.56-rc.7", "Server version")), "{output}");
+        assert!(output.contains("…010101010101.sock"), "{output}");
+        assert!(!output.contains(&format!("{:<18}: 98.76.54", "Server version")));
         assert!(matches!(app.screen, Screen::Connected { snapshot: None, .. }));
 
         // Selecting another instance must not retain the previous server version.
@@ -3101,7 +3127,7 @@ mod tests {
         app.instances[0].server_version = None;
         app.handle_key(KeyCode::Enter);
         let output = render(&app);
-        assert!(output.contains("Server (seismograph): unknown"));
+        assert!(output.contains(&format!("{:<18}: unknown", "Server version")));
         assert!(!output.contains("12.34.56-rc.7"));
     }
 
@@ -3113,8 +3139,8 @@ mod tests {
                 app.finish_offline_load(representative_capture());
             }
             let output = render(&app);
-            assert!(output.contains(&format!("Monitor (seismograph_cli): {}", env!("CARGO_PKG_VERSION"))));
-            assert!(output.contains("Server (seismograph): unknown (not recorded in snapshot)"));
+            assert!(output.contains(&format!("{:<18}: {}", "Monitor version", env!("CARGO_PKG_VERSION"))));
+            assert!(output.contains(&format!("{:<18}: unknown (not recorded in snapshot)", "Server version")));
         }
     }
 
@@ -3772,10 +3798,10 @@ mod tests {
                 snapshot,
             };
             let offline = render(&app);
-            assert!(!live.contains("Monitor (seismograph_cli):"), "{tab:?}");
-            assert!(!live.contains("Server (seismograph):"), "{tab:?}");
-            assert!(!offline.contains("Monitor (seismograph_cli):"), "{tab:?}");
-            assert!(!offline.contains("Server (seismograph):"), "{tab:?}");
+            assert!(!live.contains(&format!("{:<18}: ", "Monitor version")), "{tab:?}");
+            assert!(!live.contains(&format!("{:<18}: ", "Server version")), "{tab:?}");
+            assert!(!offline.contains(&format!("{:<18}: ", "Monitor version")), "{tab:?}");
+            assert!(!offline.contains(&format!("{:<18}: ", "Server version")), "{tab:?}");
             // Only the tab border and footer differ; compare every content cell.
             let content = |text: &str| text.chars().skip(180 * 3).take(180 * 56).collect::<String>();
             assert_eq!(content(&offline), content(&live), "{tab:?}");
@@ -3799,7 +3825,7 @@ mod tests {
         app.finish_offline_load(representative_capture());
         let output = render(&app);
         assert!(output.contains("blob capture.seismograph"));
-        assert!(output.contains("Capture time: not recorded"));
+        assert!(output.contains(&format!("{:<18}: not recorded", "Capture time")));
         assert!(!output.contains("Waiting for the first"));
         assert!(!output.contains("Recording configuration"));
     }
@@ -3816,7 +3842,7 @@ mod tests {
         let output = render(&app);
         assert_eq!(
             (
-                output.contains(&format!("Source events: 12 accepted · 3 overwritten · {threads} threads")),
+                output.contains(&format!("{:<18}: 12 accepted · 3 overwritten · {threads} threads", "Source events")),
                 output.contains("allocator source was not recorded"),
             ),
             (true, true),
@@ -3852,8 +3878,8 @@ mod tests {
         assert_eq!(
             (
                 output.contains("pending.seismograph"),
-                output.contains("Offline snapshot · read-only"),
-                output.contains("Source events:"),
+                output.contains(&format!("{:<18}: offline snapshot · read-only", "Mode")),
+                output.contains(&format!("{:<18}: ", "Source events")),
             ),
             (true, true, false),
         );
@@ -3964,8 +3990,8 @@ mod tests {
             assert!(!offline.contains(note), "offline: {note}");
             assert!(!live.contains(note), "live: {note}");
         }
-        assert!(live.contains("All-class source accepted"));
-        assert!(live.contains("All-class source overwritten"));
+        assert!(live.contains("Source accepted"));
+        assert!(live.contains("Source overwritten"));
     }
 
     #[test]
@@ -4202,8 +4228,8 @@ mod tests {
             ],
             [
                 "1ns".to_owned(),
-                "1.00us".to_owned(),
-                "1.23us".to_owned(),
+                "1.00µs".to_owned(),
+                "1.23µs".to_owned(),
                 "1.00ms".to_owned(),
                 "1.00s".to_owned(),
                 "0.0%".to_owned(),
@@ -4221,6 +4247,14 @@ mod tests {
                 "1.00 GiB".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn info_values_keep_the_identifying_tail_within_the_available_width() {
+        assert_eq!(fit_tail("short".into(), 5), "short");
+        assert_eq!(fit_tail("abcdef".into(), 5), "…cdef");
+        assert_eq!(fit_tail("abcdef".into(), 1), "…");
+        assert_eq!(fit_tail("abcdef".into(), 0), "");
     }
 
     #[test]
@@ -4259,8 +4293,8 @@ mod tests {
                 true,
                 false,
                 "row".to_owned(),
-                "Metric: 42".to_owned(),
-                "Policy: custom; backtraces on; sample 1/8 (12.5%)".to_owned(),
+                format!("{:<18}: 42", "Metric"),
+                format!("{:<18}: custom; backtraces on; sample 1/8 (12.5%)", "Policy"),
                 " F1 help  ready  ↑/↓ select  Enter connect  r refresh  q quit".to_owned(),
                 "key".to_owned(),
                 Style::default().fg(KEY_COLOR).add_modifier(Modifier::BOLD),
@@ -4942,6 +4976,6 @@ mod tests {
             }));
         }
 
-        assert_eq!(stable_digest(&output), (521_626, 5_398_699_480_934_313_611));
+        assert_eq!(stable_digest(&output), (516_229, 863_849_624_597_950_400));
     }
 }

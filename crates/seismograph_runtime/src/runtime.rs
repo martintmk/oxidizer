@@ -20,6 +20,7 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: Mutex<Vec<Arc<RuntimeControl>>> = Mutex::new(Vec::new());
+static TASK_LOCATIONS: Mutex<BTreeMap<TypeDescriptorId, &'static Location<'static>>> = Mutex::new(BTreeMap::new());
 static SOURCE: seismograph::snapshot::Source = seismograph::snapshot::Source::new(
     snapshot::source::ID,
     snapshot::source::NAME,
@@ -130,7 +131,7 @@ impl Runtime {
     pub fn async_task(&self, identity: TaskIdentity, body_size: usize) -> Option<asynchronous::TaskHandle> {
         let task = asynchronous::TaskHandle::new(self.id(), self.owner.handle.control.lifecycle_backtraces, identity, body_size);
         if task.is_some() {
-            self.owner.handle.register_task_identity(identity);
+            self.register_task_identity(identity);
         }
         task
     }
@@ -140,9 +141,13 @@ impl Runtime {
     pub fn blocking_task(&self, identity: TaskIdentity, body_size: usize) -> Option<blocking::TaskHandle> {
         let task = blocking::TaskHandle::new(self.id(), self.owner.handle.control.lifecycle_backtraces, identity, body_size);
         if task.is_some() {
-            self.owner.handle.register_task_identity(identity);
+            self.register_task_identity(identity);
         }
         task
+    }
+
+    pub(crate) fn register_task_identity(&self, identity: TaskIdentity) {
+        self.owner.handle.register_task_identity(identity);
     }
 
     /// Captures the runtime, its registered workers, and task spawn locations.
@@ -180,6 +185,9 @@ impl RuntimeHandle {
 
     fn register_task_identity(&self, identity: TaskIdentity) {
         without_recording(|| {
+            lock(&TASK_LOCATIONS)
+                .entry(identity.descriptor())
+                .or_insert_with(|| identity.location());
             lock(&self.control.task_locations)
                 .entry(identity.descriptor())
                 .or_insert_with(|| identity.location());
@@ -389,6 +397,15 @@ fn capture_source(_context: seismograph::snapshot::SnapshotContext<'_>) -> Resul
     let runtimes = lock(&REGISTRY).clone();
     let snapshot = Snapshot {
         runtimes: runtimes.iter().map(snapshot_runtime).collect(),
+        task_locations: lock(&TASK_LOCATIONS)
+            .iter()
+            .map(|(type_descriptor, location)| TaskLocation {
+                type_descriptor: *type_descriptor,
+                file: location.file().into(),
+                line: location.line(),
+                column: location.column(),
+            })
+            .collect(),
     };
     encode_source_with(
         &snapshot,
@@ -615,6 +632,20 @@ pub(crate) mod tests {
         drop(runtime);
 
         assert!(!lock(&REGISTRY).iter().any(|runtime| Arc::ptr_eq(runtime, &control)));
+    }
+
+    #[test]
+    fn stopped_runtime_keeps_its_process_spawn_locations() {
+        let _test = test_lock();
+        let runtime = Runtime::builder("retired-locations").build();
+        let identity = TaskIdentity::from_location(Location::caller());
+        let descriptor = identity.descriptor();
+        let location = identity.location();
+        runtime.owner.handle.register_task_identity(identity);
+
+        drop(runtime);
+
+        assert_eq!(lock(&TASK_LOCATIONS).get(&descriptor), Some(&location));
     }
 
     pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {

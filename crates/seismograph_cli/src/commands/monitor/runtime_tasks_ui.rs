@@ -3,14 +3,15 @@
 
 //! Descriptor-level asynchronous and blocking task summaries.
 
-use std::cmp::Ordering;
-
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
-use super::super::app::{RuntimeSectionFocus, RuntimeTaskTypeSort, RuntimeViewState, RuntimeWorkersFocus, selected_runtime_worker_id};
+use super::super::app::{
+    RuntimeSectionFocus, RuntimeTaskTypeSort, RuntimeViewState, RuntimeWorkersFocus, selected_runtime_worker_id, sort_runtime_async_groups,
+    sort_runtime_blocking_groups,
+};
 use super::super::data::{AsynchronousTaskGroupSummary, BlockingTaskGroupSummary, RuntimeMonitorSnapshot};
 use super::super::formatting::{format_count, format_runtime_duration};
 use super::super::mouse::{ListTarget, MouseRows};
@@ -36,7 +37,7 @@ pub(super) fn draw(
 }
 
 fn descriptor(id: Option<u64>) -> String {
-    id.map_or_else(|| "unknown".into(), |id| format!("#{id}"))
+    id.map_or_else(|| "not retained".into(), |id| format!("#{id}"))
 }
 
 fn task_type(spawned_at: Option<&str>, id: Option<u64>) -> String {
@@ -56,57 +57,6 @@ fn task_type(spawned_at: Option<&str>, id: Option<u64>) -> String {
 
 fn duration(value: Option<u64>) -> String {
     value.map_or_else(|| "-".into(), format_runtime_duration)
-}
-
-fn directed(ordering: Ordering, view: RuntimeViewState) -> Ordering {
-    table_ui::directed(ordering, view.task_type_sort_descending)
-}
-
-fn compare_optional<T: Ord>(left: Option<T>, right: Option<T>, view: RuntimeViewState) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => directed(left.cmp(&right), view),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn compare_async_groups(left: &AsynchronousTaskGroupSummary, right: &AsynchronousTaskGroupSummary, view: RuntimeViewState) -> Ordering {
-    let ordering = match view.task_type_sort {
-        RuntimeTaskTypeSort::SpawnedAt => compare_optional(left.spawned_at.as_deref(), right.spawned_at.as_deref(), view),
-        RuntimeTaskTypeSort::BodySize => compare_optional(left.body_size_bytes, right.body_size_bytes, view),
-        RuntimeTaskTypeSort::Spawned => directed(left.outcomes.tasks.cmp(&right.outcomes.tasks), view),
-        RuntimeTaskTypeSort::Live => directed(left.outcomes.active.cmp(&right.outcomes.active), view),
-        RuntimeTaskTypeSort::Succeeded => directed(left.outcomes.completed.cmp(&right.outcomes.completed), view),
-        RuntimeTaskTypeSort::Canceled => directed(left.outcomes.canceled.cmp(&right.outcomes.canceled), view),
-        RuntimeTaskTypeSort::Panicked => directed(left.outcomes.panicked.cmp(&right.outcomes.panicked), view),
-        RuntimeTaskTypeSort::Workers => directed(left.outcomes.workers.cmp(&right.outcomes.workers), view),
-        RuntimeTaskTypeSort::PollsOrRuns => directed(left.polls.cmp(&right.polls), view),
-        RuntimeTaskTypeSort::AverageReadyOrQueue => compare_optional(left.ready_time.mean_nanos(), right.ready_time.mean_nanos(), view),
-        RuntimeTaskTypeSort::MaximumReadyOrQueue => compare_optional(left.ready_time.max_nanos, right.ready_time.max_nanos, view),
-        RuntimeTaskTypeSort::AverageDuration => compare_optional(left.poll_time.mean_nanos(), right.poll_time.mean_nanos(), view),
-        RuntimeTaskTypeSort::MaximumDuration => compare_optional(left.poll_time.max_nanos, right.poll_time.max_nanos, view),
-    };
-    ordering.then_with(|| left.type_descriptor_id.cmp(&right.type_descriptor_id))
-}
-
-fn compare_blocking_groups(left: &BlockingTaskGroupSummary, right: &BlockingTaskGroupSummary, view: RuntimeViewState) -> Ordering {
-    let ordering = match view.task_type_sort {
-        RuntimeTaskTypeSort::SpawnedAt => compare_optional(left.spawned_at.as_deref(), right.spawned_at.as_deref(), view),
-        RuntimeTaskTypeSort::BodySize => compare_optional(left.body_size_bytes, right.body_size_bytes, view),
-        RuntimeTaskTypeSort::Spawned => directed(left.outcomes.tasks.cmp(&right.outcomes.tasks), view),
-        RuntimeTaskTypeSort::Live => directed(left.outcomes.active.cmp(&right.outcomes.active), view),
-        RuntimeTaskTypeSort::Succeeded => directed(left.outcomes.completed.cmp(&right.outcomes.completed), view),
-        RuntimeTaskTypeSort::Canceled => directed(left.outcomes.canceled.cmp(&right.outcomes.canceled), view),
-        RuntimeTaskTypeSort::Panicked => directed(left.outcomes.panicked.cmp(&right.outcomes.panicked), view),
-        RuntimeTaskTypeSort::Workers => directed(left.outcomes.workers.cmp(&right.outcomes.workers), view),
-        RuntimeTaskTypeSort::PollsOrRuns => directed(left.executions.cmp(&right.executions), view),
-        RuntimeTaskTypeSort::AverageReadyOrQueue => compare_optional(left.queue_time.mean_nanos(), right.queue_time.mean_nanos(), view),
-        RuntimeTaskTypeSort::MaximumReadyOrQueue => compare_optional(left.queue_time.max_nanos, right.queue_time.max_nanos, view),
-        RuntimeTaskTypeSort::AverageDuration => compare_optional(left.execution_time.mean_nanos(), right.execution_time.mean_nanos(), view),
-        RuntimeTaskTypeSort::MaximumDuration => compare_optional(left.execution_time.max_nanos, right.execution_time.max_nanos, view),
-    };
-    ordering.then_with(|| left.type_descriptor_id.cmp(&right.type_descriptor_id))
 }
 
 fn draw_empty(frame: &mut ratatui::Frame<'_>, area: Rect, title: String, message: &'static str, focused: bool) {
@@ -152,7 +102,7 @@ fn draw_asynchronous(
         .filter(|group| Some(group.runtime_id) == runtime_id)
         .filter(|group| group.worker_id == worker_id)
         .collect::<Vec<_>>();
-    groups.sort_by(|left, right| compare_async_groups(left, right, view));
+    sort_runtime_async_groups(&mut groups, view);
     let focused = view.section == RuntimeSectionFocus::TaskTypes;
     let selected = view.asynchronous_task_selected.min(groups.len().saturating_sub(1));
     let visible = usize::from(area.height.saturating_sub(3));
@@ -337,7 +287,7 @@ fn draw_blocking(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, 
         .filter(|group| Some(group.runtime_id) == runtime_id)
         .filter(|group| group.worker_id == worker_id)
         .collect::<Vec<_>>();
-    groups.sort_by(|left, right| compare_blocking_groups(left, right, view));
+    sort_runtime_blocking_groups(&mut groups, view);
     let focused = view.section == RuntimeSectionFocus::TaskTypes;
     let selected = view.blocking_task_selected.min(groups.len().saturating_sub(1));
     let visible = usize::from(area.height.saturating_sub(3));

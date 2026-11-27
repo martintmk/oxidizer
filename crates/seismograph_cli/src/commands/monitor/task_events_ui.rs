@@ -12,11 +12,32 @@ use super::super::app::{
     RuntimeDetailMode, RuntimeViewState, TaskEventOperationSort, TaskEventsFocus, TaskEventsViewState, TaskOccurrenceSort,
 };
 use super::super::data::{AllocationStackFilter, RuntimeTaskSummary};
-use super::super::formatting::format_count;
+use super::super::formatting::{format_count, format_runtime_duration};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::table_ui;
 use super::super::task_events::{TaskEvent, TaskEventSummary, TaskEventsSnapshot, TaskObject, TaskOperation};
 use super::draw_empty_panel_with_message;
+
+#[derive(Clone, Copy)]
+struct OccurrenceTable<'a> {
+    operation: Option<&'a TaskOperation>,
+    occurrences: Option<&'a [(&'a TaskObject, &'a TaskEvent)]>,
+    offset_origin: Option<u64>,
+}
+
+impl<'a> OccurrenceTable<'a> {
+    const fn new(
+        operation: Option<&'a TaskOperation>,
+        occurrences: Option<&'a [(&'a TaskObject, &'a TaskEvent)]>,
+        offset_origin: Option<u64>,
+    ) -> Self {
+        Self {
+            operation,
+            occurrences,
+            offset_origin,
+        }
+    }
+}
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -52,6 +73,7 @@ pub(super) fn draw(
         .and_then(|operations| operations.get(view.operation_selected.min(operations.len().saturating_sub(1))))
         .copied();
     let occurrences = operation.map(|operation| sorted_occurrences(operation, view));
+    let offset_origin = events.and_then(first_task_event_timestamp);
     let occurrence = occurrences
         .as_ref()
         .and_then(|occurrences| occurrences.get(view.event_selected.min(occurrences.len().saturating_sub(1))))
@@ -59,8 +81,22 @@ pub(super) fn draw(
     let [operations_area, occurrences_area, stack_area] = areas(content, view.focus);
     let focused = runtime_view.detail_mode == RuntimeDetailMode::Events;
     draw_operations(frame, mouse, operations_area, operations.as_deref(), view, focused);
-    draw_occurrences(frame, mouse, occurrences_area, operation, occurrences.as_deref(), view, focused);
-    draw_stack(frame, stack_area, occurrence, view);
+    draw_occurrences(
+        frame,
+        mouse,
+        occurrences_area,
+        OccurrenceTable::new(operation, occurrences.as_deref(), offset_origin),
+        view,
+        focused,
+    );
+    draw_stack(frame, stack_area, occurrence, offset_origin, view);
+}
+
+fn first_task_event_timestamp(task: &TaskEventSummary) -> Option<u64> {
+    task.operations
+        .iter()
+        .filter_map(|operation| operation.occurrences().next().map(|(_, event)| event.timestamp))
+        .min()
 }
 
 fn sorted_operations(task: &TaskEventSummary, view: TaskEventsViewState) -> Vec<&TaskOperation> {
@@ -174,26 +210,25 @@ fn draw_occurrences(
     frame: &mut ratatui::Frame<'_>,
     mouse: &MouseRows,
     area: Rect,
-    operation: Option<&TaskOperation>,
-    occurrences: Option<&[(&TaskObject, &TaskEvent)]>,
+    table: OccurrenceTable<'_>,
     view: TaskEventsViewState,
     focused: bool,
 ) {
     if area.is_empty() {
         return;
     }
-    let Some(operation) = operation else {
+    let Some(operation) = table.operation else {
         draw_empty_panel_with_message(frame, area, " Task occurrences ", Some("Select an operation."));
         return;
     };
-    let occurrences = occurrences.unwrap_or_default();
+    let occurrences = table.occurrences.unwrap_or_default();
     let count = occurrences.len();
     let selected = view.event_selected.min(count.saturating_sub(1));
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
     let rows = occurrences.iter().skip(first).take(visible).map(|(object, event)| {
         Row::new([
-            event.timestamp.to_string(),
+            format_event_offset(event.timestamp, table.offset_origin),
             event.thread_id.to_string(),
             event.sequence.to_string(),
             format!("0x{:x}", object.object_id),
@@ -221,7 +256,7 @@ fn draw_occurrences(
     let table = Table::new(rows, widths)
         .header(
             Row::new(table_ui::sort_headers(
-                vec!["Time (ns)", "Thread", "Sequence", "Object"],
+                vec!["Offset", "Thread", "Sequence", "Object"],
                 &sorts,
                 view.occurrence_sort,
                 view.occurrence_descending,
@@ -239,7 +274,13 @@ fn draw_occurrences(
     table_ui::register_headers(mouse, area, &widths, &targets);
 }
 
-fn draw_stack(frame: &mut ratatui::Frame<'_>, area: Rect, occurrence: Option<(&TaskObject, &TaskEvent)>, view: TaskEventsViewState) {
+fn draw_stack(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    occurrence: Option<(&TaskObject, &TaskEvent)>,
+    offset_origin: Option<u64>,
+    view: TaskEventsViewState,
+) {
     if area.is_empty() {
         return;
     }
@@ -255,8 +296,10 @@ fn draw_stack(frame: &mut ratatui::Frame<'_>, area: Rect, occurrence: Option<(&T
     let frames = event.stack(view.stack_filter);
     let mut lines = vec![
         Line::from(format!(
-            "Thread {} / sequence {} / {}ns",
-            event.thread_id, event.sequence, event.timestamp
+            "Thread {} / sequence {} / offset {}",
+            event.thread_id,
+            event.sequence,
+            format_event_offset(event.timestamp, offset_origin)
         )),
         Line::from(format!("{:?} | {}", event.kind, event.detail)),
         Line::from(object.identity_note),
@@ -298,6 +341,10 @@ fn draw_stack(frame: &mut ratatui::Frame<'_>, area: Rect, occurrence: Option<(&T
     );
 }
 
+fn format_event_offset(timestamp: u64, origin: Option<u64>) -> String {
+    format_runtime_duration(timestamp.saturating_sub(origin.unwrap_or(timestamp)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -310,6 +357,17 @@ mod tests {
     use seismograph::recorder::{Policies, Policy};
 
     use super::*;
+
+    fn rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let width = usize::from(terminal.backend().buffer().area.width);
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .collect()
+    }
 
     fn event(sequence: u64, kind: EventKind, payload: EventPayload) -> Event {
         Event {
@@ -397,10 +455,18 @@ mod tests {
             .find(|operation| operation.kind == super::super::super::data::ThreadOperationKind::MutexAccess)
             .unwrap();
         let occurrences = sorted_occurrences(operation, view);
+        let offset_origin = first_task_event_timestamp(task);
         terminal
             .draw(|frame| {
                 mouse.begin(frame.area());
-                draw_occurrences(frame, &mouse, frame.area(), Some(operation), Some(&occurrences), view, true);
+                draw_occurrences(
+                    frame,
+                    &mouse,
+                    frame.area(),
+                    OccurrenceTable::new(Some(operation), Some(&occurrences), offset_origin),
+                    view,
+                    true,
+                );
             })
             .unwrap();
         assert_eq!(terminal.backend().buffer()[(1, 3)].bg, Color::Cyan);
@@ -408,16 +474,10 @@ mod tests {
         view.stack_filter = AllocationStackFilter::All;
         let mut terminal = Terminal::new(TestBackend::new(100, 9)).unwrap();
         terminal
-            .draw(|frame| draw_stack(frame, frame.area(), Some(occurrence), view))
+            .draw(|frame| draw_stack(frame, frame.area(), Some(occurrence), offset_origin, view))
             .unwrap();
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(100)
-            .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect::<String>())
-            .collect::<Vec<_>>();
-        assert!(rows[1].contains("Thread 1 / sequence 3 / 30ns"));
+        let rows = rows(&terminal);
+        assert!(rows[1].contains("Thread 1 / sequence 3 / offset 10ns"));
         assert!(rows[2].contains("MutexAccess"));
         assert!(rows[3].contains("Same-family address observations"));
         assert!(rows[4].contains("Complete captured stack"));
@@ -425,7 +485,7 @@ mod tests {
         view.stack_scroll = usize::MAX;
         terminal = Terminal::new(TestBackend::new(100, 5)).unwrap();
         terminal
-            .draw(|frame| draw_stack(frame, frame.area(), Some(occurrence), view))
+            .draw(|frame| draw_stack(frame, frame.area(), Some(occurrence), offset_origin, view))
             .unwrap();
         let last = (0..100).map(|x| terminal.backend().buffer()[(x, 3)].symbol()).collect::<String>();
         assert!(last.contains("0x0000000000001234"));
@@ -433,7 +493,7 @@ mod tests {
         view.stack_horizontal_scroll = u16::MAX;
         terminal = Terminal::new(TestBackend::new(60, 9)).unwrap();
         terminal
-            .draw(|frame| draw_stack(frame, frame.area(), Some(occurrence), view))
+            .draw(|frame| draw_stack(frame, frame.area(), Some(occurrence), offset_origin, view))
             .unwrap();
         let first = (1..59).map(|x| terminal.backend().buffer()[(x, 1)].symbol()).collect::<String>();
         assert!(first.trim().is_empty());
@@ -451,6 +511,13 @@ mod tests {
                 (occurrences.x, stack.x, area.right())
             );
         }
+    }
+
+    #[test]
+    fn event_offsets_use_jiff_durations_from_the_task_origin() {
+        assert_eq!(format_event_offset(30, Some(20)), "10ns");
+        assert_eq!(format_event_offset(1_254, Some(20)), "1.23µs");
+        assert_eq!(format_event_offset(10, None), "0ns");
     }
 
     #[test]
@@ -492,11 +559,14 @@ mod tests {
         let object = &mut operation.objects[0];
         Arc::make_mut(&mut object.history)[0].relative_stack_known = false;
         let occurrence = Some((&*object, &object.history[0]));
+        let offset_origin = Some(object.history[0].timestamp);
         let mut view = super::super::super::app::App::new().runtime_view.events;
         view.stack_filter = AllocationStackFilter::Application;
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
 
-        terminal.draw(|frame| draw_stack(frame, frame.area(), occurrence, view)).unwrap();
+        terminal
+            .draw(|frame| draw_stack(frame, frame.area(), occurrence, offset_origin, view))
+            .unwrap();
 
         let text = terminal
             .backend()

@@ -54,7 +54,7 @@ pub(super) fn prepare_with_progress(
     for source in std::mem::take(&mut decoded.sources) {
         if source.id == seismograph_runtime::snapshot::source::ID {
             progress(Phase::DecodeRuntime);
-            if source.schema_version != seismograph_runtime::snapshot::source::SCHEMA_VERSION {
+            if !seismograph_runtime::snapshot::source::supports_schema_version(source.schema_version) {
                 return Err(crate::snapshot_error::Error::UnsupportedRuntimeSchema(source.schema_version).to_string());
             }
             runtime_source =
@@ -174,8 +174,8 @@ mod tests {
     use super::{prepare, release_chunks, release_stacks};
 
     #[test]
-    fn previous_runtime_envelopes_are_rejected_before_payload_decoding() {
-        for version in 0..seismograph_runtime::snapshot::source::SCHEMA_VERSION {
+    fn unsupported_runtime_envelopes_are_rejected_before_payload_decoding() {
+        for version in 0..11 {
             let mut source = runtime_source();
             source.schema_version = version;
             source.data.clear();
@@ -187,6 +187,20 @@ mod tests {
             .unwrap();
             assert_eq!(error, format!("unsupported runtime source schema {version}"));
         }
+    }
+
+    #[test]
+    fn previous_runtime_envelope_remains_decodable() {
+        let mut source = runtime_source();
+        source.schema_version = 11;
+        source.data[10..12].copy_from_slice(&11_u16.to_le_bytes());
+        source.data.truncate(16);
+
+        prepare(DecodedSnapshot {
+            sources: vec![source],
+            ..DecodedSnapshot::default()
+        })
+        .unwrap();
     }
 
     #[test]
@@ -330,6 +344,7 @@ mod tests {
         let mut data = b"SEISRUNT".to_vec();
         data.extend_from_slice(&1_u16.to_le_bytes());
         data.extend_from_slice(&seismograph_runtime::snapshot::source::SCHEMA_VERSION.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
         data.extend_from_slice(&0_u32.to_le_bytes());
         SourceSnapshot {
             id: seismograph_runtime::snapshot::source::ID,

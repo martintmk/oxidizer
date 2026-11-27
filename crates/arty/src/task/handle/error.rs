@@ -7,6 +7,7 @@ use std::fmt::{self, Debug, Display};
 
 use arty_executor::ShutdownError;
 use performables::sync::mutex::Mutex;
+use thread_aware::ThreadAware;
 
 use crate::runtime::ShutdownCause;
 
@@ -57,7 +58,9 @@ use crate::runtime::ShutdownCause;
 /// runtime.stop()?;
 /// # Ok::<(), arty::runtime::Error>(())
 /// ```
+#[derive(ThreadAware)]
 pub struct JoinError {
+    #[thread_aware(skip)]
     kind: Kind,
 }
 
