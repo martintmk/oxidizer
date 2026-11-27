@@ -135,8 +135,8 @@ impl Panels {
             }
             MonitorTab::Threads => {
                 let [top, bottom] = split(Split::ThreadRows, Direction::Vertical, area, Constraint::Percentage(42));
-                let [threads, operations] = split(Split::ThreadColumns, Direction::Horizontal, top, Constraint::Percentage(36));
-                let [participants, rest] = split(Split::ThreadParticipants, Direction::Horizontal, bottom, Constraint::Percentage(30));
+                let [threads, operations] = split(Split::ThreadColumns, Direction::Horizontal, top, Constraint::Percentage(45));
+                let [participants, rest] = split(Split::ThreadParticipants, Direction::Horizontal, bottom, Constraint::Percentage(38));
                 let [objects, stack] = split(Split::ThreadStack, Direction::Horizontal, rest, Constraint::Percentage(43));
                 areas = [threads, operations, participants, objects, stack];
             }
@@ -209,7 +209,11 @@ impl App {
             self.panels.cancel_drag();
             return;
         }
-        if self.recording_configuration_popup.is_some() || self.filters.popup.is_some() || self.capture_started_at.is_some() {
+        if self.recording_configuration_popup.is_some()
+            || self.task_search_popup.is_some()
+            || self.filters.popup.is_some()
+            || self.capture_started_at.is_some()
+        {
             self.panels.dragging = None;
             return;
         }

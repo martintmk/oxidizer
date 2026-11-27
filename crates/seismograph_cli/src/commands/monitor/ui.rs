@@ -19,8 +19,8 @@ use super::app::HeapFocus;
 use super::app::{
     ActivitySample, AllocationViewState, AllocatorBackend, App, CacheFocus, CacheOperationSort, CacheTierSort, CacheViewState, CaptureMode,
     CaptureStep, HeapViewState, HotspotViewState, IoFocus, IoOperationSort, IoResourceSort, IoViewState, MonitorTab, PrimitiveFocus,
-    PrimitiveHotspotSort, PrimitiveTypeSort, PrimitiveViewState, RecordingConfigurationPopup, RuntimeViewState, Screen, ThreadFocus,
-    ThreadListSort, ThreadObjectSort, ThreadOperationSort, ThreadParticipantSort, ThreadViewState, format_sampling_percentage,
+    PrimitiveHotspotSort, PrimitiveTypeSort, PrimitiveViewState, RecordingConfigurationPopup, RuntimeViewState, Screen, TaskSearchPopup,
+    ThreadFocus, ThreadListSort, ThreadObjectSort, ThreadOperationSort, ThreadParticipantSort, ThreadViewState, format_sampling_percentage,
     recording_policy_label,
 };
 use super::data::{
@@ -52,6 +52,7 @@ mod task_events_ui;
 const KEY_COLOR: Color = Color::Cyan;
 const CONTENTION_COLOR: Color = Color::Yellow;
 const INFO_LABEL_WIDTH: usize = 18;
+const THREAD_ID_WIDTH: usize = 10;
 
 impl App {
     pub(super) fn screen_areas(&self, area: Rect) -> [Rect; 3] {
@@ -152,6 +153,9 @@ impl App {
             Self::draw_recording_configuration_popup(frame, popup);
         }
         self.draw_filter_popup(frame);
+        if let Some(popup) = &self.task_search_popup {
+            Self::draw_task_search_popup(frame, popup);
+        }
         if let Some(help) = &self.help {
             help.draw(frame);
         }
@@ -240,6 +244,22 @@ impl App {
         let mut state = ListState::default().with_selected(Some(popup.selected));
         frame.render_widget(Clear, popup_area);
         frame.render_stateful_widget(list, popup_area, &mut state);
+    }
+
+    fn draw_task_search_popup(frame: &mut ratatui::Frame<'_>, popup: &TaskSearchPopup) {
+        let area = centered_rect(frame.area(), 54, 7);
+        let block = Block::default().title(" Find Runtime Task ").borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        let [field, status] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(format!("Task ID: {}|", popup.task_id)), field);
+        frame.render_widget(
+            Paragraph::new(popup.error.as_deref().unwrap_or("Enter a retained numeric task ID."))
+                .style(Style::default().fg(if popup.error.is_some() { Color::Red } else { Color::Gray }))
+                .wrap(Wrap { trim: false }),
+            status,
+        );
     }
 }
 
@@ -397,7 +417,7 @@ fn draw_connected(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, v
                     frame,
                     content,
                     " Runtime Task ",
-                    Some("Select a task type or task in the Runtime tab."),
+                    Some("No task selected. Press Ctrl+F to find a retained task by ID, or select one in Runtime."),
                 );
                 return;
             };
@@ -586,17 +606,13 @@ fn draw_io(
     frame.render_widget(
         Paragraph::new(resource_lines).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(format!(
-                        " I/O Resources · {} retained I/O events · capture: {} accepted, {} overwritten ({}) · ",
-                        format_count(io.retained_events),
-                        format_count(io.total_events),
-                        format_count(io.lost_events),
-                        format_event_loss(io.lost_events, io.total_events),
-                    )),
-                    key_span("Enter"),
-                    Span::raw(" operations "),
-                ]))
+                .title(Line::from(vec![Span::raw(format!(
+                    " I/O Resources · {} retained I/O events · capture: {} accepted, {} overwritten ({}) ",
+                    format_count(io.retained_events),
+                    format_count(io.total_events),
+                    format_count(io.lost_events),
+                    format_event_loss(io.lost_events, io.total_events),
+                ))]))
                 .borders(Borders::ALL),
         ),
         resources_area,
@@ -692,11 +708,7 @@ fn draw_io(
         Paragraph::new(operation_lines).block(
             Block::default()
                 .title(" Operations ")
-                .title_bottom(Line::from(vec![
-                    Span::raw(format!(" {details} · ")),
-                    key_span("Backspace"),
-                    Span::raw(" resources "),
-                ]))
+                .title_bottom(format!(" {details} "))
                 .borders(Borders::ALL),
         ),
         operations_area,
@@ -811,17 +823,13 @@ fn draw_cache(
     frame.render_widget(
         Paragraph::new(tier_lines).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(format!(
-                        " Cache Tiers · {} retained cache events · capture: {} accepted, {} overwritten ({}) · ",
-                        format_count(cache.retained_events),
-                        format_count(cache.total_events),
-                        format_count(cache.lost_events),
-                        format_event_loss(cache.lost_events, cache.total_events),
-                    )),
-                    key_span("Enter"),
-                    Span::raw(" outcomes "),
-                ]))
+                .title(Line::from(vec![Span::raw(format!(
+                    " Cache Tiers · {} retained cache events · capture: {} accepted, {} overwritten ({}) ",
+                    format_count(cache.retained_events),
+                    format_count(cache.total_events),
+                    format_count(cache.lost_events),
+                    format_event_loss(cache.lost_events, cache.total_events),
+                ))]))
                 .borders(Borders::ALL),
         ),
         tiers_area,
@@ -881,12 +889,7 @@ fn draw_cache(
             }),
     );
     frame.render_widget(
-        Paragraph::new(operation_lines).block(
-            Block::default()
-                .title(" Outcomes ")
-                .title_bottom(Line::from(vec![key_span("Backspace"), Span::raw(" tiers ")]))
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(operation_lines).block(Block::default().title(" Outcomes ").borders(Borders::ALL)),
         operations_area,
     );
     register_fixed_headers(
@@ -1060,21 +1063,11 @@ fn draw_allocations(
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Hotspots · e events · click headings · "),
-                    key_span("["),
-                    Span::raw("/"),
-                    key_span("]"),
-                    Span::raw(" sort · "),
-                    key_span("r"),
-                    Span::raw(" reverse · "),
-                    key_span("↑/↓"),
-                    Span::raw(format!(
-                        " select · source {} accepted / {} overwritten ",
-                        format_count(allocations.total_events),
-                        format_count(allocations.lost_events)
-                    )),
-                ]))
+                .title(Line::from(vec![Span::raw(format!(
+                    " Hotspots · source {} accepted / {} overwritten ",
+                    format_count(allocations.total_events),
+                    format_count(allocations.lost_events)
+                ))]))
                 .title_bottom(" Unmatched retained allocations are not proven live allocations or leaks, even with zero overwrites ")
                 .borders(Borders::ALL),
         ),
@@ -1155,9 +1148,7 @@ fn draw_allocation_records(
     frame.render_widget(
         wrapped_detail_paragraph(
             &lines,
-            Block::default()
-                .title(" Operation detail / stack · f frames · PgUp/PgDn scroll ")
-                .borders(Borders::ALL),
+            Block::default().title(" Operation detail / stack ").borders(Borders::ALL),
             stack_area,
             view.stack_scroll,
         ),
@@ -1208,19 +1199,14 @@ fn draw_allocation_stack(
     frame.render_widget(
         Paragraph::new(stack).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Stack Trace • "),
-                    key_span("[f]"),
-                    Span::raw(format!(
-                        " {} • ",
-                        match view.stack_filter {
-                            AllocationStackFilter::Application => "application frames",
-                            AllocationStackFilter::All => "all frames",
-                        }
-                    )),
-                    key_span("PgUp/PgDn"),
-                    Span::raw(format!(" scroll • {} ", hotspot.location(view.stack_filter))),
-                ]))
+                .title(Line::from(vec![Span::raw(format!(
+                    " Stack Trace · {} · {} ",
+                    match view.stack_filter {
+                        AllocationStackFilter::Application => "application frames",
+                        AllocationStackFilter::All => "all frames",
+                    },
+                    hotspot.location(view.stack_filter),
+                ))]))
                 .borders(Borders::ALL),
         ),
         area,
@@ -1458,18 +1444,12 @@ fn draw_primitive_types(
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Primitive Types · "),
-                    key_span("↑/↓"),
-                    Span::raw(" select · "),
-                    key_span("Enter"),
-                    Span::raw(format!(
-                        " details · {} retained primitive · {} source accepted · {} overwritten ",
-                        format_count(primitives.groups.iter().map(|group| group.events).sum()),
-                        format_count(primitives.total_events),
-                        format_count(primitives.lost_events)
-                    )),
-                ]))
+                .title(Line::from(vec![Span::raw(format!(
+                    " Primitive Types · {} retained primitive · {} source accepted · {} overwritten ",
+                    format_count(primitives.groups.iter().map(|group| group.events).sum()),
+                    format_count(primitives.total_events),
+                    format_count(primitives.lost_events)
+                ))]))
                 .borders(Borders::ALL),
         ),
         area,
@@ -1535,23 +1515,7 @@ fn draw_primitive_operations(
         }));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Operations · "),
-                    key_span("Enter"),
-                    Span::raw(" hotspots · "),
-                    key_span("["),
-                    Span::raw("/"),
-                    key_span("]"),
-                    Span::raw(" sort · "),
-                    key_span("r"),
-                    Span::raw(" reverse · "),
-                    key_span("Backspace"),
-                    Span::raw(" up "),
-                ]))
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(" Operations ").borders(Borders::ALL)),
         area,
     );
     let inner = Block::default().borders(Borders::ALL).inner(area);
@@ -1622,19 +1586,7 @@ fn draw_primitive_hotspots(
         }));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Hotspots · "),
-                    key_span("↑/↓"),
-                    Span::raw(" · "),
-                    key_span("f"),
-                    Span::raw(" frames · "),
-                    key_span("Backspace"),
-                    Span::raw(" up "),
-                ]))
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(" Hotspots ").borders(Borders::ALL)),
         area,
     );
     register_fixed_headers(
@@ -1675,11 +1627,7 @@ fn draw_primitive_stack(
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Stack Trace · "),
-                    key_span("PgUp/PgDn"),
-                    Span::raw(format!(" scroll · {} ", hotspot.location(view.stack_filter))),
-                ]))
+                .title(format!(" Stack Trace · {} ", hotspot.location(view.stack_filter)))
                 .borders(Borders::ALL),
         ),
         area,
@@ -1740,7 +1688,8 @@ fn sorted_threads(threads: &ThreadSnapshot, view: ThreadViewState) -> Vec<&super
     let mut sorted = threads.threads.iter().collect::<Vec<_>>();
     sorted.sort_unstable_by(|left, right| {
         let ordering = match view.thread_sort {
-            ThreadListSort::Thread => (&left.name, left.thread_id).cmp(&(&right.name, right.thread_id)),
+            ThreadListSort::Id => left.thread_id.cmp(&right.thread_id),
+            ThreadListSort::Name => (&left.name, left.thread_id).cmp(&(&right.name, right.thread_id)),
             ThreadListSort::Retained => left.retained_events.cmp(&right.retained_events),
             ThreadListSort::Overwritten => left.lost_events.cmp(&right.lost_events),
         };
@@ -1769,7 +1718,8 @@ fn sorted_thread_participants(operation: &super::data::ThreadOperation, view: Th
     let mut sorted = operation.participants.iter().collect::<Vec<_>>();
     sorted.sort_unstable_by(|left, right| {
         let ordering = match view.participant_sort {
-            ThreadParticipantSort::Thread => (&left.name, left.thread_id).cmp(&(&right.name, right.thread_id)),
+            ThreadParticipantSort::Id => left.thread_id.cmp(&right.thread_id),
+            ThreadParticipantSort::Name => (&left.name, left.thread_id).cmp(&(&right.name, right.thread_id)),
             ThreadParticipantSort::Objects => left.objects.len().cmp(&right.objects.len()),
             ThreadParticipantSort::Events => left.events.cmp(&right.events),
         };
@@ -1806,11 +1756,13 @@ fn draw_thread_list(
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
     mouse_rows.register(area, 1, first, threads.len(), ListTarget::Threads);
+    let name_width = usize::from(area.width.saturating_sub(35)).max(12);
     let heading = |label: &str, sort| table_ui::sort_heading(label, view.thread_sort == sort, view.thread_descending);
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "{:<18} {:>9} {:>11}",
-            heading("Thread", ThreadListSort::Thread),
+            "{:<THREAD_ID_WIDTH$} {:<name_width$} {:>9} {:>11}",
+            heading("ID", ThreadListSort::Id),
+            heading("Name", ThreadListSort::Name),
             heading("Retained", ThreadListSort::Retained),
             heading("Overwritten", ThreadListSort::Overwritten)
         ),
@@ -1819,8 +1771,9 @@ fn draw_thread_list(
     lines.extend(threads.iter().skip(first).take(visible).enumerate().map(|(index, thread)| {
         primitive_selection_line(
             Line::from(format!(
-                "{:<18} {:>9} {:>11}",
-                thread_label(thread.thread_id, &thread.name, 18),
+                "{:<THREAD_ID_WIDTH$} {:<name_width$} {:>9} {:>11}",
+                format!("#{}", thread.thread_id),
+                truncated_name(&thread.name, name_width),
                 format_count(thread.retained_events),
                 format_count(thread.lost_events),
             )),
@@ -1834,23 +1787,21 @@ fn draw_thread_list(
         String::new()
     };
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Threads · "),
-                    key_span("Enter"),
-                    Span::raw(format!(" operations · sort by heading{hidden} ")),
-                ]))
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(format!(" Threads{hidden} ")).borders(Borders::ALL)),
         area,
     );
     register_fixed_headers(
         mouse_rows,
         area,
-        &[18, 9, 11],
         &[
-            ListTarget::ThreadHeader(ThreadListSort::Thread),
+            u16::try_from(THREAD_ID_WIDTH).unwrap_or(u16::MAX),
+            u16::try_from(name_width).unwrap_or(u16::MAX),
+            9,
+            11,
+        ],
+        &[
+            ListTarget::ThreadHeader(ThreadListSort::Id),
+            ListTarget::ThreadHeader(ThreadListSort::Name),
             ListTarget::ThreadHeader(ThreadListSort::Retained),
             ListTarget::ThreadHeader(ThreadListSort::Overwritten),
         ],
@@ -1909,19 +1860,7 @@ fn draw_thread_operations(
             }),
     );
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Operations · "),
-                    key_span("↑/↓"),
-                    Span::raw(" · "),
-                    key_span("Enter"),
-                    Span::raw(" related · "),
-                    key_span("Backspace"),
-                    Span::raw(" threads "),
-                ]))
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(" Operations ").borders(Borders::ALL)),
         area,
     );
     register_fixed_headers(
@@ -1955,11 +1894,13 @@ fn draw_thread_participants(
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
     mouse_rows.register(area, 1, first, participants.len(), ListTarget::ThreadParticipants);
+    let name_width = usize::from(area.width.saturating_sub(29)).max(12);
     let heading = |label: &str, sort| table_ui::sort_heading(label, view.participant_sort == sort, view.participant_descending);
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "{:<14} {:>7} {:>7}",
-            heading("Thread", ThreadParticipantSort::Thread),
+            "{:<THREAD_ID_WIDTH$} {:<name_width$} {:>7} {:>7}",
+            heading("ID", ThreadParticipantSort::Id),
+            heading("Name", ThreadParticipantSort::Name),
             heading("Objects", ThreadParticipantSort::Objects),
             heading("Events", ThreadParticipantSort::Events)
         ),
@@ -1974,12 +1915,16 @@ fn draw_thread_participants(
             .map(|(index, participant)| {
                 primitive_selection_line(
                     Line::from(format!(
-                        "{:<14} {:>7} {:>7}",
-                        if Some(participant.thread_id) == selected_thread_id {
-                            format!("{} (self)", participant.thread_id)
-                        } else {
-                            thread_label(participant.thread_id, &participant.name, 14)
-                        },
+                        "{:<THREAD_ID_WIDTH$} {:<name_width$} {:>7} {:>7}",
+                        format!("#{}", participant.thread_id),
+                        truncated_name(
+                            &if Some(participant.thread_id) == selected_thread_id {
+                                format!("{} (self)", participant.name)
+                            } else {
+                                participant.name.clone()
+                            },
+                            name_width,
+                        ),
                         format_count(u64::try_from(participant.objects.len()).unwrap_or(u64::MAX)),
                         format_count(participant.events),
                     )),
@@ -1994,13 +1939,7 @@ fn draw_thread_participants(
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(format!(" {} · ", operation.kind.relationship_label())),
-                    key_span("Enter"),
-                    Span::raw(" objects · "),
-                    key_span("Backspace"),
-                    Span::raw(" operations "),
-                ]))
+                .title(format!(" {} ", operation.kind.relationship_label()))
                 .borders(Borders::ALL),
         ),
         area,
@@ -2008,9 +1947,15 @@ fn draw_thread_participants(
     register_fixed_headers(
         mouse_rows,
         area,
-        &[14, 7, 7],
         &[
-            ListTarget::ThreadParticipantHeader(ThreadParticipantSort::Thread),
+            u16::try_from(THREAD_ID_WIDTH).unwrap_or(u16::MAX),
+            u16::try_from(name_width).unwrap_or(u16::MAX),
+            7,
+            7,
+        ],
+        &[
+            ListTarget::ThreadParticipantHeader(ThreadParticipantSort::Id),
+            ListTarget::ThreadParticipantHeader(ThreadParticipantSort::Name),
             ListTarget::ThreadParticipantHeader(ThreadParticipantSort::Objects),
             ListTarget::ThreadParticipantHeader(ThreadParticipantSort::Events),
         ],
@@ -2062,17 +2007,7 @@ fn draw_thread_objects(
         lines.push(Line::from("No shared retained objects."));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(Line::from(vec![
-                    Span::raw(" Objects · "),
-                    key_span("↑/↓"),
-                    Span::raw(" · "),
-                    key_span("Backspace"),
-                    Span::raw(" threads "),
-                ]))
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(" Objects ").borders(Borders::ALL)),
         area,
     );
     register_fixed_headers(
@@ -2102,13 +2037,7 @@ fn draw_thread_stack(frame: &mut ratatui::Frame<'_>, area: Rect, object: Option<
     frame.render_widget(
         Paragraph::new(lines.into_iter().skip(scroll).take(visible).collect::<Vec<_>>()).block(
             Block::default()
-                .title(Line::from(vec![
-                    Span::raw(format!(" Stack Trace · object 0x{:016x} · ", object.object_id)),
-                    key_span("[f]"),
-                    Span::raw(" application/all · "),
-                    key_span("PgUp/PgDn"),
-                    Span::raw(" scroll "),
-                ]))
+                .title(format!(" Stack Trace · object 0x{:016x} ", object.object_id))
                 .borders(Borders::ALL),
         ),
         area,
@@ -2143,13 +2072,12 @@ fn append_thread_stack(
     }
 }
 
-fn thread_label(thread_id: u64, name: &str, width: usize) -> String {
-    let label = if name.is_empty() {
-        format!("#{thread_id}")
+fn truncated_name(name: &str, width: usize) -> String {
+    if name.is_empty() {
+        "-".into()
     } else {
-        format!("#{thread_id} {name}")
-    };
-    label.chars().take(width).collect()
+        name.chars().take(width).collect()
+    }
 }
 
 fn primitive_selection_line(line: Line<'static>, selected: bool, focused: bool) -> Line<'static> {
@@ -2231,10 +2159,7 @@ fn draw_empty_panel_with_message(
     title: &'static str,
     unavailable: Option<&str>,
 ) {
-    let line = unavailable.map_or_else(
-        || Line::from(vec![Span::raw("Press "), key_span("[s]"), Span::raw(" to capture a snapshot.")]),
-        |message| Line::from(message.to_owned()),
-    );
+    let line = unavailable.map_or_else(|| Line::from("No snapshot captured."), |message| Line::from(message.to_owned()));
     frame.render_widget(
         Paragraph::new(line)
             .style(Style::default().fg(Color::DarkGray))
@@ -3066,7 +2991,7 @@ mod tests {
             task_events: runtime.task_events,
             io: runtime.io,
             cache: runtime.cache,
-            hotspots: super::super::hotspot_analysis::Report::default(),
+            hotspots: std::sync::OnceLock::new(),
             threads: runtime.threads,
             captured_at: Some(SystemTime::UNIX_EPOCH),
             captured_instant: Some(Instant::now()),
@@ -4258,14 +4183,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_task_search_popup_shows_input_and_errors() {
+        let mut app = App::new();
+        app.screen = Screen::Connected {
+            descriptor: descriptor(),
+            recording: RecordingConfiguration::default(),
+            tab: MonitorTab::Runtime,
+            snapshot: Some(representative_capture()),
+        };
+        app.handle_key_with_modifiers(crossterm::event::KeyCode::Char('f'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(app.task_search_popup.is_none());
+        if let Screen::Connected { tab, .. } = &mut app.screen {
+            *tab = MonitorTab::RuntimeTask;
+        }
+        assert!(render(&app).contains("Ctrl+F"));
+        app.handle_key_with_modifiers(crossterm::event::KeyCode::Char('f'), crossterm::event::KeyModifiers::CONTROL);
+        app.handle_key(crossterm::event::KeyCode::Char('4'));
+        app.handle_key(crossterm::event::KeyCode::Char('2'));
+        app.task_search_popup.as_mut().unwrap().error = Some("Task #42 is not retained.".into());
+
+        let output = render(&app);
+
+        assert!(output.contains("Find Runtime Task"));
+        assert!(output.contains("Task ID: 42"));
+        assert!(output.contains("Task #42 is not retained."));
+    }
+
+    #[test]
+    fn hotspot_analysis_is_initialized_only_when_requested() {
+        let capture = representative_capture();
+        assert!(capture.hotspots.get().is_none());
+
+        let _report = capture.hotspots();
+
+        assert!(capture.hotspots.get().is_some());
+    }
+
+    #[test]
     fn labels_and_visual_helpers_cover_empty_and_active_states() {
         assert_eq!(
             (
-                thread_label(7, "", 3),
-                thread_label(7, "worker", 5),
+                truncated_name("", 3),
+                truncated_name("worker", 5),
                 recording_configuration_label(RecordingConfiguration::default()),
             ),
-            ("#7".into(), "#7 wo".into(), "off",)
+            ("-".into(), "worke".into(), "off",)
         );
         assert_eq!(
             (
@@ -4628,7 +4590,7 @@ mod tests {
                 let area = frame.area();
                 draw_empty_panel(frame, area, " Empty ");
             })
-            .contains("Press")
+            .contains("No snapshot captured")
         );
 
         let clear = connected_footer(Some(RecordingConfiguration::default()), CaptureMode::Continue, None, "ready");
@@ -4648,12 +4610,20 @@ mod tests {
             kind: super::super::data::ThreadOperationKind::MutexAccess,
             events: 1,
             objects: 0,
-            participants: vec![super::super::data::ThreadParticipant {
-                thread_id: 7,
-                name: "worker".into(),
-                events: 1,
-                objects: Vec::new(),
-            }],
+            participants: vec![
+                super::super::data::ThreadParticipant {
+                    thread_id: 7,
+                    name: "worker".into(),
+                    events: 1,
+                    objects: Vec::new(),
+                },
+                super::super::data::ThreadParticipant {
+                    thread_id: 8,
+                    name: "background-runtime-worker".into(),
+                    events: 1,
+                    objects: Vec::new(),
+                },
+            ],
         };
         let participants = operation.participants.iter().collect::<Vec<_>>();
         let thread_view = App::new().thread_view;
@@ -4680,7 +4650,9 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(text.contains("7 (self)"));
+        assert!(text.contains("#7"));
+        assert!(text.contains("worker (self)"));
+        assert!(text.contains("background-runtime-worker"));
     }
 
     #[test]
@@ -4976,6 +4948,6 @@ mod tests {
             }));
         }
 
-        assert_eq!(stable_digest(&output), (516_229, 863_849_624_597_950_400));
+        assert_eq!(stable_digest(&output), (484_550, 13_698_850_103_802_303_703));
     }
 }

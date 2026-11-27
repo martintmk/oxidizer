@@ -107,7 +107,7 @@ fn draw_asynchronous(
     let selected = view.asynchronous_task_selected.min(groups.len().saturating_sub(1));
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
-    let (tasks, active, completed, canceled, panicked) = outcome_totals(groups.iter().map(|group| {
+    let (tasks, active, _, _, _) = outcome_totals(groups.iter().map(|group| {
         (
             group.outcomes.tasks,
             group.outcomes.active,
@@ -118,14 +118,11 @@ fn draw_asynchronous(
     }));
     let polls = groups.iter().fold(0_u64, |total, group| total.saturating_add(group.polls));
     let title = format!(
-        " Async Task Types · {} · {} types · {} spawned · {} live · {} succeeded · {} canceled · {} panicked · {} polls ",
-        worker_id.map_or_else(|| "unassigned".into(), |worker| format!("w{worker}")),
+        " Async Task Types · {} · {} types · {} spawned · {} live · {} polls ",
+        worker_id.map_or_else(|| "unassigned".into(), |worker| format!("#{worker}")),
         groups.len(),
         format_count(tasks),
         format_count(active),
-        format_count(completed),
-        format_count(canceled),
-        format_count(panicked),
         format_count(polls),
     );
     if groups.is_empty() {
@@ -138,38 +135,27 @@ fn draw_asynchronous(
         );
         return;
     }
-    let wide = area.width >= 185;
+    let wide = area.width >= 145;
     let rows = groups.iter().skip(first).take(visible).map(|group| asynchronous_row(group, wide));
     let (headers, widths, sorts): (Vec<_>, Vec<_>, Vec<_>) = if wide {
         (
             vec![
                 "Spawned at",
                 "Future B",
-                "Spawned",
+                "Total",
                 "Live",
-                "Succeeded",
-                "Canceled",
-                "Panicked",
-                "Workers",
                 "Polls",
                 "Avg ready",
                 "Max ready",
                 "Avg poll",
                 "Max poll",
             ],
-            vec![42, 10, 8, 8, 10, 9, 9, 8, 10, 12, 12, 12, 12]
-                .into_iter()
-                .map(Constraint::Length)
-                .collect(),
+            vec![42, 10, 8, 8, 10, 12, 12, 12, 12].into_iter().map(Constraint::Length).collect(),
             vec![
                 RuntimeTaskTypeSort::SpawnedAt,
                 RuntimeTaskTypeSort::BodySize,
-                RuntimeTaskTypeSort::Spawned,
+                RuntimeTaskTypeSort::Total,
                 RuntimeTaskTypeSort::Live,
-                RuntimeTaskTypeSort::Succeeded,
-                RuntimeTaskTypeSort::Canceled,
-                RuntimeTaskTypeSort::Panicked,
-                RuntimeTaskTypeSort::Workers,
                 RuntimeTaskTypeSort::PollsOrRuns,
                 RuntimeTaskTypeSort::AverageReadyOrQueue,
                 RuntimeTaskTypeSort::MaximumReadyOrQueue,
@@ -179,33 +165,20 @@ fn draw_asynchronous(
         )
     } else {
         (
-            vec![
-                "Spawned at",
-                "Future B",
-                "Spawned",
-                "Live",
-                "Succeeded",
-                "Canceled",
-                "Polls",
-                "Max poll",
-            ],
+            vec!["Spawned at", "Future B", "Total", "Live", "Polls", "Max poll"],
             vec![
                 Constraint::Min(24),
                 Constraint::Length(10),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(10),
-                Constraint::Length(9),
-                Constraint::Length(10),
                 Constraint::Length(12),
             ],
             vec![
                 RuntimeTaskTypeSort::SpawnedAt,
                 RuntimeTaskTypeSort::BodySize,
-                RuntimeTaskTypeSort::Spawned,
+                RuntimeTaskTypeSort::Total,
                 RuntimeTaskTypeSort::Live,
-                RuntimeTaskTypeSort::Succeeded,
-                RuntimeTaskTypeSort::Canceled,
                 RuntimeTaskTypeSort::PollsOrRuns,
                 RuntimeTaskTypeSort::MaximumDuration,
             ],
@@ -246,10 +219,6 @@ fn asynchronous_row(group: &AsynchronousTaskGroupSummary, wide: bool) -> Row<'st
     if wide {
         cells.extend([
             format_count(group.outcomes.active),
-            format_count(group.outcomes.completed),
-            format_count(group.outcomes.canceled),
-            format_count(group.outcomes.panicked),
-            format_count(group.outcomes.workers),
             format_count(group.polls),
             duration(group.ready_time.mean_nanos()),
             duration(group.ready_time.max_nanos),
@@ -259,8 +228,6 @@ fn asynchronous_row(group: &AsynchronousTaskGroupSummary, wide: bool) -> Row<'st
     } else {
         cells.extend([
             format_count(group.outcomes.active),
-            format_count(group.outcomes.completed),
-            format_count(group.outcomes.canceled),
             format_count(group.polls),
             duration(group.poll_time.max_nanos),
         ]);
@@ -292,7 +259,7 @@ fn draw_blocking(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, 
     let selected = view.blocking_task_selected.min(groups.len().saturating_sub(1));
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
-    let (tasks, active, completed, canceled, panicked) = outcome_totals(groups.iter().map(|group| {
+    let (tasks, active, _, _, _) = outcome_totals(groups.iter().map(|group| {
         (
             group.outcomes.tasks,
             group.outcomes.active,
@@ -303,15 +270,12 @@ fn draw_blocking(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, 
     }));
     let executions = groups.iter().fold(0_u64, |total, group| total.saturating_add(group.executions));
     let title = format!(
-        " Blocking Task Types · {} · {} types · {} spawned · {} runs · {} live · {} succeeded · {} canceled · {} panicked · {} unclassified ",
-        worker_id.map_or_else(|| "unassigned".into(), |worker| format!("w{worker}")),
+        " Blocking Task Types · {} · {} types · {} spawned · {} runs · {} live · {} unclassified ",
+        worker_id.map_or_else(|| "unassigned".into(), |worker| format!("#{worker}")),
         groups.len(),
         format_count(tasks),
         format_count(executions),
         format_count(active),
-        format_count(completed),
-        format_count(canceled),
-        format_count(panicked),
         format_count(runtime.unclassified_tasks),
     );
     if groups.is_empty() {
@@ -324,39 +288,28 @@ fn draw_blocking(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, 
         );
         return;
     }
-    let wide = area.width >= 185;
+    let wide = area.width >= 145;
     let rows = groups.iter().skip(first).take(visible).map(|group| blocking_row(group, wide));
     let (headers, widths, sorts): (Vec<_>, Vec<_>, Vec<_>) = if wide {
         (
             vec![
                 "Spawned at",
                 "Closure B",
-                "Spawned",
+                "Total",
                 "Runs",
                 "Live",
-                "Succeeded",
-                "Canceled",
-                "Panicked",
-                "Workers",
                 "Avg queue",
                 "Max queue",
                 "Avg exec",
                 "Max exec",
             ],
-            vec![42, 10, 8, 8, 8, 10, 9, 9, 8, 12, 12, 12, 12]
-                .into_iter()
-                .map(Constraint::Length)
-                .collect(),
+            vec![42, 10, 8, 8, 8, 12, 12, 12, 12].into_iter().map(Constraint::Length).collect(),
             vec![
                 RuntimeTaskTypeSort::SpawnedAt,
                 RuntimeTaskTypeSort::BodySize,
-                RuntimeTaskTypeSort::Spawned,
+                RuntimeTaskTypeSort::Total,
                 RuntimeTaskTypeSort::PollsOrRuns,
                 RuntimeTaskTypeSort::Live,
-                RuntimeTaskTypeSort::Succeeded,
-                RuntimeTaskTypeSort::Canceled,
-                RuntimeTaskTypeSort::Panicked,
-                RuntimeTaskTypeSort::Workers,
                 RuntimeTaskTypeSort::AverageReadyOrQueue,
                 RuntimeTaskTypeSort::MaximumReadyOrQueue,
                 RuntimeTaskTypeSort::AverageDuration,
@@ -365,33 +318,22 @@ fn draw_blocking(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, 
         )
     } else {
         (
-            vec![
-                "Spawned at",
-                "Closure B",
-                "Spawned",
-                "Runs",
-                "Succeeded",
-                "Canceled",
-                "Max queue",
-                "Max exec",
-            ],
+            vec!["Spawned at", "Closure B", "Total", "Runs", "Live", "Max queue", "Max exec"],
             vec![
                 Constraint::Min(24),
                 Constraint::Length(10),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Length(9),
+                Constraint::Length(8),
                 Constraint::Length(12),
                 Constraint::Length(12),
             ],
             vec![
                 RuntimeTaskTypeSort::SpawnedAt,
                 RuntimeTaskTypeSort::BodySize,
-                RuntimeTaskTypeSort::Spawned,
+                RuntimeTaskTypeSort::Total,
                 RuntimeTaskTypeSort::PollsOrRuns,
-                RuntimeTaskTypeSort::Succeeded,
-                RuntimeTaskTypeSort::Canceled,
+                RuntimeTaskTypeSort::Live,
                 RuntimeTaskTypeSort::MaximumReadyOrQueue,
                 RuntimeTaskTypeSort::MaximumDuration,
             ],
@@ -433,10 +375,6 @@ fn blocking_row(group: &BlockingTaskGroupSummary, wide: bool) -> Row<'static> {
     if wide {
         cells.extend([
             format_count(group.outcomes.active),
-            format_count(group.outcomes.completed),
-            format_count(group.outcomes.canceled),
-            format_count(group.outcomes.panicked),
-            format_count(group.outcomes.workers),
             duration(group.queue_time.mean_nanos()),
             duration(group.queue_time.max_nanos),
             duration(group.execution_time.mean_nanos()),
@@ -444,8 +382,7 @@ fn blocking_row(group: &BlockingTaskGroupSummary, wide: bool) -> Row<'static> {
         ]);
     } else {
         cells.extend([
-            format_count(group.outcomes.completed),
-            format_count(group.outcomes.canceled),
+            format_count(group.outcomes.active),
             duration(group.queue_time.max_nanos),
             duration(group.execution_time.max_nanos),
         ]);
@@ -544,6 +481,10 @@ mod tests {
                 .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
             assert!(text.contains(expected));
+            assert!(text.contains("Total"));
+            for moved in ["Succeeded", "Canceled", "Panicked", "Workers"] {
+                assert!(!text.contains(moved), "{focus:?}: {moved}");
+            }
         }
     }
 }

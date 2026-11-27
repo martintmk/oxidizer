@@ -115,6 +115,7 @@ pub(super) struct RuntimeWorkerSummary {
     pub(super) role: String,
     pub(super) state: String,
     pub(super) thread_id: Option<u64>,
+    pub(super) thread_name: String,
     pub(super) current_task: Option<u64>,
     pub(super) park_events: u64,
     pub(super) unpark_events: u64,
@@ -602,6 +603,7 @@ impl RuntimeMonitorSnapshot {
         addresses: &[seismograph_rallocator::callers::AddressLookup],
     ) -> Self {
         let lookups = addresses.iter().map(|lookup| (lookup.address, lookup)).collect::<HashMap<_, _>>();
+        let thread_names = runtime_thread_names(events);
         let RuntimeSeed {
             runtimes,
             mut workers,
@@ -690,6 +692,7 @@ impl RuntimeMonitorSnapshot {
             unclassified_tasks,
         };
         for worker in &mut snapshot.workers {
+            set_worker_thread_name(worker, &thread_names);
             if let Some(runtime) = source.and_then(|source| source.runtimes.iter().find(|runtime| runtime.id.get() == worker.runtime_id)) {
                 worker.runtime_name.clone_from(&runtime.name);
             }
@@ -708,6 +711,22 @@ impl RuntimeMonitorSnapshot {
             worker.window = windows.get(&worker.runtime_id).copied();
         }
     }
+}
+
+fn runtime_thread_names(events: &Events) -> HashMap<u64, &str> {
+    events
+        .threads
+        .iter()
+        .map(|thread| (thread.thread_id.get(), thread.name.as_str()))
+        .collect()
+}
+
+fn set_worker_thread_name(worker: &mut RuntimeWorkerSummary, thread_names: &HashMap<u64, &str>) {
+    worker.thread_name = worker
+        .thread_id
+        .and_then(|thread_id| thread_names.get(&thread_id).copied())
+        .unwrap_or_default()
+        .into();
 }
 
 fn observe_worker_event(workers: &mut Workers, runtime_id: u64, worker_id: u64, kind: EventKind) {

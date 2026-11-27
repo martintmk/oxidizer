@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Instant, SystemTime};
 
 use seismograph::recorder::event::{Event, EventKind};
@@ -22,13 +22,21 @@ pub(super) struct CapturedSnapshot {
     pub(super) runtime: RuntimeMonitorSnapshot,
     pub(super) io: IoMonitorSnapshot,
     pub(super) cache: CacheMonitorSnapshot,
-    pub(super) hotspots: super::hotspot_analysis::Report,
+    pub(super) hotspots: OnceLock<super::hotspot_analysis::Report>,
     pub(super) threads: ThreadSnapshot,
     pub(super) task_events: super::task_events::TaskEventsSnapshot,
     pub(super) captured_at: Option<SystemTime>,
     pub(super) captured_instant: Option<Instant>,
     pub(super) filter_index: Option<Arc<super::filter_index::FilterIndex>>,
     pub(super) filter_summary: super::filter_index::FilterSummary,
+}
+
+impl CapturedSnapshot {
+    pub(super) fn hotspots(&self) -> &super::hotspot_analysis::Report {
+        self.hotspots.get_or_init(|| {
+            super::hotspot_analysis::analyze(self.allocations.as_ref(), &self.primitives, &self.runtime, &self.io, &self.cache)
+        })
+    }
 }
 
 pub(super) struct RuntimeSnapshot {
@@ -5258,6 +5266,11 @@ mod tests {
         let snapshot = RuntimeMonitorSnapshot::from_events(
             &Events {
                 events,
+                threads: vec![ThreadLog {
+                    thread_id: ThreadId::new(1),
+                    name: "runtime-main".into(),
+                    ..ThreadLog::default()
+                }],
                 ..Events::default()
             },
             None,
@@ -5266,10 +5279,11 @@ mod tests {
         assert_eq!(
             (
                 snapshot.workers[0].worker_id,
+                snapshot.workers[0].thread_name.as_str(),
                 snapshot.workers[0].park_events,
                 snapshot.workers[0].unpark_events,
             ),
-            (Some(2), 2, 1)
+            (Some(2), "runtime-main", 2, 1)
         );
     }
 

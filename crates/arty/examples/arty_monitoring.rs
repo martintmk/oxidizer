@@ -17,6 +17,11 @@
 //!
 //! The workload runs until you stop it. The Anvil example check builds the
 //! example, prints a skip message, and exits without running the workload.
+//!
+//! The async workload intentionally sleeps inside selected polls for 50
+//! microseconds to 2 milliseconds. This creates visible poll-duration
+//! histograms. Do not copy this pattern into production async code because it
+//! blocks a worker.
 
 #![forbid(unsafe_code)]
 
@@ -40,6 +45,8 @@ const BLOCKING_ALLOCATION_SIZE: usize = 16 * 1024;
 const IO_PAYLOAD_SIZE: usize = 64 * 1024;
 const SESSION_COUNT: usize = 256;
 const ANALYSIS_SAMPLE_COUNT: usize = 250_000;
+const MIN_POLL_JITTER_MICROS: u64 = 50;
+const POLL_JITTER_RANGE_MICROS: u64 = 1_951;
 
 const ASYNC_STEP_DELAY: Duration = Duration::from_millis(250);
 const BLOCKING_TASK_DELAY: Duration = Duration::from_millis(750);
@@ -55,7 +62,7 @@ struct CycleSummary {
     percentile: u64,
 }
 
-#[arty::main(workers = 2, monitor = enabled)]
+#[arty::main(workers = 8, monitor = enabled)]
 async fn main(cx: Context) -> Result<(), JoinError> {
     if env::var_os("ANVIL_EXAMPLE").is_some() {
         println!("Arty monitoring is an interactive example and does not run during automated builds.");
@@ -109,6 +116,7 @@ async fn run_allocation_bursts(cx: Context, cycle: u64) -> usize {
     let mut allocated_bytes = 0;
 
     for step in 0..ASYNC_STEPS {
+        simulate_poll_work(cycle, u64::try_from(step).expect("ASYNC_STEPS fits in u64"));
         let fill = wrapping_byte(cycle.wrapping_add(u64::try_from(step).expect("ASYNC_STEPS fits in u64")));
         let payloads: Vec<_> = (0..ALLOCATIONS_PER_STEP)
             .map(|allocation| {
@@ -127,8 +135,10 @@ async fn run_allocation_bursts(cx: Context, cycle: u64) -> usize {
 async fn churn_sessions(cx: Context, cycle: u64) -> usize {
     let mut sessions: Vec<_> = (0..SESSION_COUNT).map(|session| format!("session-{cycle}-{session}")).collect();
 
+    simulate_poll_work(cycle, 100);
     cx.clock().delay(ASYNC_STEP_DELAY).await;
     sessions.retain(|session| session.len().is_multiple_of(2));
+    simulate_poll_work(cycle, 101);
     cx.clock().delay(ASYNC_STEP_DELAY).await;
 
     sessions.len()
@@ -161,6 +171,7 @@ fn run_blocking_allocations(cycle: u64) -> usize {
 }
 
 fn run_cache_workload(cycle: u64) -> usize {
+    simulate_poll_work(cycle, 200);
     let tier = ObjectId::new(0x6172_7479_2d63_6163);
     let key = cycle % 4;
     let mut cache = std::collections::HashMap::new();
@@ -175,11 +186,18 @@ fn run_cache_workload(cycle: u64) -> usize {
     if hits != 0 {
         record_cache(tier, EventKind::CacheHit);
     }
+
     if cycle.is_multiple_of(4) && cache.remove(&key).is_some() {
         record_cache(tier, EventKind::CacheEvicted);
     }
 
     hits
+}
+
+fn simulate_poll_work(cycle: u64, phase: u64) {
+    let mixed = cycle.wrapping_mul(137).wrapping_add(phase.wrapping_mul(577));
+    let micros = MIN_POLL_JITTER_MICROS + mixed % POLL_JITTER_RANGE_MICROS;
+    std::thread::sleep(Duration::from_micros(micros));
 }
 
 fn record_cache(tier: ObjectId, kind: EventKind) {

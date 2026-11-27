@@ -4,6 +4,7 @@
 //! Reusable, evidence-backed performance findings for one retained snapshot.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use super::data::{
     AllocationSnapshot, AllocationStackFilter, CacheMonitorSnapshot, IoMonitorSnapshot, PrimitiveSnapshot, RuntimeMonitorSnapshot,
@@ -17,12 +18,15 @@ const HIGH_ALLOCATED_BYTES: u64 = 8 * 1024 * 1024;
 const CONTENTION_EVENTS: u64 = 50;
 const LONG_ASYNC_POLL_NANOS: u64 = 10_000_000;
 const VERY_LONG_ASYNC_POLL_NANOS: u64 = 50_000_000;
+const SLOW_TASK_POLL_NANOS: u64 = 500_000;
+const SLOW_TASK_POLL_PERCENT: u64 = 10;
 const LONG_BLOCKING_QUEUE_NANOS: u64 = 50_000_000;
 const VERY_LONG_BLOCKING_QUEUE_NANOS: u64 = 500_000_000;
 const LONG_BLOCKING_EXECUTION_NANOS: u64 = 250_000_000;
 const CACHE_LOOKUPS: u64 = 100;
 const CACHE_MISS_PERCENT: u64 = 50;
 const MAX_CATEGORY_FINDINGS: usize = 8;
+const MAX_SLOW_POLL_TASK_FINDINGS: usize = 5;
 const MAX_FINDINGS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -227,6 +231,8 @@ const fn actionable_contention(kind: super::data::PrimitiveOperationKind) -> boo
 }
 
 fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding>) {
+    slow_poll_task_findings(runtime, findings);
+
     let mut asynchronous = runtime
         .asynchronous_groups
         .iter()
@@ -307,6 +313,101 @@ fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding
                  focused load test and compare average and maximum queue duration."
             ),
             score: max_queue,
+        });
+    }
+}
+
+#[derive(Default)]
+struct SlowPollTask {
+    runtime_id: u64,
+    task_id: u64,
+    location: Option<String>,
+    tracked_polls: u64,
+    slow_polls: u64,
+    max_poll_nanos: u64,
+}
+
+fn slow_poll_task_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding>) {
+    let mut tasks = BTreeMap::<(u64, u64), SlowPollTask>::new();
+    for task in runtime.workers.iter().flat_map(|worker| &worker.tasks) {
+        let candidate = tasks.entry((task.runtime_id, task.task_id)).or_insert_with(|| SlowPollTask {
+            runtime_id: task.runtime_id,
+            task_id: task.task_id,
+            location: task.spawned_at.clone(),
+            ..SlowPollTask::default()
+        });
+        if candidate.location.is_none() {
+            candidate.location.clone_from(&task.spawned_at);
+        }
+        candidate.tracked_polls = candidate
+            .tracked_polls
+            .saturating_add(u64::try_from(task.metrics.poll_samples.len()).unwrap_or(u64::MAX));
+        candidate.slow_polls = candidate.slow_polls.saturating_add(
+            u64::try_from(
+                task.metrics
+                    .poll_samples
+                    .iter()
+                    .filter(|duration| **duration > SLOW_TASK_POLL_NANOS)
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        );
+        candidate.max_poll_nanos = candidate
+            .max_poll_nanos
+            .max(task.metrics.poll_samples.iter().copied().max().unwrap_or_default());
+    }
+    let mut candidates = tasks
+        .into_values()
+        .filter(|task| {
+            task.tracked_polls != 0
+                && u128::from(task.slow_polls) * 100 > u128::from(task.tracked_polls) * u128::from(SLOW_TASK_POLL_PERCENT)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| {
+        (u128::from(right.slow_polls) * u128::from(left.tracked_polls))
+            .cmp(&(u128::from(left.slow_polls) * u128::from(right.tracked_polls)))
+            .then_with(|| right.slow_polls.cmp(&left.slow_polls))
+            .then_with(|| right.max_poll_nanos.cmp(&left.max_poll_nanos))
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    for task in candidates.into_iter().take(MAX_SLOW_POLL_TASK_FINDINGS) {
+        let tenths = u128::from(task.slow_polls).saturating_mul(1_000) / u128::from(task.tracked_polls);
+        let evidence = format!(
+            "{} of {} tracked polls ({}.{:01}%) exceeded {}; maximum {}",
+            format_count(task.slow_polls),
+            format_count(task.tracked_polls),
+            tenths / 10,
+            tenths % 10,
+            format_prose_duration(SLOW_TASK_POLL_NANOS),
+            format_prose_duration(task.max_poll_nanos),
+        );
+        let location = task
+            .location
+            .unwrap_or_else(|| format!("runtime #{} task #{}", task.runtime_id, task.task_id));
+        let severity = if u128::from(task.slow_polls) * 2 >= u128::from(task.tracked_polls) && task.max_poll_nanos >= LONG_ASYNC_POLL_NANOS
+        {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        let ratio_score = u64::try_from(tenths).unwrap_or(u64::MAX);
+        findings.push(Finding {
+            severity,
+            category: Category::AsyncRuntime,
+            title: format!("Async task #{} has frequent slow polls", task.task_id),
+            evidence: evidence.clone(),
+            location: location.clone(),
+            explanation: "Frequent long polls occupy an async worker and can delay unrelated ready tasks.".into(),
+            agent_instruction: format!(
+                "At {location}, reduce slow polls for async task #{} ({evidence}). Move blocking or CPU-heavy work to the blocking pool, or split \
+                 bounded work into smaller state-machine steps. Preserve task behavior and cancellation. Add a focused runtime test or benchmark \
+                 and compare the percentage of polls above {}.",
+                task.task_id,
+                format_prose_duration(SLOW_TASK_POLL_NANOS),
+            ),
+            score: ratio_score
+                .saturating_mul(1_000_000_000)
+                .saturating_add(task.max_poll_nanos),
         });
     }
 }
@@ -422,7 +523,8 @@ fn compare_findings(left: &Finding, right: &Finding) -> Ordering {
 mod tests {
     use super::*;
     use crate::commands::monitor::data::{CacheTierSummary, IoResourceSummary};
-    use crate::commands::monitor::runtime::{BlockingTaskGroupSummary, DurationSummary};
+    use crate::commands::monitor::runtime::{BlockingTaskGroupSummary, DurationSummary, RuntimeTaskSummary, RuntimeWorkerSummary};
+    use crate::commands::monitor::runtime_timeline::ExecutionMetrics;
 
     fn primitives(total_events: u64, lost_events: u64) -> PrimitiveSnapshot {
         PrimitiveSnapshot {
@@ -473,6 +575,60 @@ mod tests {
         assert!(report.findings[0].agent_instruction.contains("focused load test"));
         assert!(report.findings[1].agent_instruction.contains("key normalization"));
         assert!(report.findings.iter().all(|finding| !finding.location.is_empty()));
+    }
+
+    #[test]
+    fn frequent_slow_poll_findings_are_strict_and_limited_to_top_five_tasks() {
+        let task = |task_id: u64, slow_polls: usize| RuntimeTaskSummary {
+            runtime_id: 1,
+            task_id,
+            spawned_at: Some(format!("src/tasks.rs:{task_id}:1")),
+            metrics: ExecutionMetrics {
+                poll_samples: (0..10).map(|index| if index < slow_polls { 600_000 } else { 500_000 }).collect(),
+                ..ExecutionMetrics::default()
+            },
+            ..RuntimeTaskSummary::default()
+        };
+        let mut tasks = (1..=7)
+            .map(|task_id| task(task_id, usize::try_from(10 - task_id).unwrap()))
+            .collect::<Vec<_>>();
+        tasks.extend([task(8, 1), task(9, 0)]);
+        let runtime = RuntimeMonitorSnapshot {
+            workers: vec![RuntimeWorkerSummary {
+                runtime_id: 1,
+                worker_id: Some(1),
+                tasks,
+                ..RuntimeWorkerSummary::default()
+            }],
+            ..RuntimeMonitorSnapshot::default()
+        };
+
+        let report = analyze(
+            None,
+            &primitives(70, 0),
+            &runtime,
+            &IoMonitorSnapshot::default(),
+            &CacheMonitorSnapshot::default(),
+        );
+        let findings = report
+            .findings
+            .iter()
+            .filter(|finding| finding.title.contains("frequent slow polls"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(findings.len(), 5);
+        assert_eq!(
+            findings.iter().map(|finding| finding.title.as_str()).collect::<Vec<_>>(),
+            [
+                "Async task #1 has frequent slow polls",
+                "Async task #2 has frequent slow polls",
+                "Async task #3 has frequent slow polls",
+                "Async task #4 has frequent slow polls",
+                "Async task #5 has frequent slow polls",
+            ]
+        );
+        assert!(findings[0].evidence.contains("9 of 10 tracked polls (90.0%)"));
+        assert!(findings.iter().all(|finding| !finding.title.contains("#8")));
     }
 
     #[test]

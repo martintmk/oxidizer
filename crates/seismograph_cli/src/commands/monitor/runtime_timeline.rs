@@ -124,6 +124,10 @@ pub(super) fn histogram(samples: &[u64], count: usize) -> Vec<HistogramBin> {
     result
 }
 
+pub(super) fn populated_histogram(samples: &[u64], count: usize) -> Vec<HistogramBin> {
+    histogram(samples, count).into_iter().filter(|bin| bin.count != 0).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +212,16 @@ mod tests {
             assert_eq!(bins.iter().map(|bin| bin.count).sum::<u64>(), 7);
             assert!(bins.windows(2).all(|pair| pair[0].upper + 1 == pair[1].lower));
         }
+
         assert!(histogram(&[], HISTOGRAM_BINS).is_empty());
         assert!(histogram(&[1], 0).is_empty());
+    }
+
+    #[test]
+    fn populated_histogram_removes_empty_buckets_but_keeps_measured_zero() {
+        let bins = populated_histogram(&[0, 10, 1_000_000], HISTOGRAM_BINS);
+        assert_eq!(bins.iter().map(|bin| bin.count).sum::<u64>(), 3);
+        assert!(bins.iter().all(|bin| bin.count != 0));
+        assert_eq!(bins[0].lower, 0);
     }
 }

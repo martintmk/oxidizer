@@ -242,10 +242,6 @@ impl FilterIndex {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "filtered snapshot reconstruction keeps all derived models, hotspot analysis, and source scope synchronized"
-    )]
     pub(super) fn render(self: &Arc<Self>, filter: &FilterSpec) -> Box<CapturedSnapshot> {
         let matches = self
             .stacks
@@ -327,13 +323,6 @@ impl FilterIndex {
             }
             snapshot
         });
-        let hotspots = super::hotspot_analysis::analyze(
-            allocations.as_ref(),
-            &runtime.primitives,
-            &runtime.runtime,
-            &runtime.io,
-            &runtime.cache,
-        );
         super::snapshot::release_stacks(&mut allocation_events, |event| drop(std::mem::take(&mut event.call_stack)));
         Box::new(CapturedSnapshot {
             native: self.allocator.as_ref().and_then(|source| source.native.clone()),
@@ -345,7 +334,7 @@ impl FilterIndex {
             runtime: runtime.runtime,
             io: runtime.io,
             cache: runtime.cache,
-            hotspots,
+            hotspots: std::sync::OnceLock::new(),
             threads: runtime.threads,
             task_events: runtime.task_events,
             captured_at: None,

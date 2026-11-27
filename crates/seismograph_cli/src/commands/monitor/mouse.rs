@@ -227,7 +227,7 @@ impl App {
                 &mut self.thread_view.thread_sort,
                 &mut self.thread_view.thread_descending,
                 sort,
-                sort != super::app::ThreadListSort::Thread,
+                !matches!(sort, super::app::ThreadListSort::Id | super::app::ThreadListSort::Name),
             );
             self.thread_view.thread_selected = 0;
             self.thread_view.reset_operation();
@@ -249,7 +249,10 @@ impl App {
                 &mut self.thread_view.participant_sort,
                 &mut self.thread_view.participant_descending,
                 sort,
-                sort != super::app::ThreadParticipantSort::Thread,
+                !matches!(
+                    sort,
+                    super::app::ThreadParticipantSort::Id | super::app::ThreadParticipantSort::Name
+                ),
             );
             self.thread_view.participant_selected = 0;
             self.thread_view.reset_object();

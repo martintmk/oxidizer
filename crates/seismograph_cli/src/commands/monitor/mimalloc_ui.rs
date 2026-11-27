@@ -186,7 +186,7 @@ pub(super) fn draw(
         }),
         nav.root,
         ListTarget::HeapBuckets,
-        frame(" Mimalloc · Enter details ".into(), nav.depth == Depth::Root),
+        frame(" Mimalloc ".into(), nav.depth == Depth::Root),
     );
     if let Some(error) = unavailable {
         detail(
@@ -207,7 +207,7 @@ pub(super) fn draw(
             terminal,
             mouse,
             content,
-            " Mimalloc global backend · Enter to scroll ".into(),
+            " Mimalloc global backend ".into(),
             &lines,
             nav.scroll,
             nav.depth == Depth::Detail,
@@ -227,7 +227,7 @@ pub(super) fn draw(
         (CLASS_COUNT, |index| Cow::Owned(mimalloc_view::class_label(owner, index))),
         nav.class,
         ListTarget::NativeClasses,
-        frame(" Classes · Enter details ".into(), nav.depth == Depth::Classes),
+        frame(" Classes ".into(), nav.depth == Depth::Classes),
     );
     detail(
         terminal,

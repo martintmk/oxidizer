@@ -135,7 +135,7 @@ fn refresh_is_due(now: Instant, next_refresh: Instant) -> bool {
 
 fn should_exit(app: &mut app::App, key: crossterm::event::KeyEvent) -> bool {
     let control_c = key.code == crossterm::event::KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-    key.kind == KeyEventKind::Press && ((control_c && app.help.is_none()) || app.handle_key(key.code))
+    key.kind == KeyEventKind::Press && ((control_c && app.help.is_none()) || app.handle_key_with_modifiers(key.code, key.modifiers))
 }
 
 struct TerminalGuard<W: Write, D: FnMut() -> io::Result<()>> {

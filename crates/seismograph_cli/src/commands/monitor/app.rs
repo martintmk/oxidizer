@@ -8,7 +8,7 @@ use std::thread;
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use performables::sync::channel::{Receiver, Sender, unbounded};
 use seismograph_protocol::io::MonitorIo;
 use seismograph_protocol::message::{RecorderStatistics, RecordingConfiguration, SnapshotOptions};
@@ -668,7 +668,7 @@ impl ThreadViewState {
             operation_sort: ThreadOperationSort::Operation,
             operation_descending: false,
             participant_selected: 0,
-            participant_sort: ThreadParticipantSort::Thread,
+            participant_sort: ThreadParticipantSort::Name,
             participant_descending: false,
             object_selected: 0,
             object_sort: ThreadObjectSort::Total,
@@ -710,7 +710,8 @@ pub(super) enum ThreadFocus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ThreadListSort {
-    Thread,
+    Id,
+    Name,
     Retained,
     Overwritten,
 }
@@ -725,7 +726,8 @@ pub(super) enum ThreadOperationSort {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ThreadParticipantSort {
-    Thread,
+    Id,
+    Name,
     Objects,
     Events,
 }
@@ -789,7 +791,7 @@ impl RuntimeViewState {
             activity_scroll: 0,
             group_histogram: GroupHistogram::Primary,
             task_histogram: TaskHistogram::Poll,
-            task_type_sort: RuntimeTaskTypeSort::Spawned,
+            task_type_sort: RuntimeTaskTypeSort::PollsOrRuns,
             task_type_sort_descending: true,
             task_sort: RuntimeTaskRowSort::Task,
             task_sort_descending: false,
@@ -885,12 +887,8 @@ pub(super) enum TaskHistogram {
 pub(super) enum RuntimeTaskTypeSort {
     SpawnedAt,
     BodySize,
-    Spawned,
+    Total,
     Live,
-    Succeeded,
-    Canceled,
-    Panicked,
-    Workers,
     PollsOrRuns,
     AverageReadyOrQueue,
     MaximumReadyOrQueue,
@@ -1240,6 +1238,7 @@ pub(super) struct App {
     pub(super) recording_unknown: bool,
     pub(super) snapshot_error: Option<String>,
     pub(super) recording_configuration_popup: Option<RecordingConfigurationPopup>,
+    pub(super) task_search_popup: Option<TaskSearchPopup>,
     pub(super) filters: super::filter_ui::Filters,
     pub(super) help: Option<super::help::Help>,
     activity_observed_at: Option<Instant>,
@@ -1256,6 +1255,12 @@ pub(super) struct App {
     recording_generation: u64,
     next_refresh: Instant,
     pub(super) last_runtime_task_click: Option<(usize, Instant)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct TaskSearchPopup {
+    pub(super) task_id: String,
+    pub(super) error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1362,6 +1367,7 @@ impl App {
             recording_unknown: false,
             snapshot_error: None,
             recording_configuration_popup: None,
+            task_search_popup: None,
             filters: super::filter_ui::Filters::default(),
             help: None,
             activity_observed_at: None,
@@ -1439,12 +1445,96 @@ impl App {
             }
     }
 
+    fn open_task_search(&mut self) {
+        let available = matches!(
+            self.screen,
+            Screen::Connected {
+                tab: MonitorTab::RuntimeTask,
+                snapshot: Some(_),
+                ..
+            } | Screen::Offline {
+                tab: MonitorTab::RuntimeTask,
+                snapshot: Some(_),
+                ..
+            }
+        );
+        if available {
+            self.task_search_popup = Some(TaskSearchPopup::default());
+        } else {
+            self.status = "Task ID search is available in Runtime Task after a snapshot is loaded.".into();
+        }
+    }
+
+    fn handle_task_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.task_search_popup = None;
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if let Some(popup) = &mut self.task_search_popup {
+                    popup.task_id.pop();
+                    popup.error = None;
+                }
+            }
+            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                if let Some(popup) = &mut self.task_search_popup {
+                    popup.task_id.push(digit);
+                    popup.error = None;
+                }
+            }
+            KeyCode::Enter => {
+                let task_id = self.task_search_popup.as_ref().and_then(|popup| popup.task_id.parse::<u64>().ok());
+                let Some(task_id) = task_id else {
+                    if let Some(popup) = &mut self.task_search_popup {
+                        popup.error = Some("Enter a valid numeric task ID.".into());
+                    }
+                    return;
+                };
+                let result = match &self.screen {
+                    Screen::Connected {
+                        snapshot: Some(snapshot), ..
+                    }
+                    | Screen::Offline {
+                        snapshot: Some(snapshot), ..
+                    } => runtime_view_for_task_id(&snapshot.runtime, self.runtime_view, task_id),
+                    Screen::Browse | Screen::Connected { snapshot: None, .. } | Screen::Offline { snapshot: None, .. } => {
+                        Err("No runtime snapshot is loaded.".into())
+                    }
+                };
+                match result {
+                    Ok(view) => {
+                        self.runtime_view = view;
+                        match &mut self.screen {
+                            Screen::Connected { tab, .. } | Screen::Offline { tab, .. } => *tab = MonitorTab::RuntimeTask,
+                            Screen::Browse => {}
+                        }
+                        self.task_search_popup = None;
+                    }
+                    Err(error) => {
+                        if let Some(popup) = &mut self.task_search_popup {
+                            popup.error = Some(error);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn handle_key(&mut self, code: KeyCode) -> bool {
+        self.handle_key_with_modifiers(code, KeyModifiers::NONE)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the top-level key dispatcher enforces modal precedence before routing each monitor tab"
     )]
-    pub(super) fn handle_key(&mut self, code: KeyCode) -> bool {
+    pub(super) fn handle_key_with_modifiers(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         if self.handle_help_key(code) || self.native_back(code) {
+            return false;
+        }
+        if self.task_search_popup.is_some() {
+            self.handle_task_search_key(code);
             return false;
         }
         if self.filters.popup.is_some() {
@@ -1465,6 +1555,10 @@ impl App {
         }
         if code == KeyCode::Char('F') {
             self.open_filter_popup();
+            return false;
+        }
+        if code == KeyCode::Char('f') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_task_search();
             return false;
         }
         if matches!(code, KeyCode::Char('s' | 'C')) {
@@ -2559,12 +2653,8 @@ pub(super) fn sort_runtime_async_groups(groups: &mut [&super::runtime::Asynchron
         let ordering = match view.task_type_sort {
             RuntimeTaskTypeSort::SpawnedAt => compare_optional_task_type(left.spawned_at.as_deref(), right.spawned_at.as_deref(), view),
             RuntimeTaskTypeSort::BodySize => compare_optional_task_type(left.body_size_bytes, right.body_size_bytes, view),
-            RuntimeTaskTypeSort::Spawned => directed_task_type(left.outcomes.tasks.cmp(&right.outcomes.tasks), view),
+            RuntimeTaskTypeSort::Total => directed_task_type(left.outcomes.tasks.cmp(&right.outcomes.tasks), view),
             RuntimeTaskTypeSort::Live => directed_task_type(left.outcomes.active.cmp(&right.outcomes.active), view),
-            RuntimeTaskTypeSort::Succeeded => directed_task_type(left.outcomes.completed.cmp(&right.outcomes.completed), view),
-            RuntimeTaskTypeSort::Canceled => directed_task_type(left.outcomes.canceled.cmp(&right.outcomes.canceled), view),
-            RuntimeTaskTypeSort::Panicked => directed_task_type(left.outcomes.panicked.cmp(&right.outcomes.panicked), view),
-            RuntimeTaskTypeSort::Workers => directed_task_type(left.outcomes.workers.cmp(&right.outcomes.workers), view),
             RuntimeTaskTypeSort::PollsOrRuns => directed_task_type(left.polls.cmp(&right.polls), view),
             RuntimeTaskTypeSort::AverageReadyOrQueue => {
                 compare_optional_task_type(left.ready_time.mean_nanos(), right.ready_time.mean_nanos(), view)
@@ -2586,12 +2676,8 @@ pub(super) fn sort_runtime_blocking_groups(groups: &mut [&super::runtime::Blocki
         let ordering = match view.task_type_sort {
             RuntimeTaskTypeSort::SpawnedAt => compare_optional_task_type(left.spawned_at.as_deref(), right.spawned_at.as_deref(), view),
             RuntimeTaskTypeSort::BodySize => compare_optional_task_type(left.body_size_bytes, right.body_size_bytes, view),
-            RuntimeTaskTypeSort::Spawned => directed_task_type(left.outcomes.tasks.cmp(&right.outcomes.tasks), view),
+            RuntimeTaskTypeSort::Total => directed_task_type(left.outcomes.tasks.cmp(&right.outcomes.tasks), view),
             RuntimeTaskTypeSort::Live => directed_task_type(left.outcomes.active.cmp(&right.outcomes.active), view),
-            RuntimeTaskTypeSort::Succeeded => directed_task_type(left.outcomes.completed.cmp(&right.outcomes.completed), view),
-            RuntimeTaskTypeSort::Canceled => directed_task_type(left.outcomes.canceled.cmp(&right.outcomes.canceled), view),
-            RuntimeTaskTypeSort::Panicked => directed_task_type(left.outcomes.panicked.cmp(&right.outcomes.panicked), view),
-            RuntimeTaskTypeSort::Workers => directed_task_type(left.outcomes.workers.cmp(&right.outcomes.workers), view),
             RuntimeTaskTypeSort::PollsOrRuns => directed_task_type(left.executions.cmp(&right.executions), view),
             RuntimeTaskTypeSort::AverageReadyOrQueue => {
                 compare_optional_task_type(left.queue_time.mean_nanos(), right.queue_time.mean_nanos(), view)
@@ -2626,6 +2712,106 @@ pub(super) fn selected_runtime_worker_id(runtime: &super::data::RuntimeMonitorSn
             RuntimeWorkersFocus::Blocking => view.blocking_selected,
         })
         .and_then(|worker| worker.worker_id)
+}
+
+fn runtime_view_for_task_id(
+    runtime: &super::data::RuntimeMonitorSnapshot,
+    mut view: RuntimeViewState,
+    task_id: u64,
+) -> Result<RuntimeViewState, String> {
+    let task = runtime
+        .workers
+        .iter()
+        .flat_map(|worker| &worker.tasks)
+        .find(|task| {
+            task.task_id == task_id
+                && matches!(
+                    task.kind,
+                    super::runtime::RuntimeTaskKind::Asynchronous | super::runtime::RuntimeTaskKind::Blocking
+                )
+        })
+        .ok_or_else(|| {
+            if runtime
+                .workers
+                .iter()
+                .flat_map(|worker| &worker.tasks)
+                .any(|task| task.task_id == task_id)
+            {
+                format!("Task #{task_id} has no retained async or blocking category.")
+            } else {
+                format!("Task #{task_id} is not retained in this snapshot.")
+            }
+        })?;
+    let runtime_index = runtime
+        .runtimes
+        .iter()
+        .position(|candidate| candidate.runtime_id == task.runtime_id)
+        .ok_or_else(|| format!("Runtime #{} for task #{task_id} is not retained.", task.runtime_id))?;
+    let focus = match task.kind {
+        super::runtime::RuntimeTaskKind::Asynchronous => RuntimeWorkersFocus::Asynchronous,
+        super::runtime::RuntimeTaskKind::Blocking => RuntimeWorkersFocus::Blocking,
+        super::runtime::RuntimeTaskKind::Unknown => unreachable!("filtered above"),
+    };
+    let worker_id = task
+        .worker_ids
+        .first()
+        .copied()
+        .ok_or_else(|| format!("Task #{task_id} has no retained execution worker."))?;
+    let worker_index = runtime
+        .workers
+        .iter()
+        .filter(|worker| worker.runtime_id == task.runtime_id && worker.worker_id.is_some())
+        .filter(|worker| match focus {
+            RuntimeWorkersFocus::Asynchronous => worker.role != "Blocking" && worker.blocking.executions == 0,
+            RuntimeWorkersFocus::Blocking => worker.role == "Blocking" || worker.blocking.executions != 0,
+        })
+        .position(|worker| worker.worker_id == Some(worker_id))
+        .ok_or_else(|| format!("Worker #{worker_id} for task #{task_id} is not retained."))?;
+
+    view.runtime_selected = runtime_index;
+    view.focus = focus;
+    match focus {
+        RuntimeWorkersFocus::Asynchronous => view.asynchronous_selected = worker_index,
+        RuntimeWorkersFocus::Blocking => view.blocking_selected = worker_index,
+    }
+    let group_index = match focus {
+        RuntimeWorkersFocus::Asynchronous => {
+            let mut groups = runtime
+                .asynchronous_groups
+                .iter()
+                .filter(|group| group.runtime_id == task.runtime_id && group.worker_id == Some(worker_id))
+                .collect::<Vec<_>>();
+            sort_runtime_async_groups(&mut groups, view);
+            groups.iter().position(|group| group.type_descriptor_id == task.type_descriptor_id)
+        }
+        RuntimeWorkersFocus::Blocking => {
+            let mut groups = runtime
+                .blocking_groups
+                .iter()
+                .filter(|group| group.runtime_id == task.runtime_id && group.worker_id == Some(worker_id))
+                .collect::<Vec<_>>();
+            sort_runtime_blocking_groups(&mut groups, view);
+            groups.iter().position(|group| group.type_descriptor_id == task.type_descriptor_id)
+        }
+    }
+    .ok_or_else(|| format!("Task type for task #{task_id} is not retained."))?;
+    match focus {
+        RuntimeWorkersFocus::Asynchronous => view.asynchronous_task_selected = group_index,
+        RuntimeWorkersFocus::Blocking => view.blocking_task_selected = group_index,
+    }
+    let mut tasks = runtime.tasks_for_group(task.runtime_id, Some(worker_id), task.type_descriptor_id, task.kind);
+    sort_runtime_tasks(&mut tasks, view);
+    view.task_selected = tasks
+        .iter()
+        .position(|task| task.task_id == task_id)
+        .ok_or_else(|| format!("Task #{task_id} is not in its retained task group."))?;
+    view.section = RuntimeSectionFocus::GroupTasks;
+    view.group_selected_explicitly = true;
+    view.task_selected_explicitly = true;
+    view.detail_mode = RuntimeDetailMode::Task;
+    view.activity_scroll = 0;
+    view.events.reset();
+    Ok(view)
 }
 
 pub(super) fn selected_runtime_task<'a>(
@@ -2834,7 +3020,7 @@ fn handle_cache_key(code: KeyCode, view: &mut CacheViewState, snapshot: Option<&
 }
 
 fn handle_hotspot_key(code: KeyCode, view: &mut HotspotViewState, snapshot: Option<&CapturedSnapshot>) -> bool {
-    let count = snapshot.map_or(0, |snapshot| snapshot.hotspots.findings.len());
+    let count = snapshot.map_or(0, |snapshot| snapshot.hotspots().findings.len());
     match code {
         KeyCode::Up => view.selected = view.selected.saturating_sub(1),
         KeyCode::Down => view.selected = advance_selection(view.selected, count),
@@ -3172,7 +3358,7 @@ mod tests {
             runtime: runtime.runtime,
             io: runtime.io,
             cache: runtime.cache,
-            hotspots: super::super::hotspot_analysis::Report::default(),
+            hotspots: std::sync::OnceLock::new(),
             threads: runtime.threads,
             task_events: runtime.task_events,
             captured_at: None,
@@ -3395,7 +3581,7 @@ mod tests {
             task_events: super::super::task_events::TaskEventsSnapshot::default(),
             io: IoMonitorSnapshot::default(),
             cache: CacheMonitorSnapshot::default(),
-            hotspots: super::super::hotspot_analysis::Report::default(),
+            hotspots: std::sync::OnceLock::new(),
             threads: ThreadSnapshot {
                 threads: Vec::new(),
                 hidden_internal_threads: 0,
@@ -4114,6 +4300,14 @@ mod tests {
                 runtime_id: 1,
                 worker_id: Some(2),
                 role: "Core".into(),
+                tasks: vec![super::super::runtime::RuntimeTaskSummary {
+                    runtime_id: 1,
+                    task_id: 250,
+                    type_descriptor_id: Some(250),
+                    worker_ids: vec![2],
+                    kind: super::super::runtime::RuntimeTaskKind::Asynchronous,
+                    ..Default::default()
+                }],
                 ..Default::default()
             }],
             asynchronous_groups: vec![
@@ -4140,11 +4334,26 @@ mod tests {
             ],
             ..Default::default()
         };
-        let view = RuntimeViewState::new();
+        let view = RuntimeViewState {
+            task_type_sort: RuntimeTaskTypeSort::Total,
+            task_type_sort_descending: true,
+            ..RuntimeViewState::new()
+        };
 
         assert_eq!(
             selected_runtime_group(&runtime, &view),
             Some((1, Some(2), Some(250), super::super::runtime::RuntimeTaskKind::Asynchronous))
+        );
+        let searched = runtime_view_for_task_id(&runtime, view, 250).unwrap();
+        assert_eq!(
+            (
+                searched.section,
+                searched.asynchronous_task_selected,
+                searched.task_selected,
+                searched.detail_mode,
+                selected_runtime_task(&runtime, &searched).map(|task| task.task_id),
+            ),
+            (RuntimeSectionFocus::GroupTasks, 0, 0, RuntimeDetailMode::Task, Some(250),)
         );
     }
 

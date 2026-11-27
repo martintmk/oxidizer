@@ -13,7 +13,7 @@ use super::super::data::CapturedSnapshot;
 use super::super::hotspot_analysis::{Finding, Report, Severity};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::table_ui;
-use super::{draw_empty_panel_with_message, key_span};
+use super::draw_empty_panel_with_message;
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -28,14 +28,15 @@ pub(super) fn draw(
         draw_empty_panel_with_message(frame, details_area, " Finding Details ", unavailable);
         return;
     };
-    let findings = sorted_findings(&snapshot.hotspots, view);
-    draw_findings(frame, mouse, findings_area, &snapshot.hotspots, &findings, view);
+    let report = snapshot.hotspots();
+    let findings = sorted_findings(report, view);
+    draw_findings(frame, mouse, findings_area, report, &findings, view);
     let selected = view.selected.min(findings.len().saturating_sub(1));
     draw_details(
         frame,
         details_area,
         findings.get(selected).copied(),
-        snapshot.hotspots.capture_warning.as_deref(),
+        report.capture_warning.as_deref(),
     );
 }
 
@@ -98,15 +99,7 @@ fn draw_findings(
             }
         }))
     });
-    let title = Line::from(vec![
-        Span::raw(format!(" Hotspots · {} findings · ", findings.len())),
-        key_span("↑/↓"),
-        Span::raw(" select · "),
-        key_span("[/]"),
-        Span::raw(" sort · "),
-        key_span("r"),
-        Span::raw(" reverse "),
-    ]);
+    let title = Line::from(format!(" Hotspots · {} findings ", findings.len()));
     let empty = findings
         .is_empty()
         .then_some(Row::new(vec!["No actionable hotspots met the evidence thresholds.".to_owned()]));

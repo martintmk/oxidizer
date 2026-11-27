@@ -12,7 +12,7 @@ use super::super::app::{RuntimeDetailMode, RuntimeViewState, TaskHistogram};
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeTaskSummary};
 use super::super::formatting::{format_histogram_duration, format_runtime_duration};
 use super::super::runtime::RuntimeTaskKind;
-use super::super::runtime_timeline::histogram;
+use super::super::runtime_timeline::populated_histogram;
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
 use super::runtime_group_ui::{draw_details, draw_summary, sample_details};
@@ -43,7 +43,7 @@ pub(super) fn draw(
             } else {
                 task.worker_ids
                     .iter()
-                    .map(|worker| format!("w{worker}"))
+                    .map(|worker| format!("#{worker}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             }
@@ -148,7 +148,7 @@ fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, sampl
         return;
     }
     let count = usize::from(area.width.saturating_sub(2) / 9).clamp(1, 12);
-    let bins = histogram(samples, count);
+    let bins = populated_histogram(samples, count);
     let bars = bins
         .iter()
         .map(|bin| {
@@ -249,7 +249,7 @@ mod tests {
         assert!(text.contains("0 #1 root.rs:1:1"), "{text}");
         assert!(text.contains("1 #2 parent.rs:2:1"), "{text}");
         assert!(text.contains("2 #3 location not retained [selected]"), "{text}");
-        assert!(text.contains("Execution workers: w4, w5"));
+        assert!(text.contains("Execution workers: #4, #5"));
         assert!(text.contains("Scheduling delay: 11ns"));
         assert!(text.contains("Poll total: 13ns"));
         assert!(text.contains("Poll median: 4ns"));

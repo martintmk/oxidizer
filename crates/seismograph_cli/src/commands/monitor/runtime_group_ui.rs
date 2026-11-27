@@ -16,7 +16,7 @@ use super::super::data::{RuntimeMonitorSnapshot, RuntimeTaskSummary};
 use super::super::formatting::{format_count, format_histogram_duration, format_runtime_duration};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::runtime::{AsynchronousTaskGroupSummary, BlockingTaskGroupSummary};
-use super::super::runtime_timeline::{histogram, median_nanos};
+use super::super::runtime_timeline::{median_nanos, populated_histogram};
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
 
@@ -98,9 +98,9 @@ fn duration(value: Option<u64>) -> String {
 fn task_spawn(task: &RuntimeTaskSummary) -> String {
     match (task.origin_worker_id, task.worker_ids.first().copied()) {
         (None, _) => "external".into(),
-        (Some(origin), Some(worker)) if origin == worker => format!("local w{worker}"),
-        (Some(origin), Some(worker)) => format!("w{origin} -> w{worker}"),
-        (Some(origin), None) => format!("w{origin} -> ?"),
+        (Some(origin), Some(worker)) if origin == worker => format!("local #{worker}"),
+        (Some(origin), Some(worker)) => format!("#{origin} -> #{worker}"),
+        (Some(origin), None) => format!("#{origin} -> ?"),
     }
 }
 
@@ -121,6 +121,7 @@ fn draw_async_statistics(
         GroupHistogram::Secondary => ("Ready wait", group.ready_samples.as_slice()),
     };
     let mut lines = vec![
+        statistics_heading("Identity"),
         Line::from(format!(
             "Spawned at: {}",
             group.spawned_at.as_deref().unwrap_or("location not retained")
@@ -131,6 +132,13 @@ fn draw_async_statistics(
                 .type_descriptor_id
                 .map_or_else(|| "not retained".into(), |id| format!("#{id}"))
         )),
+        statistics_heading("Outcomes"),
+        Line::from(format!("Succeeded: {}", format_count(group.outcomes.completed))),
+        Line::from(format!("Canceled: {}", format_count(group.outcomes.canceled))),
+        Line::from(format!("Panicked: {}", format_count(group.outcomes.panicked))),
+        statistics_heading("Execution"),
+        Line::from(format!("Workers: {}", format_count(group.outcomes.workers))),
+        Line::from(format!("Polls: {}", format_count(group.polls))),
     ];
     lines.extend(sample_details("Poll", &group.poll_samples));
     lines.extend(sample_details("Ready wait", &group.ready_samples));
@@ -155,6 +163,7 @@ fn draw_blocking_statistics(
         GroupHistogram::Secondary => ("Queue wait", group.queue_samples.as_slice()),
     };
     let mut lines = vec![
+        statistics_heading("Identity"),
         Line::from(format!(
             "Spawned at: {}",
             group.spawned_at.as_deref().unwrap_or("location not retained")
@@ -165,11 +174,25 @@ fn draw_blocking_statistics(
                 .type_descriptor_id
                 .map_or_else(|| "not retained".into(), |id| format!("#{id}"))
         )),
+        statistics_heading("Outcomes"),
+        Line::from(format!("Succeeded: {}", format_count(group.outcomes.completed))),
+        Line::from(format!("Canceled: {}", format_count(group.outcomes.canceled))),
+        Line::from(format!("Panicked: {}", format_count(group.outcomes.panicked))),
+        statistics_heading("Execution"),
+        Line::from(format!("Workers: {}", format_count(group.outcomes.workers))),
+        Line::from(format!("Runs: {}", format_count(group.executions))),
     ];
     lines.extend(sample_details("Execution", &group.execution_samples));
     lines.extend(sample_details("Queue wait", &group.queue_samples));
     let chart = draw_summary(frame, area, lines, " Task Type Statistics ".into(), focused, scroll);
     draw_histogram(frame, chart, label, samples);
+}
+
+fn statistics_heading(label: &'static str) -> Line<'static> {
+    Line::from(ratatui::text::Span::styled(
+        label,
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))
 }
 
 pub(super) fn sample_details(label: &str, samples: &[u64]) -> Vec<Line<'static>> {
@@ -254,10 +277,7 @@ fn draw_detail_lines(
     let scroll = scroll.min(line_count.saturating_sub(visible));
     let mut block = table_ui::focused_block(title, focused);
     if line_count > visible {
-        let histogram = if chart_height == 0 { "" } else { " · t: histogram" };
-        block = block.title_bottom(format!(" PgUp/PgDn: scroll{histogram} · line {}/{} ", scroll + 1, line_count));
-    } else if chart_height != 0 {
-        block = block.title_bottom(" t: histogram ");
+        block = block.title_bottom(format!(" line {}/{} ", scroll + 1, line_count));
     }
     frame.render_widget(
         paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)).block(block),
@@ -280,7 +300,7 @@ fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, sampl
         return;
     }
     let count = usize::from(area.width.saturating_sub(2) / 9).clamp(1, 12);
-    let bins = histogram(samples, count);
+    let bins = populated_histogram(samples, count);
     let bars = bins
         .iter()
         .map(|bin| {
@@ -392,7 +412,7 @@ fn draw_tasks<'a>(
         .column_spacing(1)
         .row_highlight_style(table_ui::selection_style(view.section == RuntimeSectionFocus::GroupTasks))
         .block(table_ui::focused_block(
-            format!(" Tasks · {} · select then open Runtime Task ", tasks.len()),
+            format!(" Tasks · {} ", tasks.len()),
             view.section == RuntimeSectionFocus::GroupTasks,
         ));
     let mut state = TableState::default().with_selected((!tasks.is_empty()).then_some(selected.saturating_sub(first)));
@@ -440,11 +460,20 @@ mod tests {
         let group = AsynchronousTaskGroupSummary {
             spawned_at: Some("src/tasks.rs:42:5".into()),
             type_descriptor_id: Some(8),
+            outcomes: super::super::super::runtime::TaskOutcomeSummary {
+                tasks: 10,
+                completed: 7,
+                canceled: 2,
+                panicked: 1,
+                workers: 3,
+                ..Default::default()
+            },
+            polls: 9,
             poll_samples: vec![8, 1, 4],
             ready_samples: vec![0],
             ..Default::default()
         };
-        let mut terminal = Terminal::new(TestBackend::new(100, 22)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
             .draw(|frame| draw_async_statistics(frame, frame.area(), Some(&group), GroupHistogram::Primary, true, 0))
             .unwrap();
@@ -459,6 +488,13 @@ mod tests {
         for detail in [
             "Spawned at: src/tasks.rs:42:5",
             "Descriptor: #8",
+            "Outcomes",
+            "Succeeded: 7",
+            "Canceled: 2",
+            "Panicked: 1",
+            "Execution",
+            "Workers: 3",
+            "Polls: 9",
             "Poll samples: 3",
             "Poll total: 13ns",
             "Poll median: 4ns",
@@ -466,9 +502,9 @@ mod tests {
             "Ready wait total: 0ns",
             "Ready wait median: 0ns",
         ] {
-            assert!(text.contains(detail), "{detail}");
+            assert!(text.contains(detail), "{detail}: {text}");
         }
-        for duplicate in ["spawned ·", "live ·", "succeeded", "workers ·", "avg", "Poll:"] {
+        for duplicate in ["spawned ·", "live ·", "workers ·", "avg", "Poll:"] {
             assert!(!text.contains(duplicate), "{duplicate}");
         }
     }

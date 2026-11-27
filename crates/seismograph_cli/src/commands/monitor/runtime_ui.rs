@@ -14,7 +14,7 @@ use super::super::app::{RuntimeSectionFocus, RuntimeViewState, RuntimeWorkerSort
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeWorkerSummary};
 use super::super::formatting::{format_count, format_histogram_duration, format_runtime_duration};
 use super::super::mouse::{ListTarget, MouseRows};
-use super::super::runtime_timeline::histogram;
+use super::super::runtime_timeline::populated_histogram;
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
 use super::runtime_group_ui::aligned_details;
@@ -118,7 +118,15 @@ const fn selected_index(view: RuntimeViewState) -> usize {
 }
 
 fn worker_name(worker: &RuntimeWorkerSummary) -> String {
-    worker.worker_id.map_or_else(|| "Unknown".into(), |id| format!("w{id}"))
+    worker.worker_id.map_or_else(|| "Unknown".into(), |id| format!("#{id}"))
+}
+
+fn worker_thread(worker: &RuntimeWorkerSummary) -> String {
+    if worker.thread_name.is_empty() {
+        "-".into()
+    } else {
+        worker.thread_name.clone()
+    }
 }
 
 fn duration(value: Option<u64>) -> String {
@@ -180,7 +188,6 @@ fn draw_workers(
                 "Blocking workers",
                 table_ui::selection_style(view.focus == RuntimeWorkersFocus::Blocking),
             ),
-            Span::raw(" · a/b · Enter task types"),
         ])),
         tabs,
     );
@@ -347,10 +354,18 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 RuntimeWorkerSort::AverageReady,
                 RuntimeWorkerSort::MaximumReady,
             ],
-            vec![8, 8, 4, 5, 6, 10, 10, 10, 10, 10]
-                .into_iter()
-                .map(Constraint::Length)
-                .collect(),
+            vec![
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(4),
+                Constraint::Length(5),
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
         ),
         (RuntimeWorkersFocus::Asynchronous, false) => (
             vec!["Worker ID", "Polls", "Avg sched", "Max ready"],
@@ -511,10 +526,7 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
     if focus == RuntimeWorkersFocus::Asynchronous {
         let [summary, chart] = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
         let lines = vec![
-            Line::from(format!(
-                "Thread: {}",
-                worker.thread_id.map_or_else(|| "-".into(), |id| id.to_string())
-            )),
+            Line::from(format!("Thread: {}", worker_thread(worker))),
             Line::from(format!(
                 "Current task: {}",
                 worker.current_task.map_or_else(|| "-".into(), |id| format!("#{id}"))
@@ -532,10 +544,7 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
         return;
     }
     let lines = vec![
-        Line::from(format!(
-            "Thread: {}",
-            worker.thread_id.map_or_else(|| "-".into(), |id| id.to_string())
-        )),
+        Line::from(format!("Thread: {}", worker_thread(worker))),
         Line::from(format!(
             "Current task: {}",
             worker.current_task.map_or_else(|| "-".into(), |id| format!("#{id}"))
@@ -566,7 +575,7 @@ fn draw_poll_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, samples: &[u6
         return;
     }
     let count = usize::from(area.width.saturating_sub(2) / 9).clamp(1, 12);
-    let bins = histogram(samples, count);
+    let bins = populated_histogram(samples, count);
     let bars = bins
         .iter()
         .map(|bin| {
@@ -629,6 +638,8 @@ mod tests {
                     worker_id: Some(1),
                     role: "Core".into(),
                     state: "Running".into(),
+                    thread_id: Some(11),
+                    thread_name: "async-main".into(),
                     park_events: 5,
                     unpark_events: 6,
                     observed_tasks: 3,
@@ -657,6 +668,8 @@ mod tests {
                     worker_id: Some(2),
                     role: "Blocking".into(),
                     state: "Running".into(),
+                    thread_id: Some(12),
+                    thread_name: "blocking-main".into(),
                     park_events: 7,
                     unpark_events: 8,
                     task_types: 1,
@@ -715,7 +728,7 @@ mod tests {
                 assert!(text.contains("60ns"));
                 assert!(text.contains("50ns"));
             }
-            if width >= 125 {
+            if width >= 145 {
                 assert!(text.contains("Median poll"));
                 assert!(text.contains("20ns"));
             }
@@ -740,6 +753,8 @@ mod tests {
     #[test]
     fn worker_tabs_show_category_specific_metrics_without_observed_percentage() {
         let runtime = runtime();
+        assert_eq!(worker_name(&runtime.workers[0]), "#1");
+        assert_eq!(worker_thread(&runtime.workers[0]), "async-main");
         let mouse = MouseRows::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 16)).unwrap();
         for focus in [RuntimeWorkersFocus::Asynchronous, RuntimeWorkersFocus::Blocking] {
@@ -772,6 +787,7 @@ mod tests {
                 RuntimeWorkersFocus::Asynchronous => {
                     assert!(text.contains("Async Workers"));
                     assert!(text.contains("Async Worker Activity"));
+                    assert!(text.contains("async-main"));
                     assert!(text.contains("50ns"));
                     let details = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
                     assert!(details.contains("Park events: 5"), "{details}");
@@ -783,7 +799,7 @@ mod tests {
                     assert!(text.contains("200ns"));
                     let details = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
                     for expected in [
-                        "Thread: -",
+                        "Thread: blocking-main",
                         "Current task: -",
                         "Queue samples: 4",
                         "Total queue wait: 80ns",

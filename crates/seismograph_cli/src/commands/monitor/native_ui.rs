@@ -319,7 +319,7 @@ pub(super) fn draw(
         labels,
         nav.root,
         ListTarget::HeapBuckets,
-        frame(" Allocator · Enter › ".into(), nav.depth == Depth::Root),
+        frame(" Allocator ".into(), nav.depth == Depth::Root),
     );
     if let Some(error) = unavailable {
         let lines = error.lines().map(str::to_owned).collect::<Vec<_>>();
@@ -327,7 +327,7 @@ pub(super) fn draw(
             terminal,
             mouse,
             right,
-            " Source / capture error · Enter details ".into(),
+            " Source / capture error ".into(),
             &lines,
             nav.scroll,
             nav.depth != Depth::Root,
@@ -607,7 +607,7 @@ fn draw_owner(terminal: &mut ratatui::Frame<'_>, mouse: &MouseRows, area: Rect, 
             (SUBSYSTEMS.len(), |index| Cow::Borrowed(SUBSYSTEMS[index])),
             nav.subsystem,
             ListTarget::NativeSubsystems,
-            frame(" Subsystems · Enter › ".into(), true),
+            frame(" Subsystems ".into(), true),
         );
         detail(
             terminal,

@@ -336,7 +336,7 @@ fn draw_stack(
                 .collect::<Vec<_>>(),
         )
         .scroll((0, horizontal))
-        .block(table_ui::focused_block(" Event stack | f relative/all ", false).title_bottom(" PgUp/Dn scroll | Left/Right pan ")),
+        .block(table_ui::focused_block(" Event stack ", false)),
         area,
     );
 }

@@ -134,7 +134,7 @@ pub(super) fn draw_threads(frame: &mut ratatui::Frame<'_>, mouse: &MouseRows, ar
         String::new()
     };
     let footer = format!(
-        " {}/{} threads{hidden} · Up/Down · PgUp/Dn ",
+        " {}/{} threads{hidden} ",
         selected.saturating_add(1).min(live.threads.len()),
         live.threads.len()
     );

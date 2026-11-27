@@ -275,7 +275,7 @@ const HOTSPOTS: &Section = section!("ACTIONABLE HOTSPOTS";
     "Location" => "The first application frame, task spawn location, cache tier identity, or I/O resource identity used to address the finding.",
     "Agent instruction" => "A copy-ready implementation task. It states the evidence, a narrow fix direction, behavior constraints, and the validation to add.",
     "Allocation thresholds" => "Maximum allocation at least 256 KiB, or at least 1,000 allocations and 8 MiB total at one captured stack.",
-    "Runtime thresholds" => "Async poll maximum at least 10 ms with three samples, or at least 50 ms once. Blocking queue maximum at least 50 ms with three runs.",
+    "Runtime thresholds" => "Async poll maximum at least 10 ms with three samples, or at least 50 ms once. Up to five individual tasks are also reported when more than 10% of tracked polls exceed 0.5 ms. Blocking queue maximum is at least 50 ms with three runs.",
     "Contention thresholds" => "At least 50 retained mutex, RwLock, Once, or blocked-send contention events. Normal notify, condition-variable, barrier, and receive waits are excluded.",
     "Cache / I/O thresholds" => "Any retained cache or I/O error. Cache miss findings also need at least 100 lookup outcomes and at least 50% misses.",
     "Capture warning" => "Source overwrite makes findings lower-bound evidence. Capture loss is not itself reported as an application hotspot.",
@@ -358,7 +358,8 @@ const PRIMITIVE_VALUES: &Section = section!("OPERATION VALUES";
 );
 
 const THREADS: &Section = section!("THREADS";
-    "Thread" => "Recorder thread ID and available name, not necessarily OS thread ID. The default order shows the most retained activity first.",
+    "ID" => "Recorder thread ID, not necessarily the OS thread ID. The default order shows the most retained activity first.",
+    "Name" => "Captured recorder thread name; '-' means that no name was retained.",
     "Retained" => "Retained source records for this thread; filtering can reduce this count.",
     "Overwritten" => "All-class source lost-record count for this thread; remains unfiltered.",
     "telemetry sources hidden" => "Internal monitor recorder sources are omitted. The count can include retired sources. It is not an active OS-thread count.",
@@ -379,7 +380,8 @@ const THREAD_OPERATIONS: &Section = section!("THREAD OPERATIONS";
 );
 
 const THREAD_PARTICIPANTS: &Section = section!("RELATED THREADS";
-    "Thread" => "Related recorder thread; (self) is the originally selected thread.",
+    "ID" => "Related recorder thread ID.",
+    "Name" => "Related recorder thread name; (self) marks the originally selected thread.",
     "Objects" => "Shared recorded objects in this relationship.",
     "Events" => "Participant's retained events on those objects.",
     "Sortable headers" => "Click a heading to sort by that column. Click it again to reverse the order.",
@@ -402,7 +404,7 @@ const THREAD_OBJECTS: &Section = section!("THREAD OBJECTS / STACKS";
 
 const RUNTIME_WORKERS: &Section = section!("RUNTIME WORKERS";
     "Runtime" => "Selected runtime name and ID. Use [ and ] when the snapshot contains more than one runtime.",
-    "Worker ID" => "Runtime worker ID. The selected runtime supplies the scope for this value.",
+    "Worker ID" => "Runtime worker ID. The selected runtime supplies the scope. The detail pane shows the recorder thread name when retained.",
     "State" => "Running means available to execute, not necessarily polling now. Parked means parked; Stopped means stopped. Event-only workers can have blank metadata.",
     "Types" => "Distinct retained task descriptors that executed on this worker.",
     "Tasks" => "Distinct asynchronous tasks with a retained poll on this worker. A migrated task can count on more than one worker.",
@@ -432,7 +434,7 @@ const RUNTIME_TASK_GROUPS: &Section = section!("RUNTIME TASK TYPES";
     "Closure B" => "Inline closure size shared by this blocking task type.",
     "Async tasks" => "Groups are inferred from retained poll events. Poll totals include retained finished and unfinished polls.",
     "Blocking tasks" => "Groups are inferred when a blocking worker starts execution. Queue-only tasks remain unclassified.",
-    "Spawned" => "Retained task count for this descriptor.",
+    "Total" => "All retained tasks of this type on the selected worker.",
     "Live" => "Tasks in queued, running, or waiting state at the end of the capture.",
     "Succeeded" => "Tasks with a retained successful completion.",
     "Canceled" => "Tasks with a retained cancellation.",
@@ -447,12 +449,13 @@ const RUNTIME_TASK_GROUPS: &Section = section!("RUNTIME TASK TYPES";
     "Max queue" => "Maximum retained blocking queue duration.",
     "Avg exec" => "Mean retained blocking execution duration.",
     "Max exec" => "Maximum retained blocking execution duration. An unfinished execution has no duration sample.",
-    "Task Type Statistics" => "Details align captions so their colons share one column. The full spawn location and descriptor identify the type. Sample counts, totals, and medians describe completed durations.",
+    "Task Type Statistics" => "Identity, Outcomes, and Execution groups show the spawn location, descriptor, spawned and terminal counts, worker count, and duration samples.",
     "Task Statistics" => "Async details show execution workers, completed poll samples, and a duration histogram. Blocking details use aligned caption: value lines and do not show a histogram.",
     "Scheduling delay" => "Recorded delay from enqueue to first activation. The value is '-' when the first-activation event is absent.",
     "Missing ready values" => "Arty records initial queue delay in first-activation events. It does not record queue waits before later polls. Without either kind of evidence, ready values are '-'.",
     "Spawn hierarchy" => "The numbered list starts at the oldest recorded parent and ends at the selected task. Each task shows its source location, captured stack frame, or descriptor. Missing parents, missing locations, and cycles are marked.",
     "Missing spawn location" => "Older captures can omit locations after a runtime stopped. New captures keep a process-wide location catalog. A captured stack frame or descriptor remains as a fallback.",
+    "Ctrl+F" => "Open task ID search in Runtime Task. A match opens that task's detail view.",
     "PgUp / PgDn / t" => "Scroll detail lines / switch an async task or task-type histogram. These keys work in Runtime and Runtime Task.",
     "a / b / Up / Down" => "Select the async or blocking task-type page, then move the descriptor selection.",
 );
@@ -800,9 +803,9 @@ mod tests {
             &["Operation", "Events", "Objects", "Threads", "Hotspots"],
         ),
         (Context::PrimitiveHotspots, &["Events", "Location", "Stack Trace"]),
-        (Context::Threads, &["Thread", "Retained", "Overwritten"]),
+        (Context::Threads, &["ID", "Name", "Retained", "Overwritten"]),
         (Context::ThreadOperations, &["Operation", "Events", "Objects", "Threads"]),
-        (Context::ThreadParticipants, &["Thread", "Objects", "Events"]),
+        (Context::ThreadParticipants, &["ID", "Name", "Objects", "Events"]),
         (Context::ThreadObjects, &["Object", "Own", "Related", "event(s)"]),
         (
             Context::RuntimeWorkers,
@@ -830,7 +833,7 @@ mod tests {
             Context::RuntimeTask,
             &[
                 "Spawned at",
-                "Spawned",
+                "Total",
                 "Live",
                 "Succeeded",
                 "Canceled",
