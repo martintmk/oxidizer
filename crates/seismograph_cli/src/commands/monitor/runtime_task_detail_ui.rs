@@ -15,7 +15,7 @@ use super::super::runtime::RuntimeTaskKind;
 use super::super::runtime_timeline::populated_histogram;
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
-use super::runtime_group_ui::{draw_details, draw_summary, sample_details};
+use super::runtime_group_ui::{draw_details, draw_summary, sample_details, statistics_heading};
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -28,29 +28,11 @@ pub(super) fn draw(
         draw_empty_panel_with_message(frame, area, " Task Statistics ", Some("Select a task."));
         return;
     };
-    let mut lines = vec![Line::from("Spawn hierarchy:")];
+    let mut lines = vec![statistics_heading("Spawn hierarchy")];
     lines.extend(spawn_hierarchy(task, runtime).into_iter().map(Line::from));
-    lines.extend([
-        Line::from(format!(
-            "Descriptor: {}",
-            task.type_descriptor_id
-                .map_or_else(|| "not retained".into(), |descriptor| format!("#{descriptor}")),
-        )),
-        Line::from(format!(
-            "Execution workers: {}",
-            if task.worker_ids.is_empty() {
-                "-".into()
-            } else {
-                task.worker_ids
-                    .iter()
-                    .map(|worker| format!("#{worker}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        )),
-    ]);
     let histogram = match task.kind {
         RuntimeTaskKind::Asynchronous => {
+            lines.push(statistics_heading("Timing"));
             lines.push(Line::from(format!("Scheduling delay: {}", duration(task.scheduling_delay_nanos))));
             lines.extend(sample_details("Poll", &task.metrics.poll_samples).into_iter().skip(1));
             lines.extend(sample_details("Ready wait", &task.metrics.ready_samples));
@@ -71,7 +53,9 @@ pub(super) fn draw(
             })
         }
         RuntimeTaskKind::Blocking => {
+            lines.push(statistics_heading("Lifecycle"));
             lines.push(Line::from(format!("Started: {}", if task.blocking.started { "yes" } else { "no" })));
+            lines.push(statistics_heading("Timing"));
             lines.push(Line::from(format!("Queue wait: {}", duration(task.blocking.queue_duration_nanos))));
             lines.push(Line::from(format!(
                 "Execution duration: {}",
@@ -245,11 +229,12 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
-        assert!(text.contains("Spawn hierarchy:"));
+        assert!(text.contains("Timing"));
+        assert!(text.contains("Spawn hierarchy"));
         assert!(text.contains("0 #1 root.rs:1:1"), "{text}");
         assert!(text.contains("1 #2 parent.rs:2:1"), "{text}");
         assert!(text.contains("2 #3 location not retained [selected]"), "{text}");
-        assert!(text.contains("Execution workers: #4, #5"));
+        assert!(!text.contains("Execution workers:"));
         assert!(text.contains("Scheduling delay: 11ns"));
         assert!(text.contains("Poll total: 13ns"));
         assert!(text.contains("Poll median: 4ns"));
@@ -327,6 +312,9 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
+        assert!(text.contains("Spawn hierarchy"));
+        assert!(text.contains("Lifecycle"));
+        assert!(text.contains("Timing"));
         assert!(text.contains("Started: yes"), "{text}");
         assert!(text.contains("Queue wait: 12ns"), "{text}");
         assert!(text.contains("Execution duration: 34ns"), "{text}");

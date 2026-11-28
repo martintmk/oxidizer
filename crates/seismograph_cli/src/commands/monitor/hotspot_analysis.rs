@@ -239,8 +239,7 @@ fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding
         .filter_map(|group| {
             let max_poll = group.poll_time.max_nanos?;
             let location = group.spawned_at.as_deref()?;
-            (max_poll >= LONG_ASYNC_POLL_NANOS && (group.poll_samples.len() >= 3 || max_poll >= VERY_LONG_ASYNC_POLL_NANOS))
-                .then_some((group, location, max_poll))
+            long_async_poll(max_poll, group.poll_samples.len()).then_some((group, location, max_poll))
         })
         .collect::<Vec<_>>();
     asynchronous.sort_unstable_by_key(|(_, _, max_poll)| std::cmp::Reverse(*max_poll));
@@ -278,7 +277,7 @@ fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding
         .filter_map(|group| {
             let max_queue = group.queue_time.max_nanos?;
             let location = group.spawned_at.as_deref()?;
-            (max_queue >= LONG_BLOCKING_QUEUE_NANOS && group.executions >= 3).then_some((group, location, max_queue))
+            long_blocking_queue(max_queue, group.executions).then_some((group, location, max_queue))
         })
         .collect::<Vec<_>>();
     blocking.sort_unstable_by_key(|(_, _, max_queue)| std::cmp::Reverse(*max_queue));
@@ -296,7 +295,7 @@ fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding
             format_prose_duration(max_queue),
             group.execution_time.max_nanos.map_or_else(|| "-".into(), format_prose_duration)
         );
-        let execution_advice = if max_execution >= LONG_BLOCKING_EXECUTION_NANOS {
+        let execution_advice = if long_blocking_execution(max_execution) {
             " Reduce callback duration or split large batches before increasing pool size."
         } else {
             " Reduce burst concurrency or batch submissions before increasing pool size."
@@ -358,10 +357,7 @@ fn slow_poll_task_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<
     }
     let mut candidates = tasks
         .into_values()
-        .filter(|task| {
-            task.tracked_polls != 0
-                && u128::from(task.slow_polls) * 100 > u128::from(task.tracked_polls) * u128::from(SLOW_TASK_POLL_PERCENT)
-        })
+        .filter(|task| frequent_slow_polls(task.slow_polls, task.tracked_polls))
         .collect::<Vec<_>>();
     candidates.sort_unstable_by(|left, right| {
         (u128::from(right.slow_polls) * u128::from(left.tracked_polls))
@@ -410,6 +406,28 @@ fn slow_poll_task_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<
                 .saturating_add(task.max_poll_nanos),
         });
     }
+}
+
+pub(super) fn frequent_slow_poll_samples(samples: &[u64]) -> bool {
+    let tracked = u64::try_from(samples.len()).unwrap_or(u64::MAX);
+    let slow = u64::try_from(samples.iter().filter(|duration| **duration > SLOW_TASK_POLL_NANOS).count()).unwrap_or(u64::MAX);
+    frequent_slow_polls(slow, tracked)
+}
+
+fn frequent_slow_polls(slow: u64, tracked: u64) -> bool {
+    tracked != 0 && u128::from(slow) * 100 > u128::from(tracked) * u128::from(SLOW_TASK_POLL_PERCENT)
+}
+
+pub(super) fn long_async_poll(max_poll_nanos: u64, samples: usize) -> bool {
+    max_poll_nanos >= LONG_ASYNC_POLL_NANOS && (samples >= 3 || max_poll_nanos >= VERY_LONG_ASYNC_POLL_NANOS)
+}
+
+pub(super) fn long_blocking_queue(max_queue_nanos: u64, executions: u64) -> bool {
+    max_queue_nanos >= LONG_BLOCKING_QUEUE_NANOS && executions >= 3
+}
+
+pub(super) const fn long_blocking_execution(execution_nanos: u64) -> bool {
+    execution_nanos >= LONG_BLOCKING_EXECUTION_NANOS
 }
 
 fn cache_findings(cache: &CacheMonitorSnapshot, findings: &mut Vec<Finding>) {

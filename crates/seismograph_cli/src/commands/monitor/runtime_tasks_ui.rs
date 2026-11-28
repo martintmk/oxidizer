@@ -14,6 +14,7 @@ use super::super::app::{
 };
 use super::super::data::{AsynchronousTaskGroupSummary, BlockingTaskGroupSummary, RuntimeMonitorSnapshot};
 use super::super::formatting::{format_count, format_runtime_duration};
+use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
@@ -232,9 +233,19 @@ fn asynchronous_row(group: &AsynchronousTaskGroupSummary, wide: bool) -> Row<'st
             duration(group.poll_time.max_nanos),
         ]);
     }
+    let max_poll_index = if wide { 8 } else { 5 };
+    let poll_hotspot = group
+        .poll_time
+        .max_nanos
+        .is_some_and(|maximum| long_async_poll(maximum, group.poll_samples.len()));
     Row::new(cells.into_iter().enumerate().map(|(index, value)| {
         let line = Line::from(value);
-        Cell::from(if index == 0 { line } else { line.right_aligned() })
+        let cell = Cell::from(if index == 0 { line } else { line.right_aligned() });
+        if index == max_poll_index && poll_hotspot {
+            cell.style(Style::default().fg(Color::Yellow))
+        } else {
+            cell
+        }
     }))
 }
 
@@ -387,9 +398,20 @@ fn blocking_row(group: &BlockingTaskGroupSummary, wide: bool) -> Row<'static> {
             duration(group.execution_time.max_nanos),
         ]);
     }
+    let (max_queue_index, max_execution_index) = if wide { (6, 8) } else { (5, 6) };
+    let queue_hotspot = group
+        .queue_time
+        .max_nanos
+        .is_some_and(|maximum| long_blocking_queue(maximum, group.executions));
+    let execution_hotspot = group.execution_time.max_nanos.is_some_and(long_blocking_execution);
     Row::new(cells.into_iter().enumerate().map(|(index, value)| {
         let line = Line::from(value);
-        Cell::from(if index == 0 { line } else { line.right_aligned() })
+        let cell = Cell::from(if index == 0 { line } else { line.right_aligned() });
+        if (index == max_queue_index && queue_hotspot) || (index == max_execution_index && execution_hotspot) {
+            cell.style(Style::default().fg(Color::Yellow))
+        } else {
+            cell
+        }
     }))
 }
 
@@ -423,11 +445,11 @@ mod tests {
                 ready_time: DurationSummary::default(),
                 poll_time: DurationSummary {
                     samples: 3,
-                    total_nanos: 90,
-                    max_nanos: Some(50),
+                    total_nanos: 30_000_000,
+                    max_nanos: Some(10_000_000),
                 },
                 ready_samples: Vec::new(),
-                poll_samples: vec![10, 30, 50],
+                poll_samples: vec![10_000_000; 3],
             }],
             blocking_groups: vec![BlockingTaskGroupSummary {
                 runtime_id: 1,
@@ -436,25 +458,25 @@ mod tests {
                 spawned_at: Some("src/blocking.rs:2:1".into()),
                 body_size_bytes: Some(64),
                 outcomes: TaskOutcomeSummary {
-                    tasks: 2,
+                    tasks: 3,
                     completed: 1,
                     canceled: 1,
                     workers: 1,
                     ..TaskOutcomeSummary::default()
                 },
-                executions: 2,
+                executions: 3,
                 queue_time: DurationSummary {
-                    samples: 2,
-                    total_nanos: 60,
-                    max_nanos: Some(40),
+                    samples: 3,
+                    total_nanos: 150_000_000,
+                    max_nanos: Some(50_000_000),
                 },
                 execution_time: DurationSummary {
-                    samples: 2,
-                    total_nanos: 240,
-                    max_nanos: Some(200),
+                    samples: 3,
+                    total_nanos: 750_000_000,
+                    max_nanos: Some(300_000_000),
                 },
-                queue_samples: vec![20, 40],
-                execution_samples: vec![40, 200],
+                queue_samples: vec![50_000_000; 3],
+                execution_samples: vec![250_000_000; 3],
             }],
             unclassified_tasks: 1,
             ..RuntimeMonitorSnapshot::default()
@@ -482,6 +504,10 @@ mod tests {
                 .collect::<String>();
             assert!(text.contains(expected));
             assert!(text.contains("Total"));
+            assert!(
+                terminal.backend().buffer().content.iter().any(|cell| cell.fg == Color::Yellow),
+                "{focus:?}"
+            );
             for moved in ["Succeeded", "Canceled", "Panicked", "Workers"] {
                 assert!(!text.contains(moved), "{focus:?}: {moved}");
             }

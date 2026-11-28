@@ -14,6 +14,7 @@ use super::super::app::{
 };
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeTaskSummary};
 use super::super::formatting::{format_count, format_histogram_duration, format_runtime_duration};
+use super::super::hotspot_analysis::{frequent_slow_poll_samples, long_blocking_execution, long_blocking_queue};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::runtime::{AsynchronousTaskGroupSummary, BlockingTaskGroupSummary};
 use super::super::runtime_timeline::{median_nanos, populated_histogram};
@@ -124,13 +125,7 @@ fn draw_async_statistics(
         statistics_heading("Identity"),
         Line::from(format!(
             "Spawned at: {}",
-            group.spawned_at.as_deref().unwrap_or("location not retained")
-        )),
-        Line::from(format!(
-            "Descriptor: {}",
-            group
-                .type_descriptor_id
-                .map_or_else(|| "not retained".into(), |id| format!("#{id}"))
+            task_type_location(group.spawned_at.as_deref(), group.type_descriptor_id)
         )),
         statistics_heading("Outcomes"),
         Line::from(format!("Succeeded: {}", format_count(group.outcomes.completed))),
@@ -166,13 +161,7 @@ fn draw_blocking_statistics(
         statistics_heading("Identity"),
         Line::from(format!(
             "Spawned at: {}",
-            group.spawned_at.as_deref().unwrap_or("location not retained")
-        )),
-        Line::from(format!(
-            "Descriptor: {}",
-            group
-                .type_descriptor_id
-                .map_or_else(|| "not retained".into(), |id| format!("#{id}"))
+            task_type_location(group.spawned_at.as_deref(), group.type_descriptor_id)
         )),
         statistics_heading("Outcomes"),
         Line::from(format!("Succeeded: {}", format_count(group.outcomes.completed))),
@@ -188,9 +177,16 @@ fn draw_blocking_statistics(
     draw_histogram(frame, chart, label, samples);
 }
 
-fn statistics_heading(label: &'static str) -> Line<'static> {
+fn task_type_location(location: Option<&str>, descriptor: Option<u64>) -> String {
+    location.map_or_else(
+        || descriptor.map_or_else(|| "not retained".into(), |descriptor| format!("descriptor #{descriptor}")),
+        str::to_owned,
+    )
+}
+
+pub(super) fn statistics_heading(label: impl Into<String>) -> Line<'static> {
     Line::from(ratatui::text::Span::styled(
-        label,
+        label.into(),
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     ))
 }
@@ -212,9 +208,10 @@ pub(super) fn aligned_details(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .iter()
         .filter_map(|line| {
             let text = line.to_string();
-            (!text.chars().next().is_some_and(char::is_whitespace))
-                .then(|| text.find(':'))
-                .flatten()
+            (!line.spans.iter().any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                && !text.chars().next().is_some_and(char::is_whitespace))
+            .then(|| text.find(':'))
+            .flatten()
         })
         .max()
         .unwrap_or(0);
@@ -222,7 +219,9 @@ pub(super) fn aligned_details(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .into_iter()
         .map(|line| {
             let text = line.to_string();
-            if text.chars().next().is_some_and(char::is_whitespace) {
+            if line.spans.iter().any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                || text.chars().next().is_some_and(char::is_whitespace)
+            {
                 return line;
             }
             match text.split_once(':') {
@@ -442,9 +441,26 @@ fn task_row(task: &RuntimeTaskSummary, focus: RuntimeWorkersFocus) -> Row<'stati
             duration(task.blocking.execution_duration_nanos),
         ]),
     }
+    let hotspots = match focus {
+        RuntimeWorkersFocus::Asynchronous => [(5, frequent_slow_poll_samples(&task.metrics.poll_samples)), (usize::MAX, false)],
+        RuntimeWorkersFocus::Blocking => [
+            (
+                4,
+                task.blocking
+                    .queue_duration_nanos
+                    .is_some_and(|duration| long_blocking_queue(duration, 3)),
+            ),
+            (5, task.blocking.execution_duration_nanos.is_some_and(long_blocking_execution)),
+        ],
+    };
     Row::new(cells.into_iter().enumerate().map(|(index, value)| {
         let line = Line::from(value);
-        Cell::from(if index >= 3 { line.right_aligned() } else { line })
+        let cell = Cell::from(if index >= 3 { line.right_aligned() } else { line });
+        if hotspots.iter().any(|(hotspot_index, active)| *active && index == *hotspot_index) {
+            cell.style(Style::default().fg(Color::Yellow))
+        } else {
+            cell
+        }
     }))
 }
 
@@ -486,8 +502,8 @@ mod tests {
             .collect::<String>();
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
         for detail in [
+            "Identity",
             "Spawned at: src/tasks.rs:42:5",
-            "Descriptor: #8",
             "Outcomes",
             "Succeeded: 7",
             "Canceled: 2",
@@ -516,7 +532,7 @@ mod tests {
             execution_samples: vec![0],
             ..Default::default()
         };
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|frame| draw_blocking_statistics(frame, frame.area(), Some(&group), GroupHistogram::Primary, true, 0))
             .unwrap();
@@ -576,5 +592,12 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(buffer[(first + 2, 1)].symbol(), "f");
         assert_eq!(buffer[(second + 2, 2)].symbol(), "s");
+    }
+
+    #[test]
+    fn task_type_location_uses_descriptor_only_as_a_fallback() {
+        assert_eq!(task_type_location(Some("src/task.rs:1:2"), Some(8)), "src/task.rs:1:2");
+        assert_eq!(task_type_location(None, Some(8)), "descriptor #8");
+        assert_eq!(task_type_location(None, None), "not retained");
     }
 }

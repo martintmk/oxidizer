@@ -13,6 +13,7 @@ use ratatui::widgets::{Bar, BarChart, BarGroup, Cell, Paragraph, Row, Table, Tab
 use super::super::app::{RuntimeSectionFocus, RuntimeViewState, RuntimeWorkerSort, RuntimeWorkersFocus};
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeWorkerSummary};
 use super::super::formatting::{format_count, format_histogram_duration, format_runtime_duration};
+use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::runtime_timeline::populated_histogram;
 use super::super::table_ui;
@@ -505,10 +506,64 @@ fn worker_row(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: b
             ]);
         }
     }
+    let hotspots = worker_hotspot_columns(worker, focus, wide, width);
     Row::new(cells.into_iter().enumerate().map(|(index, value)| {
         let line = Line::from(value);
-        Cell::from(if index >= 1 { line.right_aligned() } else { line })
+        let cell = Cell::from(if index >= 1 { line.right_aligned() } else { line });
+        if hotspots.iter().any(|(hotspot_index, active)| *active && index == *hotspot_index) {
+            cell.style(Style::default().fg(Color::Yellow))
+        } else {
+            cell
+        }
     }))
+}
+
+fn worker_hotspot_columns(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: bool, width: u16) -> [(usize, bool); 2] {
+    match (focus, wide, width >= 95) {
+        (RuntimeWorkersFocus::Asynchronous, true, _) => [
+            (
+                8,
+                worker
+                    .metrics
+                    .max_poll_nanos
+                    .is_some_and(|maximum| long_async_poll(maximum, worker.metrics.poll_samples.len())),
+            ),
+            (usize::MAX, false),
+        ],
+        (RuntimeWorkersFocus::Asynchronous, false, true) => [
+            (
+                5,
+                worker
+                    .metrics
+                    .max_poll_nanos
+                    .is_some_and(|maximum| long_async_poll(maximum, worker.metrics.poll_samples.len())),
+            ),
+            (usize::MAX, false),
+        ],
+        (RuntimeWorkersFocus::Asynchronous, false, false) => [(usize::MAX, false), (usize::MAX, false)],
+        (RuntimeWorkersFocus::Blocking, true, _) => [
+            (
+                10,
+                worker
+                    .blocking
+                    .queue_time
+                    .max_nanos
+                    .is_some_and(|maximum| long_blocking_queue(maximum, worker.blocking.executions)),
+            ),
+            (12, worker.blocking.execution_time.max_nanos.is_some_and(long_blocking_execution)),
+        ],
+        (RuntimeWorkersFocus::Blocking, false, _) => [
+            (
+                4,
+                worker
+                    .blocking
+                    .queue_time
+                    .max_nanos
+                    .is_some_and(|maximum| long_blocking_queue(maximum, worker.blocking.executions)),
+            ),
+            (5, worker.blocking.execution_time.max_nanos.is_some_and(long_blocking_execution)),
+        ],
+    }
 }
 
 fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Option<&RuntimeWorkerSummary>, focus: RuntimeWorkersFocus) {
