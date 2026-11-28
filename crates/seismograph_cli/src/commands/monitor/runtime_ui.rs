@@ -3,6 +3,7 @@
 
 //! Runtime workers and category-specific worker activity.
 
+#[cfg(test)]
 use std::cmp::Ordering;
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,10 +11,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, BarGroup, Cell, Paragraph, Row, Table, TableState};
 
-use super::super::app::{RuntimeSectionFocus, RuntimeViewState, RuntimeWorkerSort, RuntimeWorkersFocus};
+use super::super::app::{RuntimeSectionFocus, RuntimeViewState, RuntimeWorkerSort, RuntimeWorkersFocus, compare_runtime_workers};
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeWorkerSummary};
 use super::super::formatting::{format_count, format_histogram_duration, format_runtime_duration};
-use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue};
+use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue, long_scheduling_delay};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::runtime_timeline::populated_histogram;
 use super::super::table_ui;
@@ -55,56 +56,8 @@ fn workers_for(runtime: &RuntimeMonitorSnapshot, view: RuntimeViewState) -> Vec<
         RuntimeWorkersFocus::Asynchronous => (view.asynchronous_worker_sort, view.asynchronous_worker_descending),
         RuntimeWorkersFocus::Blocking => (view.blocking_worker_sort, view.blocking_worker_descending),
     };
-    workers.sort_unstable_by(|left, right| compare_workers(left, right, sort, descending));
+    workers.sort_unstable_by(|left, right| compare_runtime_workers(left, right, sort, descending));
     workers
-}
-
-fn optional(left: Option<u64>, right: Option<u64>, descending: bool) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => table_ui::directed(left.cmp(&right), descending),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn compare_workers(left: &RuntimeWorkerSummary, right: &RuntimeWorkerSummary, sort: RuntimeWorkerSort, descending: bool) -> Ordering {
-    let ordering = match sort {
-        RuntimeWorkerSort::WorkerId => table_ui::directed(left.worker_id.cmp(&right.worker_id), descending),
-        RuntimeWorkerSort::State => table_ui::directed(left.state.cmp(&right.state), descending),
-        RuntimeWorkerSort::Types => table_ui::directed(left.task_types.cmp(&right.task_types), descending),
-        RuntimeWorkerSort::Tasks => table_ui::directed(left.observed_tasks.cmp(&right.observed_tasks), descending),
-        RuntimeWorkerSort::Polls => table_ui::directed(left.metrics.poll_count.cmp(&right.metrics.poll_count), descending),
-        RuntimeWorkerSort::Parks => table_ui::directed(left.park_events.cmp(&right.park_events), descending),
-        RuntimeWorkerSort::Unparks => table_ui::directed(left.unpark_events.cmp(&right.unpark_events), descending),
-        RuntimeWorkerSort::MedianPoll => optional(left.metrics.median_poll_nanos, right.metrics.median_poll_nanos, descending),
-        RuntimeWorkerSort::MaxPoll => optional(left.metrics.max_poll_nanos, right.metrics.max_poll_nanos, descending),
-        RuntimeWorkerSort::AverageScheduling => optional(left.scheduling_time.mean_nanos(), right.scheduling_time.mean_nanos(), descending),
-        RuntimeWorkerSort::MaximumScheduling => optional(left.scheduling_time.max_nanos, right.scheduling_time.max_nanos, descending),
-        RuntimeWorkerSort::AverageReady => optional(left.ready_time.mean_nanos(), right.ready_time.mean_nanos(), descending),
-        RuntimeWorkerSort::MaximumReady => optional(left.ready_time.max_nanos, right.ready_time.max_nanos, descending),
-        RuntimeWorkerSort::Runs => table_ui::directed(left.blocking.executions.cmp(&right.blocking.executions), descending),
-        RuntimeWorkerSort::Succeeded => table_ui::directed(left.blocking.succeeded.cmp(&right.blocking.succeeded), descending),
-        RuntimeWorkerSort::Canceled => table_ui::directed(left.blocking.canceled.cmp(&right.blocking.canceled), descending),
-        RuntimeWorkerSort::Panicked => table_ui::directed(left.blocking.panicked.cmp(&right.blocking.panicked), descending),
-        RuntimeWorkerSort::AverageQueue => optional(
-            left.blocking.queue_time.mean_nanos(),
-            right.blocking.queue_time.mean_nanos(),
-            descending,
-        ),
-        RuntimeWorkerSort::MaximumQueue => optional(left.blocking.queue_time.max_nanos, right.blocking.queue_time.max_nanos, descending),
-        RuntimeWorkerSort::AverageExecution => optional(
-            left.blocking.execution_time.mean_nanos(),
-            right.blocking.execution_time.mean_nanos(),
-            descending,
-        ),
-        RuntimeWorkerSort::MaximumExecution => optional(
-            left.blocking.execution_time.max_nanos,
-            right.blocking.execution_time.max_nanos,
-            descending,
-        ),
-    };
-    ordering.then_with(|| left.worker_id.cmp(&right.worker_id))
 }
 
 fn is_blocking(worker: &RuntimeWorkerSummary) -> bool {
@@ -296,8 +249,6 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 "Max poll",
                 "Avg sched",
                 "Max sched",
-                "Avg ready",
-                "Max ready",
             ],
             vec![
                 RuntimeWorkerSort::WorkerId,
@@ -311,8 +262,6 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 RuntimeWorkerSort::MaxPoll,
                 RuntimeWorkerSort::AverageScheduling,
                 RuntimeWorkerSort::MaximumScheduling,
-                RuntimeWorkerSort::AverageReady,
-                RuntimeWorkerSort::MaximumReady,
             ],
             vec![
                 Constraint::Length(10),
@@ -322,8 +271,6 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 Constraint::Length(8),
                 Constraint::Length(7),
                 Constraint::Length(9),
-                Constraint::Length(12),
-                Constraint::Length(12),
                 Constraint::Length(12),
                 Constraint::Length(12),
                 Constraint::Length(12),
@@ -340,8 +287,6 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 "Max poll",
                 "Avg sched",
                 "Max sched",
-                "Avg ready",
-                "Max ready",
             ],
             vec![
                 RuntimeWorkerSort::WorkerId,
@@ -352,8 +297,6 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 RuntimeWorkerSort::MaxPoll,
                 RuntimeWorkerSort::AverageScheduling,
                 RuntimeWorkerSort::MaximumScheduling,
-                RuntimeWorkerSort::AverageReady,
-                RuntimeWorkerSort::MaximumReady,
             ],
             vec![
                 Constraint::Length(10),
@@ -364,17 +307,15 @@ fn worker_columns(focus: RuntimeWorkersFocus, wide: bool, width: u16) -> (Vec<&'
                 Constraint::Length(10),
                 Constraint::Length(10),
                 Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
             ],
         ),
         (RuntimeWorkersFocus::Asynchronous, false) => (
-            vec!["Worker ID", "Polls", "Avg sched", "Max ready"],
+            vec!["Worker ID", "Polls", "Avg sched", "Max sched"],
             vec![
                 RuntimeWorkerSort::WorkerId,
                 RuntimeWorkerSort::Polls,
                 RuntimeWorkerSort::AverageScheduling,
-                RuntimeWorkerSort::MaximumReady,
+                RuntimeWorkerSort::MaximumScheduling,
             ],
             vec![
                 Constraint::Min(8),
@@ -456,8 +397,6 @@ fn worker_row(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: b
                 duration(worker.metrics.max_poll_nanos),
                 duration(worker.scheduling_time.mean_nanos()),
                 duration(worker.scheduling_time.max_nanos),
-                duration(worker.ready_time.mean_nanos()),
-                duration(worker.ready_time.max_nanos),
             ]);
         }
         (RuntimeWorkersFocus::Asynchronous, false) if width >= 95 => {
@@ -469,15 +408,13 @@ fn worker_row(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: b
                 duration(worker.metrics.max_poll_nanos),
                 duration(worker.scheduling_time.mean_nanos()),
                 duration(worker.scheduling_time.max_nanos),
-                duration(worker.ready_time.mean_nanos()),
-                duration(worker.ready_time.max_nanos),
             ]);
         }
         (RuntimeWorkersFocus::Asynchronous, false) => {
             cells.extend([
                 format_count(worker.metrics.poll_count),
                 duration(worker.scheduling_time.mean_nanos()),
-                duration(worker.ready_time.max_nanos),
+                duration(worker.scheduling_time.max_nanos),
             ]);
         }
         (RuntimeWorkersFocus::Blocking, true) => {
@@ -519,6 +456,10 @@ fn worker_row(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: b
 }
 
 fn worker_hotspot_columns(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFocus, wide: bool, width: u16) -> [(usize, bool); 2] {
+    let scheduling_hotspot = worker
+        .scheduling_time
+        .max_nanos
+        .is_some_and(|maximum| long_scheduling_delay(maximum, usize::try_from(worker.scheduling_time.samples).unwrap_or(usize::MAX)));
     match (focus, wide, width >= 95) {
         (RuntimeWorkersFocus::Asynchronous, true, _) => [
             (
@@ -528,7 +469,7 @@ fn worker_hotspot_columns(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFo
                     .max_poll_nanos
                     .is_some_and(|maximum| long_async_poll(maximum, worker.metrics.poll_samples.len())),
             ),
-            (usize::MAX, false),
+            (10, scheduling_hotspot),
         ],
         (RuntimeWorkersFocus::Asynchronous, false, true) => [
             (
@@ -538,9 +479,9 @@ fn worker_hotspot_columns(worker: &RuntimeWorkerSummary, focus: RuntimeWorkersFo
                     .max_poll_nanos
                     .is_some_and(|maximum| long_async_poll(maximum, worker.metrics.poll_samples.len())),
             ),
-            (usize::MAX, false),
+            (7, scheduling_hotspot),
         ],
-        (RuntimeWorkersFocus::Asynchronous, false, false) => [(usize::MAX, false), (usize::MAX, false)],
+        (RuntimeWorkersFocus::Asynchronous, false, false) => [(3, scheduling_hotspot), (usize::MAX, false)],
         (RuntimeWorkersFocus::Blocking, true, _) => [
             (
                 10,
@@ -579,7 +520,7 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
         return;
     };
     if focus == RuntimeWorkersFocus::Asynchronous {
-        let [summary, chart] = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area);
+        let [summary, chart] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
         let lines = vec![
             Line::from(format!("Thread: {}", worker_thread(worker))),
             Line::from(format!(
@@ -587,7 +528,6 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
                 worker.current_task.map_or_else(|| "-".into(), |id| format!("#{id}"))
             )),
             Line::from(format!("Scheduling samples: {}", format_count(worker.scheduling_time.samples))),
-            Line::from(format!("Ready wait samples: {}", format_count(worker.ready_time.samples))),
             Line::from(format!("Park events: {}", format_count(worker.park_events))),
             Line::from(format!("Unpark events: {}", format_count(worker.unpark_events))),
         ];
@@ -752,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_worker_grid_shows_scheduling_and_ready_delays_at_each_width() {
+    fn runtime_worker_grid_shows_scheduling_delays_at_each_width() {
         let runtime = runtime();
         let view = RuntimeViewState::new();
         let workers = workers_for(&runtime, view);
@@ -773,16 +713,10 @@ mod tests {
                 .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
             assert!(text.contains("Avg sched"));
-            assert!(text.contains("Max ready"));
+            assert!(text.contains("Max sched"));
             assert!(text.contains("40ns"));
-            assert!(text.contains("90ns"));
+            assert!(text.contains("60ns"));
             assert!(!text.contains("Poll timeline"));
-            if width >= 95 {
-                assert!(text.contains("Max sched"));
-                assert!(text.contains("Avg ready"));
-                assert!(text.contains("60ns"));
-                assert!(text.contains("50ns"));
-            }
             if width >= 145 {
                 assert!(text.contains("Median poll"));
                 assert!(text.contains("20ns"));
@@ -796,12 +730,23 @@ mod tests {
         other.worker_id = Some(3);
         other.scheduling_time.max_nanos = Some(30);
         assert_eq!(
-            compare_workers(&runtime.workers[0], &other, RuntimeWorkerSort::MaximumScheduling, true),
+            compare_runtime_workers(&runtime.workers[0], &other, RuntimeWorkerSort::MaximumScheduling, true),
             Ordering::Less
         );
         assert_eq!(
-            compare_workers(&runtime.workers[0], &other, RuntimeWorkerSort::MaximumScheduling, false),
+            compare_runtime_workers(&runtime.workers[0], &other, RuntimeWorkerSort::MaximumScheduling, false),
             Ordering::Greater
+        );
+        let mut scheduling_hotspot = runtime.workers[0].clone();
+        scheduling_hotspot.scheduling_time.samples = 3;
+        scheduling_hotspot.scheduling_time.max_nanos = Some(10_000_000);
+        assert_eq!(
+            worker_hotspot_columns(&scheduling_hotspot, RuntimeWorkersFocus::Asynchronous, true, 150),
+            [(8, false), (10, true)]
+        );
+        assert_eq!(
+            worker_hotspot_columns(&scheduling_hotspot, RuntimeWorkersFocus::Asynchronous, false, 80),
+            [(3, true), (usize::MAX, false)]
         );
     }
 

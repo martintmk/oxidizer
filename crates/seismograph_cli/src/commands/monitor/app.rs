@@ -18,7 +18,9 @@ use super::client::{
     Discovery, capture_snapshot, capture_snapshot_and_stop, clear_event_buffers, discover, handshake, recorder_activity, save_snapshot,
     set_recording,
 };
-use super::data::{AllocationSort, AllocationStackFilter, CapturedSnapshot, MemoryTier, MemoryTierData, PrimitiveSort};
+use super::data::{
+    AllocationSort, AllocationStackFilter, CapturedSnapshot, MemoryTier, MemoryTierData, PrimitiveSort, RuntimeWorkerSummary,
+};
 use super::live_activity::{LiveActivity, RecorderUpdate};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -762,7 +764,6 @@ pub(super) struct RuntimeViewState {
     pub(super) task_selected_explicitly: bool,
     pub(super) activity_scroll: usize,
     pub(super) group_histogram: GroupHistogram,
-    pub(super) task_histogram: TaskHistogram,
     pub(super) task_type_sort: RuntimeTaskTypeSort,
     pub(super) task_type_sort_descending: bool,
     pub(super) task_sort: RuntimeTaskRowSort,
@@ -790,7 +791,6 @@ impl RuntimeViewState {
             task_selected_explicitly: false,
             activity_scroll: 0,
             group_histogram: GroupHistogram::Primary,
-            task_histogram: TaskHistogram::Poll,
             task_type_sort: RuntimeTaskTypeSort::PollsOrRuns,
             task_type_sort_descending: true,
             task_sort: RuntimeTaskRowSort::Task,
@@ -836,8 +836,6 @@ pub(super) enum RuntimeWorkerSort {
     MaxPoll,
     AverageScheduling,
     MaximumScheduling,
-    AverageReady,
-    MaximumReady,
     Runs,
     Succeeded,
     Canceled,
@@ -878,12 +876,6 @@ impl GroupHistogram {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TaskHistogram {
-    Poll,
-    Ready,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RuntimeTaskTypeSort {
     SpawnedAt,
     BodySize,
@@ -906,15 +898,6 @@ pub(super) enum RuntimeTaskRowSort {
     MaximumPoll,
     Queue,
     Execution,
-}
-
-impl TaskHistogram {
-    const fn toggle(self) -> Self {
-        match self {
-            Self::Poll => Self::Ready,
-            Self::Ready => Self::Poll,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2544,12 +2527,8 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
         }
         KeyCode::PageUp => view.activity_scroll = view.activity_scroll.saturating_sub(5),
         KeyCode::PageDown => view.activity_scroll = view.activity_scroll.saturating_add(5).min(usize::from(u16::MAX)),
-        KeyCode::Char('t') if view.detail_mode != RuntimeDetailMode::Task || view.focus == RuntimeWorkersFocus::Asynchronous => {
-            if view.detail_mode == RuntimeDetailMode::Task {
-                view.task_histogram = view.task_histogram.toggle();
-            } else {
-                view.group_histogram = view.group_histogram.toggle();
-            }
+        KeyCode::Char('t') if view.detail_mode != RuntimeDetailMode::Task && view.focus == RuntimeWorkersFocus::Blocking => {
+            view.group_histogram = view.group_histogram.toggle();
         }
         _ => return false,
     }
@@ -2604,7 +2583,7 @@ pub(super) fn selected_runtime_group(
                 .filter(|group| group.worker_id == worker_id)
                 .collect::<Vec<_>>();
             sort_runtime_async_groups(&mut groups, *view);
-            let group = groups.get(view.asynchronous_task_selected)?;
+            let group = groups.get(view.asynchronous_task_selected.min(groups.len().saturating_sub(1)))?;
             Some((
                 runtime_id,
                 worker_id,
@@ -2620,7 +2599,7 @@ pub(super) fn selected_runtime_group(
                 .filter(|group| group.worker_id == worker_id)
                 .collect::<Vec<_>>();
             sort_runtime_blocking_groups(&mut groups, *view);
-            let group = groups.get(view.blocking_task_selected)?;
+            let group = groups.get(view.blocking_task_selected.min(groups.len().saturating_sub(1)))?;
             Some((
                 runtime_id,
                 worker_id,
@@ -2696,9 +2675,72 @@ pub(super) fn sort_runtime_blocking_groups(groups: &mut [&super::runtime::Blocki
     });
 }
 
+fn runtime_worker_ordering(ordering: std::cmp::Ordering, descending: bool) -> std::cmp::Ordering {
+    if descending { ordering.reverse() } else { ordering }
+}
+
+fn compare_optional_worker<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => runtime_worker_ordering(left.cmp(&right), descending),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+pub(super) fn compare_runtime_workers(
+    left: &RuntimeWorkerSummary,
+    right: &RuntimeWorkerSummary,
+    sort: RuntimeWorkerSort,
+    descending: bool,
+) -> std::cmp::Ordering {
+    let ordering = match sort {
+        RuntimeWorkerSort::WorkerId => runtime_worker_ordering(left.worker_id.cmp(&right.worker_id), descending),
+        RuntimeWorkerSort::State => runtime_worker_ordering(left.state.cmp(&right.state), descending),
+        RuntimeWorkerSort::Types => runtime_worker_ordering(left.task_types.cmp(&right.task_types), descending),
+        RuntimeWorkerSort::Tasks => runtime_worker_ordering(left.observed_tasks.cmp(&right.observed_tasks), descending),
+        RuntimeWorkerSort::Polls => runtime_worker_ordering(left.metrics.poll_count.cmp(&right.metrics.poll_count), descending),
+        RuntimeWorkerSort::Parks => runtime_worker_ordering(left.park_events.cmp(&right.park_events), descending),
+        RuntimeWorkerSort::Unparks => runtime_worker_ordering(left.unpark_events.cmp(&right.unpark_events), descending),
+        RuntimeWorkerSort::MedianPoll => {
+            compare_optional_worker(left.metrics.median_poll_nanos, right.metrics.median_poll_nanos, descending)
+        }
+        RuntimeWorkerSort::MaxPoll => compare_optional_worker(left.metrics.max_poll_nanos, right.metrics.max_poll_nanos, descending),
+        RuntimeWorkerSort::AverageScheduling => {
+            compare_optional_worker(left.scheduling_time.mean_nanos(), right.scheduling_time.mean_nanos(), descending)
+        }
+        RuntimeWorkerSort::MaximumScheduling => {
+            compare_optional_worker(left.scheduling_time.max_nanos, right.scheduling_time.max_nanos, descending)
+        }
+        RuntimeWorkerSort::Runs => runtime_worker_ordering(left.blocking.executions.cmp(&right.blocking.executions), descending),
+        RuntimeWorkerSort::Succeeded => runtime_worker_ordering(left.blocking.succeeded.cmp(&right.blocking.succeeded), descending),
+        RuntimeWorkerSort::Canceled => runtime_worker_ordering(left.blocking.canceled.cmp(&right.blocking.canceled), descending),
+        RuntimeWorkerSort::Panicked => runtime_worker_ordering(left.blocking.panicked.cmp(&right.blocking.panicked), descending),
+        RuntimeWorkerSort::AverageQueue => compare_optional_worker(
+            left.blocking.queue_time.mean_nanos(),
+            right.blocking.queue_time.mean_nanos(),
+            descending,
+        ),
+        RuntimeWorkerSort::MaximumQueue => {
+            compare_optional_worker(left.blocking.queue_time.max_nanos, right.blocking.queue_time.max_nanos, descending)
+        }
+        RuntimeWorkerSort::AverageExecution => compare_optional_worker(
+            left.blocking.execution_time.mean_nanos(),
+            right.blocking.execution_time.mean_nanos(),
+            descending,
+        ),
+        RuntimeWorkerSort::MaximumExecution => compare_optional_worker(
+            left.blocking.execution_time.max_nanos,
+            right.blocking.execution_time.max_nanos,
+            descending,
+        ),
+    };
+    ordering.then_with(|| left.worker_id.cmp(&right.worker_id))
+}
+
 pub(super) fn selected_runtime_worker_id(runtime: &super::data::RuntimeMonitorSnapshot, view: &RuntimeViewState) -> Option<u64> {
     let runtime_id = runtime.selected_runtime(view.runtime_selected)?.runtime_id;
-    runtime
+    let mut workers = runtime
         .workers
         .iter()
         .filter(|worker| worker.runtime_id == runtime_id)
@@ -2707,7 +2749,14 @@ pub(super) fn selected_runtime_worker_id(runtime: &super::data::RuntimeMonitorSn
             RuntimeWorkersFocus::Asynchronous => worker.role != "Blocking" && worker.blocking.executions == 0,
             RuntimeWorkersFocus::Blocking => worker.role == "Blocking" || worker.blocking.executions != 0,
         })
-        .nth(match view.focus {
+        .collect::<Vec<_>>();
+    let (sort, descending) = match view.focus {
+        RuntimeWorkersFocus::Asynchronous => (view.asynchronous_worker_sort, view.asynchronous_worker_descending),
+        RuntimeWorkersFocus::Blocking => (view.blocking_worker_sort, view.blocking_worker_descending),
+    };
+    workers.sort_unstable_by(|left, right| compare_runtime_workers(left, right, sort, descending));
+    workers
+        .get(match view.focus {
             RuntimeWorkersFocus::Asynchronous => view.asynchronous_selected,
             RuntimeWorkersFocus::Blocking => view.blocking_selected,
         })
@@ -2861,7 +2910,9 @@ pub(super) fn sort_runtime_tasks(tasks: &mut Vec<&super::data::RuntimeTaskSummar
 fn handle_runtime_task_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Option<&CapturedSnapshot>) -> bool {
     if code == KeyCode::Char('g') && view.group_selected_explicitly {
         view.detail_mode = RuntimeDetailMode::Group;
-        view.group_histogram = view.group_histogram.toggle();
+        if view.focus == RuntimeWorkersFocus::Blocking {
+            view.group_histogram = view.group_histogram.toggle();
+        }
         view.activity_scroll = 0;
         return true;
     }
@@ -2881,13 +2932,8 @@ fn handle_runtime_task_key(code: KeyCode, view: &mut RuntimeViewState, snapshot:
         return false;
     }
     match code {
-        KeyCode::Char('t') if view.detail_mode == RuntimeDetailMode::Group || view.focus == RuntimeWorkersFocus::Asynchronous => {
-            if view.detail_mode == RuntimeDetailMode::Group {
-                view.group_histogram = view.group_histogram.toggle();
-            } else {
-                view.detail_mode = RuntimeDetailMode::Task;
-                view.task_histogram = view.task_histogram.toggle();
-            }
+        KeyCode::Char('t') if view.detail_mode == RuntimeDetailMode::Group && view.focus == RuntimeWorkersFocus::Blocking => {
+            view.group_histogram = view.group_histogram.toggle();
         }
         KeyCode::Char('e') if task.is_some() => {
             view.detail_mode = RuntimeDetailMode::Events;
@@ -4252,13 +4298,8 @@ mod tests {
     #[test]
     fn capture_mode_has_two_actions_and_defaults_to_continue() {
         assert_eq!(
-            (
-                CaptureMode::default(),
-                CaptureMode::Continue.next(),
-                CaptureMode::Stop.next(),
-                TaskHistogram::Ready.toggle(),
-            ),
-            (CaptureMode::Continue, CaptureMode::Stop, CaptureMode::Continue, TaskHistogram::Poll,)
+            (CaptureMode::default(), CaptureMode::Continue.next(), CaptureMode::Stop.next()),
+            (CaptureMode::Continue, CaptureMode::Stop, CaptureMode::Continue)
         );
     }
 
@@ -4266,6 +4307,7 @@ mod tests {
     fn runtime_details_scroll_beyond_histogram_bins_and_keep_group_selection() {
         let mut view = RuntimeViewState {
             group_selected_explicitly: true,
+            focus: RuntimeWorkersFocus::Blocking,
             ..RuntimeViewState::new()
         };
         for _ in 0..3 {
@@ -4354,6 +4396,51 @@ mod tests {
                 selected_runtime_task(&runtime, &searched).map(|task| task.task_id),
             ),
             (RuntimeSectionFocus::GroupTasks, 0, 0, RuntimeDetailMode::Task, Some(250),)
+        );
+    }
+
+    #[test]
+    fn changing_sorted_async_worker_refreshes_and_clamps_the_task_type() {
+        let worker = |worker_id, polls| super::super::runtime::RuntimeWorkerSummary {
+            runtime_id: 1,
+            worker_id: Some(worker_id),
+            role: "Core".into(),
+            metrics: super::super::runtime_timeline::ExecutionMetrics {
+                poll_count: polls,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let group = |worker_id, descriptor| super::super::runtime::AsynchronousTaskGroupSummary {
+            runtime_id: 1,
+            worker_id: Some(worker_id),
+            type_descriptor_id: Some(descriptor),
+            ..Default::default()
+        };
+        let runtime = super::super::runtime::RuntimeMonitorSnapshot {
+            runtimes: vec![super::super::runtime::RuntimeSummary {
+                runtime_id: 1,
+                name: "test".into(),
+            }],
+            workers: vec![worker(1, 1), worker(2, 10)],
+            asynchronous_groups: vec![group(1, 10), group(1, 11), group(2, 20)],
+            ..Default::default()
+        };
+        let mut view = RuntimeViewState {
+            asynchronous_worker_sort: RuntimeWorkerSort::Polls,
+            asynchronous_worker_descending: true,
+            asynchronous_task_selected: 1,
+            ..RuntimeViewState::new()
+        };
+
+        assert_eq!(
+            selected_runtime_group(&runtime, &view),
+            Some((1, Some(2), Some(20), super::super::runtime::RuntimeTaskKind::Asynchronous))
+        );
+        view.asynchronous_selected = 1;
+        assert_eq!(
+            selected_runtime_group(&runtime, &view),
+            Some((1, Some(1), Some(11), super::super::runtime::RuntimeTaskKind::Asynchronous))
         );
     }
 

@@ -510,6 +510,7 @@ impl TaskBuilder {
             && matches!(
                 kind,
                 EventKind::TaskMaterialized
+                    | EventKind::TaskReady
                     | EventKind::TaskPollStarted
                     | EventKind::TaskPollFinished
                     | EventKind::TaskCompleted
@@ -569,8 +570,9 @@ fn task_id(kind: EventKind, subject: u64, related: u64) -> Option<TaskId> {
         | EventKind::TaskCompleted
         | EventKind::TaskCanceled
         | EventKind::TaskPanicked
-        | EventKind::InstanceRelocated => subject,
-        EventKind::TaskReady | EventKind::TransferStarted | EventKind::TransferFinished => related,
+        | EventKind::InstanceRelocated
+        | EventKind::TaskReady => subject,
+        EventKind::TransferStarted | EventKind::TransferFinished => related,
         _ => return None,
     };
     TaskId::from_raw(raw)
@@ -605,6 +607,7 @@ mod tests {
     fn poll_only_history_creates_an_incomplete_asynchronous_task() {
         let events = Events {
             events: vec![
+                event(EventKind::TaskReady, 7, None, 17, 0, 0),
                 event(EventKind::TaskPollStarted, 7, Some(3), 17, 0, 0),
                 event(EventKind::TaskPollFinished, 7, Some(3), 17, 11, 0),
             ],

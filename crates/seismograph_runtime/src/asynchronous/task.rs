@@ -179,6 +179,28 @@ impl Task {
         self.data.identity
     }
 
+    /// Records that the task became ready for another poll.
+    ///
+    /// Pass the timestamp from the accepted wake. Call this method immediately
+    /// before the next poll.
+    pub fn ready(mut self, ready_at: EventTimestamp) -> Self {
+        seismograph::record(EventClass::RuntimeTask, || {
+            self.data.recorded = true;
+            Some(runtime_record(
+                ready_at,
+                EventKind::TaskReady,
+                self.data.runtime,
+                None,
+                self.data.identity.id().get(),
+                self.data.identity.descriptor().get(),
+                0,
+                0,
+                BacktraceCapture::Never,
+            ))
+        });
+        self
+    }
+
     /// Starts one poll.
     pub fn poll_started(mut self, worker: &super::Worker) -> Poll {
         let mut started_at = None;

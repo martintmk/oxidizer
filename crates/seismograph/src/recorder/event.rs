@@ -412,12 +412,13 @@ pub enum EventKind {
     CachePromotionFailed,
     /// A background refresh was already in progress.
     CacheRefreshSuppressed,
-    /// First outstanding wake notification for a task (coalesced until its next poll).
+    /// First outstanding wake notification for a task. Later notifications merge until the next poll.
     ///
-    /// Uses the fixed runtime payload: `subject_id` is the task, `worker_id` is
-    /// absent, and `related_id`, `value_0`, and `value_1` are zero. The timestamp
-    /// is the raw wake time, including notifications during a poll. The event's
-    /// thread is the notifier, not evidence of a polling worker. No stack is captured.
+    /// New producers use `subject_id` for the task and `related_id` for the task
+    /// descriptor. `worker_id` is absent, and `value_0` and `value_1` are zero.
+    /// The timestamp is the wake time, including notifications during a poll.
+    /// The producer writes this event immediately before the next poll. No stack
+    /// is captured.
     TaskReady,
     /// A retained notification was consumed.
     NotifyAccess,

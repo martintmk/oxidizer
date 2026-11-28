@@ -613,7 +613,7 @@ mod tests {
     fn applying_filter_resets_panel_positions_but_preserves_display_options() {
         use super::super::app::{
             CacheFocus, GroupHistogram, HeapFocus, IoFocus, PrimitiveFocus, RuntimeDetailMode, RuntimeSectionFocus, RuntimeWorkersFocus,
-            TaskEventsFocus, TaskHistogram, ThreadFocus,
+            TaskEventsFocus, ThreadFocus,
         };
         use super::super::data::AllocationStackFilter;
 
@@ -625,7 +625,6 @@ mod tests {
         app.primitive_view.stack_filter = AllocationStackFilter::All;
         app.thread_view.stack_filter = AllocationStackFilter::All;
         app.runtime_view.group_histogram = GroupHistogram::Secondary;
-        app.runtime_view.task_histogram = TaskHistogram::Ready;
         app.runtime_view.events.stack_filter = AllocationStackFilter::All;
         let expected = (
             app.heap_view,

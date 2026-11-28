@@ -135,7 +135,6 @@ pub(super) struct RuntimeTaskSummary {
     pub(super) runtime_id: u64,
     pub(super) parent_id: Option<u64>,
     pub(super) origin_worker_id: Option<u64>,
-    pub(super) scheduling_delay_nanos: Option<u64>,
     pub(super) type_descriptor_id: Option<u64>,
     pub(super) future_size_bytes: Option<u64>,
     pub(super) operations: u64,
@@ -193,6 +192,7 @@ struct TaskBuilder {
     metrics: BTreeMap<Option<u64>, ExecutionMetrics>,
     ready: Vec<Interval>,
     ready_samples: Vec<u64>,
+    ready_at: Option<u64>,
     wake_samples: Vec<u64>,
     unassigned_poll: Option<Interval>,
     matching_poll_workers: BTreeSet<u64>,
@@ -366,7 +366,7 @@ fn only_value(values: &BTreeSet<u64>) -> Option<u64> {
 }
 
 impl TaskBuilder {
-    fn ready_observed(&mut self, timestamp: u64, duration: u64) {
+    fn scheduling_delay_observed(&mut self, timestamp: u64, duration: u64) {
         self.ready_samples.push(duration);
         if timestamp != 0
             && let Some(start) = timestamp.checked_sub(duration)
@@ -406,7 +406,6 @@ fn observe_ready_delay(
     worker_id: Option<u64>,
     descriptor: Option<u64>,
     duration: u64,
-    initial_activation: bool,
     workers: &mut Workers,
     groups: &mut BTreeMap<(u64, Option<u64>, Option<u64>), AsynchronousTaskGroupBuilder>,
 ) {
@@ -414,9 +413,7 @@ fn observe_ready_delay(
         .entry((runtime_id, worker_id))
         .or_insert_with(|| worker_row(runtime_id, worker_id));
     worker.ready_time.observe(Some(duration));
-    if initial_activation {
-        worker.scheduling_time.observe(Some(duration));
-    }
+    worker.scheduling_time.observe(Some(duration));
     let group = groups.entry((runtime_id, worker_id, descriptor)).or_default();
     group.ready_time.observe(Some(duration));
     group.ready_samples.push(duration);
@@ -597,6 +594,10 @@ impl RuntimeMonitorSnapshot {
         tasks.into_values().collect()
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "runtime event projection keeps task and aggregate updates in one ordered pass"
+    )]
     pub(super) fn from_events(
         events: &Events,
         source: Option<&Snapshot>,
@@ -638,17 +639,38 @@ impl RuntimeMonitorSnapshot {
                 task.workers.insert(worker_id);
             }
             let timestamp = event.timestamp.ticks();
-            match event.kind {
+            let scheduling_delay = match event.kind {
                 EventKind::TaskSpawned | EventKind::TaskEnqueued => {
                     if task.row.spawn_stack.is_empty() {
                         let stack = event.call_stack.iter().map(|address| address.get()).collect::<Vec<_>>();
                         task.row.spawn_stack = primitive_stack(&stack, &lookups, AllocationStackFilter::All);
                     }
+                    None
                 }
-                EventKind::TaskPollStarted => task.poll_started(worker_id, timestamp, runtime.value_0, runtime.value_1),
+                EventKind::TaskReady => {
+                    task.ready_at = Some(timestamp);
+                    None
+                }
+                EventKind::TaskPollStarted => {
+                    let delay = task
+                        .ready_at
+                        .take()
+                        .and_then(|ready_at| timestamp.checked_sub(ready_at))
+                        .or_else(|| (runtime.value_1 == 2).then_some(runtime.value_0));
+                    if let Some(delay) = delay {
+                        task.scheduling_delay_observed(timestamp, delay);
+                    }
+                    task.poll_started(
+                        worker_id,
+                        timestamp,
+                        runtime.value_0,
+                        if delay.is_some() { 0 } else { runtime.value_1 },
+                    );
+                    delay
+                }
                 EventKind::TaskMaterialized if task.row.kind == RuntimeTaskKind::Asynchronous => {
-                    task.row.scheduling_delay_nanos = Some(runtime.value_0);
-                    task.ready_observed(timestamp, runtime.value_0);
+                    task.scheduling_delay_observed(timestamp, runtime.value_0);
+                    Some(runtime.value_0)
                 }
                 EventKind::TaskPollFinished => {
                     task.executed.insert(worker_id);
@@ -659,18 +681,16 @@ impl RuntimeMonitorSnapshot {
                     {
                         metrics.polls.push(Interval { start, end: timestamp });
                     }
+                    None
                 }
-                _ => {}
-            }
-            if (event.kind == EventKind::TaskPollStarted && runtime.value_1 == 2)
-                || (event.kind == EventKind::TaskMaterialized && task.row.kind == RuntimeTaskKind::Asynchronous)
-            {
+                _ => None,
+            };
+            if let Some(scheduling_delay) = scheduling_delay {
                 observe_ready_delay(
                     runtime_id,
                     worker_id,
                     task.row.type_descriptor_id,
-                    runtime.value_0,
-                    event.kind == EventKind::TaskMaterialized,
+                    scheduling_delay,
                     &mut workers,
                     &mut asynchronous_groups,
                 );

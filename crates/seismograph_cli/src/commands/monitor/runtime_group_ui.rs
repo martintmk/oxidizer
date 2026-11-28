@@ -48,7 +48,6 @@ pub(super) fn draw_statistics(
                 frame,
                 area,
                 group,
-                view.group_histogram,
                 view.detail_mode == RuntimeDetailMode::Group,
                 view.activity_scroll,
             );
@@ -109,7 +108,6 @@ fn draw_async_statistics(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     group: Option<&AsynchronousTaskGroupSummary>,
-    histogram_kind: GroupHistogram,
     focused: bool,
     scroll: usize,
 ) {
@@ -117,11 +115,7 @@ fn draw_async_statistics(
         draw_empty_panel_with_message(frame, area, " Async Task Type ", Some("Task type data is unavailable."));
         return;
     };
-    let (label, samples) = match histogram_kind {
-        GroupHistogram::Primary => ("Poll duration", group.poll_samples.as_slice()),
-        GroupHistogram::Secondary => ("Ready wait", group.ready_samples.as_slice()),
-    };
-    let mut lines = vec![
+    let lines = vec![
         statistics_heading("Identity"),
         Line::from(format!(
             "Spawned at: {}",
@@ -131,14 +125,14 @@ fn draw_async_statistics(
         Line::from(format!("Succeeded: {}", format_count(group.outcomes.completed))),
         Line::from(format!("Canceled: {}", format_count(group.outcomes.canceled))),
         Line::from(format!("Panicked: {}", format_count(group.outcomes.panicked))),
-        statistics_heading("Execution"),
-        Line::from(format!("Workers: {}", format_count(group.outcomes.workers))),
-        Line::from(format!("Polls: {}", format_count(group.polls))),
     ];
-    lines.extend(sample_details("Poll", &group.poll_samples));
-    lines.extend(sample_details("Ready wait", &group.ready_samples));
-    let chart = draw_summary(frame, area, lines, " Task Type Statistics ".into(), focused, scroll);
-    draw_histogram(frame, chart, label, samples);
+    let chart = draw_summary(frame, area, lines, " Task Type Details ".into(), focused, scroll);
+    draw_histogram_pair(
+        frame,
+        chart,
+        ("Poll duration", &group.poll_samples),
+        ("Scheduling delay", &group.ready_samples),
+    );
 }
 
 fn draw_blocking_statistics(
@@ -173,7 +167,7 @@ fn draw_blocking_statistics(
     ];
     lines.extend(sample_details("Execution", &group.execution_samples));
     lines.extend(sample_details("Queue wait", &group.queue_samples));
-    let chart = draw_summary(frame, area, lines, " Task Type Statistics ".into(), focused, scroll);
+    let chart = draw_summary(frame, area, lines, " Task Type Details ".into(), focused, scroll);
     draw_histogram(frame, chart, label, samples);
 }
 
@@ -192,15 +186,22 @@ pub(super) fn statistics_heading(label: impl Into<String>) -> Line<'static> {
 }
 
 pub(super) fn sample_details(label: &str, samples: &[u64]) -> Vec<Line<'static>> {
-    let total = samples.iter().copied().fold(0_u64, u64::saturating_add);
     vec![
         Line::from(format!(
             "{label} samples: {}",
             format_count(u64::try_from(samples.len()).unwrap_or(u64::MAX))
         )),
-        Line::from(format!("{label} total: {}", duration((!samples.is_empty()).then_some(total)))),
-        Line::from(format!("{label} median: {}", duration(median_nanos(&mut samples.to_vec())))),
+        Line::from(format!("{label} total: {}", duration(sample_total(samples)))),
+        Line::from(format!("{label} median: {}", duration(sample_median(samples)))),
     ]
+}
+
+fn sample_total(samples: &[u64]) -> Option<u64> {
+    (!samples.is_empty()).then(|| samples.iter().copied().fold(0_u64, u64::saturating_add))
+}
+
+fn sample_median(samples: &[u64]) -> Option<u64> {
+    median_nanos(&mut samples.to_vec())
 }
 
 pub(super) fn aligned_details(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -283,6 +284,12 @@ fn draw_detail_lines(
         summary,
     );
     chart
+}
+
+pub(super) fn draw_histogram_pair(frame: &mut ratatui::Frame<'_>, area: Rect, left: (&str, &[u64]), right: (&str, &[u64])) {
+    let [left_area, right_area] = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(area);
+    draw_histogram(frame, left_area, left.0, left.1);
+    draw_histogram(frame, right_area, right.0, right.1);
 }
 
 fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, samples: &[u64]) {
@@ -491,7 +498,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|frame| draw_async_statistics(frame, frame.area(), Some(&group), GroupHistogram::Primary, true, 0))
+            .draw(|frame| draw_async_statistics(frame, frame.area(), Some(&group), true, 0))
             .unwrap();
         let text = terminal
             .backend()
@@ -508,19 +515,23 @@ mod tests {
             "Succeeded: 7",
             "Canceled: 2",
             "Panicked: 1",
-            "Execution",
-            "Workers: 3",
-            "Polls: 9",
-            "Poll samples: 3",
-            "Poll total: 13ns",
-            "Poll median: 4ns",
-            "Ready wait samples: 1",
-            "Ready wait total: 0ns",
-            "Ready wait median: 0ns",
+            "Poll duration",
+            "Scheduling delay",
         ] {
             assert!(text.contains(detail), "{detail}: {text}");
         }
-        for duplicate in ["spawned ·", "live ·", "workers ·", "avg", "Poll:"] {
+        for duplicate in [
+            "Execution",
+            "Workers:",
+            "Count:",
+            "Total:",
+            "Median:",
+            "spawned ·",
+            "live ·",
+            "workers ·",
+            "avg",
+            "Poll:",
+        ] {
             assert!(!text.contains(duplicate), "{duplicate}");
         }
     }

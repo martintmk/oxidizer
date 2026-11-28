@@ -14,7 +14,7 @@ use super::super::app::{
 };
 use super::super::data::{AsynchronousTaskGroupSummary, BlockingTaskGroupSummary, RuntimeMonitorSnapshot};
 use super::super::formatting::{format_count, format_runtime_duration};
-use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue};
+use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue, long_scheduling_delay};
 use super::super::mouse::{ListTarget, MouseRows};
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
@@ -146,8 +146,8 @@ fn draw_asynchronous(
                 "Total",
                 "Live",
                 "Polls",
-                "Avg ready",
-                "Max ready",
+                "Avg sched",
+                "Max sched",
                 "Avg poll",
                 "Max poll",
             ],
@@ -238,10 +238,14 @@ fn asynchronous_row(group: &AsynchronousTaskGroupSummary, wide: bool) -> Row<'st
         .poll_time
         .max_nanos
         .is_some_and(|maximum| long_async_poll(maximum, group.poll_samples.len()));
+    let scheduling_hotspot = group
+        .ready_time
+        .max_nanos
+        .is_some_and(|maximum| long_scheduling_delay(maximum, group.ready_samples.len()));
     Row::new(cells.into_iter().enumerate().map(|(index, value)| {
         let line = Line::from(value);
         let cell = Cell::from(if index == 0 { line } else { line.right_aligned() });
-        if index == max_poll_index && poll_hotspot {
+        if (wide && index == 6 && scheduling_hotspot) || (index == max_poll_index && poll_hotspot) {
             cell.style(Style::default().fg(Color::Yellow))
         } else {
             cell
@@ -442,14 +446,18 @@ mod tests {
                     ..TaskOutcomeSummary::default()
                 },
                 polls: 9,
-                ready_time: DurationSummary::default(),
-                poll_time: DurationSummary {
+                ready_time: DurationSummary {
                     samples: 3,
                     total_nanos: 30_000_000,
                     max_nanos: Some(10_000_000),
                 },
-                ready_samples: Vec::new(),
-                poll_samples: vec![10_000_000; 3],
+                poll_time: DurationSummary {
+                    samples: 3,
+                    total_nanos: 3_000_000,
+                    max_nanos: Some(1_000_000),
+                },
+                ready_samples: vec![10_000_000; 3],
+                poll_samples: vec![1_000_000; 3],
             }],
             blocking_groups: vec![BlockingTaskGroupSummary {
                 runtime_id: 1,

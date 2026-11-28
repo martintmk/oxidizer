@@ -232,6 +232,7 @@ const fn actionable_contention(kind: super::data::PrimitiveOperationKind) -> boo
 
 fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding>) {
     slow_poll_task_findings(runtime, findings);
+    scheduling_delay_findings(runtime, findings);
 
     let mut asynchronous = runtime
         .asynchronous_groups
@@ -312,6 +313,45 @@ fn runtime_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding
                  focused load test and compare average and maximum queue duration."
             ),
             score: max_queue,
+        });
+    }
+}
+
+fn scheduling_delay_findings(runtime: &RuntimeMonitorSnapshot, findings: &mut Vec<Finding>) {
+    let mut scheduling = runtime
+        .asynchronous_groups
+        .iter()
+        .filter_map(|group| {
+            let max_delay = group.ready_time.max_nanos?;
+            let location = group.spawned_at.as_deref()?;
+            long_scheduling_delay(max_delay, group.ready_samples.len()).then_some((group, location, max_delay))
+        })
+        .collect::<Vec<_>>();
+    scheduling.sort_unstable_by_key(|(_, _, max_delay)| std::cmp::Reverse(*max_delay));
+    for (group, location, max_delay) in scheduling.into_iter().take(MAX_CATEGORY_FINDINGS) {
+        let severity = if max_delay >= VERY_LONG_ASYNC_POLL_NANOS {
+            Severity::High
+        } else {
+            Severity::Medium
+        };
+        let evidence = format!(
+            "{} samples, {} average, {} maximum",
+            format_count(u64::try_from(group.ready_samples.len()).unwrap_or(u64::MAX)),
+            group.ready_time.mean_nanos().map_or_else(|| "-".into(), format_prose_duration),
+            format_prose_duration(max_delay)
+        );
+        findings.push(Finding {
+            severity,
+            category: Category::AsyncRuntime,
+            title: "Long async scheduling delays".into(),
+            evidence: evidence.clone(),
+            location: location.into(),
+            explanation: "A ready task waited too long before an async worker started its next poll.".into(),
+            agent_instruction: format!(
+                "At {location}, reduce async scheduling delay ({evidence}). Look for long polls, blocking work, or worker saturation. Preserve task \
+                 behavior and cancellation. Add a focused runtime test and compare maximum scheduling delay."
+            ),
+            score: max_delay,
         });
     }
 }
@@ -420,6 +460,10 @@ fn frequent_slow_polls(slow: u64, tracked: u64) -> bool {
 
 pub(super) fn long_async_poll(max_poll_nanos: u64, samples: usize) -> bool {
     max_poll_nanos >= LONG_ASYNC_POLL_NANOS && (samples >= 3 || max_poll_nanos >= VERY_LONG_ASYNC_POLL_NANOS)
+}
+
+pub(super) fn long_scheduling_delay(max_delay_nanos: u64, samples: usize) -> bool {
+    long_async_poll(max_delay_nanos, samples)
 }
 
 pub(super) fn long_blocking_queue(max_queue_nanos: u64, executions: u64) -> bool {
@@ -541,7 +585,9 @@ fn compare_findings(left: &Finding, right: &Finding) -> Ordering {
 mod tests {
     use super::*;
     use crate::commands::monitor::data::{CacheTierSummary, IoResourceSummary};
-    use crate::commands::monitor::runtime::{BlockingTaskGroupSummary, DurationSummary, RuntimeTaskSummary, RuntimeWorkerSummary};
+    use crate::commands::monitor::runtime::{
+        AsynchronousTaskGroupSummary, BlockingTaskGroupSummary, DurationSummary, RuntimeTaskSummary, RuntimeWorkerSummary,
+    };
     use crate::commands::monitor::runtime_timeline::ExecutionMetrics;
 
     fn primitives(total_events: u64, lost_events: u64) -> PrimitiveSnapshot {
@@ -593,6 +639,40 @@ mod tests {
         assert!(report.findings[0].agent_instruction.contains("focused load test"));
         assert!(report.findings[1].agent_instruction.contains("key normalization"));
         assert!(report.findings.iter().all(|finding| !finding.location.is_empty()));
+    }
+
+    #[test]
+    fn scheduling_delay_findings_use_ready_to_poll_samples() {
+        let runtime = RuntimeMonitorSnapshot {
+            asynchronous_groups: vec![AsynchronousTaskGroupSummary {
+                spawned_at: Some("src/tasks.rs:12:3".into()),
+                ready_time: DurationSummary {
+                    samples: 3,
+                    total_nanos: 30_000_000,
+                    max_nanos: Some(10_000_000),
+                },
+                ready_samples: vec![10_000_000; 3],
+                ..AsynchronousTaskGroupSummary::default()
+            }],
+            ..RuntimeMonitorSnapshot::default()
+        };
+
+        let report = analyze(
+            None,
+            &primitives(3, 0),
+            &runtime,
+            &IoMonitorSnapshot::default(),
+            &CacheMonitorSnapshot::default(),
+        );
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.title == "Long async scheduling delays")
+            .unwrap();
+        assert_eq!(finding.location, "src/tasks.rs:12:3");
+        assert_eq!(finding.score, 10_000_000);
+        assert!(finding.evidence.contains("3 samples"));
     }
 
     #[test]

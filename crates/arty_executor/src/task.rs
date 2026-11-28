@@ -173,11 +173,17 @@ where
     M: MonitoringState,
 {
     fn poll(self: Pin<&Self>, shared: &ExecutorShared) -> task::Poll<()> {
+        _ = self.pinned_wake_signal().take_ready();
         self.poll_with(shared, M::poll_silent_started, M::poll_silent_finished)
     }
 
     fn poll_recorded(self: Pin<&Self>, shared: &ExecutorShared) -> task::Poll<()> {
-        self.poll_with(shared, M::poll_recorded_started, M::poll_recorded_finished)
+        let ready_at = self.pinned_wake_signal().take_ready();
+        self.poll_with(
+            shared,
+            |monitoring, identity, shared| M::poll_recorded_started(monitoring, identity, shared, ready_at),
+            M::poll_recorded_finished,
+        )
     }
 
     fn links(&self) -> &TaskLinks {

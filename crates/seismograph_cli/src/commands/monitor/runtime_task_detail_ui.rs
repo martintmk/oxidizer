@@ -4,18 +4,14 @@
 //! Rich statistics for one task selected from a task-type group.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Bar, BarChart, BarGroup, Paragraph};
 
-use super::super::app::{RuntimeDetailMode, RuntimeViewState, TaskHistogram};
+use super::super::app::{RuntimeDetailMode, RuntimeViewState};
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeTaskSummary};
-use super::super::formatting::{format_histogram_duration, format_runtime_duration};
+use super::super::formatting::format_runtime_duration;
 use super::super::runtime::RuntimeTaskKind;
-use super::super::runtime_timeline::populated_histogram;
-use super::super::table_ui;
 use super::draw_empty_panel_with_message;
-use super::runtime_group_ui::{draw_details, draw_summary, sample_details, statistics_heading};
+use super::runtime_group_ui::{draw_details, draw_histogram_pair, draw_summary, statistics_heading};
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -25,33 +21,16 @@ pub(super) fn draw(
     view: RuntimeViewState,
 ) {
     let Some(task) = task else {
-        draw_empty_panel_with_message(frame, area, " Task Statistics ", Some("Select a task."));
+        draw_empty_panel_with_message(frame, area, " Task Details ", Some("Select a task."));
         return;
     };
     let mut lines = vec![statistics_heading("Spawn hierarchy")];
     lines.extend(spawn_hierarchy(task, runtime).into_iter().map(Line::from));
     let histogram = match task.kind {
-        RuntimeTaskKind::Asynchronous => {
-            lines.push(statistics_heading("Timing"));
-            lines.push(Line::from(format!("Scheduling delay: {}", duration(task.scheduling_delay_nanos))));
-            lines.extend(sample_details("Poll", &task.metrics.poll_samples).into_iter().skip(1));
-            lines.extend(sample_details("Ready wait", &task.metrics.ready_samples));
-            lines.push(Line::from(format!(
-                "Ready wait max: {}",
-                duration(task.metrics.ready_samples.iter().copied().max())
-            )));
-            if !task.metrics.wake_samples.is_empty() {
-                lines.extend(sample_details("Wake latency", &task.metrics.wake_samples));
-                lines.push(Line::from(format!(
-                    "Wake latency max: {}",
-                    duration(task.metrics.wake_samples.iter().copied().max())
-                )));
-            }
-            Some(match view.task_histogram {
-                TaskHistogram::Poll => ("Poll duration", task.metrics.poll_samples.as_slice()),
-                TaskHistogram::Ready => ("Ready wait", task.metrics.ready_samples.as_ref()),
-            })
-        }
+        RuntimeTaskKind::Asynchronous => Some((
+            ("Poll duration", task.metrics.poll_samples.as_slice()),
+            ("Scheduling delay", task.metrics.ready_samples.as_ref()),
+        )),
         RuntimeTaskKind::Blocking => {
             lines.push(statistics_heading("Lifecycle"));
             lines.push(Line::from(format!("Started: {}", if task.blocking.started { "yes" } else { "no" })));
@@ -65,11 +44,11 @@ pub(super) fn draw(
         }
         RuntimeTaskKind::Unknown => None,
     };
-    let title = format!(" Task Statistics · #{} ", task.task_id);
+    let title = format!(" Task Details · #{} ", task.task_id);
     let focused = view.detail_mode == RuntimeDetailMode::Task;
-    if let Some((label, samples)) = histogram {
+    if let Some((polls, scheduling)) = histogram {
         let chart = draw_summary(frame, area, lines, title, focused, view.activity_scroll);
-        draw_histogram(frame, chart, label, samples);
+        draw_histogram_pair(frame, chart, polls, scheduling);
     } else {
         draw_details(frame, area, lines, title, focused, view.activity_scroll);
     }
@@ -121,38 +100,6 @@ fn duration(value: Option<u64>) -> String {
     value.map_or_else(|| "-".into(), format_runtime_duration)
 }
 
-fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, samples: &[u64]) {
-    if samples.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No completed duration samples.")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(table_ui::focused_block(format!(" {label} "), false)),
-            area,
-        );
-        return;
-    }
-    let count = usize::from(area.width.saturating_sub(2) / 9).clamp(1, 12);
-    let bins = populated_histogram(samples, count);
-    let bars = bins
-        .iter()
-        .map(|bin| {
-            Bar::default()
-                .value(bin.count)
-                .label(Line::from(format_histogram_duration(bin.lower)))
-                .style(Style::default().fg(Color::Cyan))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        BarChart::default()
-            .block(table_ui::focused_block(format!(" {label} "), false))
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(5)
-            .bar_gap(1)
-            .max(bins.iter().map(|bin| bin.count).max().unwrap_or(1)),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
@@ -170,7 +117,6 @@ mod tests {
             kind: RuntimeTaskKind::Asynchronous,
             state: "Running".into(),
             origin_worker_id: Some(4),
-            scheduling_delay_nanos: Some(11),
             worker_ids: vec![4, 5],
             metrics: super::super::super::runtime_timeline::ExecutionMetrics {
                 poll_count: 3,
@@ -229,19 +175,26 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
-        assert!(text.contains("Timing"));
         assert!(text.contains("Spawn hierarchy"));
         assert!(text.contains("0 #1 root.rs:1:1"), "{text}");
         assert!(text.contains("1 #2 parent.rs:2:1"), "{text}");
         assert!(text.contains("2 #3 location not retained [selected]"), "{text}");
         assert!(!text.contains("Execution workers:"));
-        assert!(text.contains("Scheduling delay: 11ns"));
-        assert!(text.contains("Poll total: 13ns"));
-        assert!(text.contains("Poll median: 4ns"));
-        assert!(text.contains("Ready wait samples: 2"));
-        assert!(text.contains("Ready wait max: 4ns"));
-        assert!(text.contains("Wake latency median: 0ns"));
-        for duplicate in ["Running", "Spawn origin:", "Poll samples:", "Poll timeline:", "wrong.rs"] {
+        assert!(text.contains("Poll duration"));
+        assert!(text.contains("Scheduling delay"));
+        for duplicate in [
+            "Timing",
+            "Polls",
+            "Count:",
+            "Total:",
+            "Median:",
+            "Wake latency",
+            "Running",
+            "Spawn origin:",
+            "Poll samples:",
+            "Poll timeline:",
+            "wrong.rs",
+        ] {
             assert!(!text.contains(duplicate), "{duplicate}");
         }
     }

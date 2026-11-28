@@ -3,6 +3,7 @@
 
 use std::fmt::Debug;
 
+use seismograph::recorder::event::EventTimestamp;
 use seismograph_runtime::asynchronous::{Poll, QueuedTask, Task};
 use seismograph_runtime::{TaskIdentity, TaskOutcome};
 
@@ -16,7 +17,12 @@ pub(crate) trait MonitoringState: Debug + 'static {
 
     fn poll_silent_finished(&mut self, poll: Self::SilentPoll, outcome: Option<TaskOutcome>);
 
-    fn poll_recorded_started(&mut self, identity: TaskIdentity, shared: &ExecutorShared) -> Self::RecordedPoll;
+    fn poll_recorded_started(
+        &mut self,
+        identity: TaskIdentity,
+        shared: &ExecutorShared,
+        ready_at: Option<EventTimestamp>,
+    ) -> Self::RecordedPoll;
 
     fn poll_recorded_finished(&mut self, poll: Self::RecordedPoll, outcome: Option<TaskOutcome>);
 }
@@ -32,9 +38,20 @@ impl MonitoringState for Unmonitored {
 
     fn poll_silent_finished(&mut self, (): Self::SilentPoll, _outcome: Option<TaskOutcome>) {}
 
-    fn poll_recorded_started(&mut self, identity: TaskIdentity, shared: &ExecutorShared) -> Self::RecordedPoll {
+    fn poll_recorded_started(
+        &mut self,
+        identity: TaskIdentity,
+        shared: &ExecutorShared,
+        ready_at: Option<EventTimestamp>,
+    ) -> Self::RecordedPoll {
         let worker = shared.monitoring().expect("recorded executor polls require a monitoring worker");
-        Task::unrecorded(identity, worker).poll_started(worker)
+        let task = Task::unrecorded(identity, worker);
+        let task = if let Some(ready_at) = ready_at {
+            task.ready(ready_at)
+        } else {
+            task
+        };
+        task.poll_started(worker)
     }
 
     fn poll_recorded_finished(&mut self, poll: Self::RecordedPoll, outcome: Option<TaskOutcome>) {
@@ -80,13 +97,23 @@ impl MonitoringState for Monitored {
         }
     }
 
-    fn poll_recorded_started(&mut self, identity: TaskIdentity, shared: &ExecutorShared) -> Self::RecordedPoll {
+    fn poll_recorded_started(
+        &mut self,
+        identity: TaskIdentity,
+        shared: &ExecutorShared,
+        ready_at: Option<EventTimestamp>,
+    ) -> Self::RecordedPoll {
         let worker = shared.monitoring().expect("recorded executor polls require a monitoring worker");
         let task = match std::mem::replace(self, Self::Dormant) {
             Self::Dormant => Task::unrecorded(identity, worker),
             Self::Queued(queued) => queued.activated(worker),
             Self::Active(task) => task,
             Self::Polling(_) => unreachable!("a task cannot start another poll before finishing its current poll"),
+        };
+        let task = if let Some(ready_at) = ready_at {
+            task.ready(ready_at)
+        } else {
+            task
         };
         *self = Self::Polling(task.poll_started(worker));
     }

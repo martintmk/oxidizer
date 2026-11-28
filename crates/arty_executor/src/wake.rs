@@ -6,19 +6,23 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{self, AtomicBool, AtomicU8};
+use std::sync::atomic::{self, AtomicBool, AtomicU64};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 use std::thread::ThreadId;
 
 use performables::sync::channel;
+use seismograph::recorder::event::{EventClass, EventTimestamp};
+use seismograph::recorder::is_enabled;
 
-#[cfg(test)]
-use crate::TaskIdentity;
 use crate::{RemoteTaskHandle, TaskPtr, executor_context};
 
-const TASK_ACTIVE: u8 = 0b001;
-const TASK_ACTIVE_LOCAL: u8 = 0b011;
-const TASK_ACTIVE_REMOTE: u8 = 0b101;
+const TASK_STATE_MASK: u64 = 0b111;
+const TASK_ACTIVE: u64 = 0b001;
+const TASK_ACTIVE_LOCAL: u64 = 0b011;
+const TASK_ACTIVE_REMOTE: u64 = 0b101;
+const READY_SHIFT: u32 = TASK_STATE_MASK.count_ones();
+const READY_MASK: u64 = !TASK_STATE_MASK;
+const MAX_READY_TIMESTAMP: u64 = (READY_MASK >> READY_SHIFT) - 1;
 
 #[derive(Clone, Debug)]
 pub(crate) struct WakeShared {
@@ -96,7 +100,7 @@ impl WakeShared {
 pub(crate) struct WakeSignal {
     task_ptr: TaskPtr,
     shared: WakeShared,
-    schedule_state: AtomicU8,
+    schedule_state: AtomicU64,
     _requires_pin: PhantomPinned,
 }
 
@@ -105,7 +109,7 @@ impl WakeSignal {
         Self {
             task_ptr,
             shared,
-            schedule_state: AtomicU8::new(TASK_ACTIVE),
+            schedule_state: AtomicU64::new(TASK_ACTIVE),
             _requires_pin: PhantomPinned,
         }
     }
@@ -113,13 +117,17 @@ impl WakeSignal {
     pub(crate) fn retire(&self) {
         let previous = self.schedule_state.swap(0, atomic::Ordering::AcqRel);
         // #[gamma::skip(cond.always_true, reason = "remove_wake retains all nonmatching entries; when no local notification exists there is nothing to remove.")]
-        if previous == TASK_ACTIVE_LOCAL {
+        if (previous & TASK_STATE_MASK) == TASK_ACTIVE_LOCAL {
             executor_context::remove_wake(self.shared.thread_id(), self.task_ptr);
         }
     }
 
     pub(crate) fn clear_queued_notification(&self) {
-        self.clear_notification();
+        _ = self
+            .schedule_state
+            .fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |state| {
+                ((state & TASK_STATE_MASK) != 0).then_some((state & !TASK_STATE_MASK) | TASK_ACTIVE)
+            });
     }
 
     /// # Safety
@@ -139,6 +147,7 @@ impl WakeSignal {
         if !self.begin_notification(remote) {
             return;
         }
+        self.capture_ready();
         if remote {
             self.schedule_remote();
         } else {
@@ -174,27 +183,37 @@ impl WakeSignal {
 
     fn begin_notification(&self, remote: bool) -> bool {
         let notification_state = if remote { TASK_ACTIVE_REMOTE } else { TASK_ACTIVE_LOCAL };
-        matches!(
-            self.schedule_state
-                .try_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |state| match state {
-                    TASK_ACTIVE => Some(notification_state),
-                    TASK_ACTIVE_LOCAL | TASK_ACTIVE_REMOTE => Some(state),
-                    _ => None,
-                }),
-            Ok(TASK_ACTIVE)
-        )
+        self.schedule_state
+            .try_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |state| {
+                ((state & (TASK_STATE_MASK | READY_MASK)) == TASK_ACTIVE).then_some((state & !TASK_STATE_MASK) | notification_state)
+            })
+            .is_ok()
     }
 
     pub(crate) fn promote_remote_notification(&self) -> bool {
         self.schedule_state
             .try_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |state| {
-                (state == TASK_ACTIVE_REMOTE).then_some(TASK_ACTIVE_LOCAL)
+                ((state & TASK_STATE_MASK) == TASK_ACTIVE_REMOTE).then_some((state & !TASK_STATE_MASK) | TASK_ACTIVE_LOCAL)
             })
             .is_ok()
     }
 
     fn clear_notification(&self) {
-        self.schedule_state.fetch_and(TASK_ACTIVE, atomic::Ordering::AcqRel);
+        self.schedule_state.store(TASK_ACTIVE, atomic::Ordering::Release);
+    }
+
+    fn capture_ready(&self) {
+        if !is_enabled(EventClass::RuntimeTask) {
+            return;
+        }
+        let timestamp = EventTimestamp::now().ticks().min(MAX_READY_TIMESTAMP) + 1;
+        self.schedule_state.fetch_or(timestamp << READY_SHIFT, atomic::Ordering::Release);
+    }
+
+    pub(crate) fn take_ready(&self) -> Option<EventTimestamp> {
+        let previous = self.schedule_state.fetch_and(TASK_STATE_MASK, atomic::Ordering::AcqRel);
+        let timestamp = (previous & READY_MASK) >> READY_SHIFT;
+        (timestamp != 0).then(|| EventTimestamp::from_ticks(timestamp - 1))
     }
 
     fn add_owned_waker(&self) {
@@ -312,6 +331,7 @@ mod tests {
     use plurality::MultiPool;
 
     use super::*;
+    use crate::TaskIdentity;
 
     #[test]
     fn nov4_executor_shutdown_closes_the_retained_task_wakers_remote_sender() {

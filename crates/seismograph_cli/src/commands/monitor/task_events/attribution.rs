@@ -156,8 +156,7 @@ fn collect_polls(
                     polls.push(poll);
                 }
             }
-            // In particular, TaskReady belongs to the notifier and is not a
-            // change of the currently executing task on this recorder thread.
+            // TaskReady records scheduling evidence. It does not open a poll.
             _ => {}
         }
     }

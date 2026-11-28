@@ -5215,7 +5215,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (Some(1), 2, Some(5), Some(10), 2, Some(5), Some(10)),
-                (Some(2), 0, None, None, 1, Some(5), Some(5))
+                (Some(2), 1, Some(5), Some(5), 1, Some(5), Some(5))
             ]
         );
         let group = snapshot
@@ -5228,11 +5228,9 @@ mod tests {
         assert_eq!(group.ready_time.max_nanos, Some(10));
         let worker = &snapshot.workers[1];
         let migrated = worker.tasks.iter().find(|task| task.task_id == 10).unwrap();
-        assert_eq!(migrated.scheduling_delay_nanos, Some(10));
         assert_eq!(migrated.metrics.ready_samples.as_ref(), [10, 5]);
         assert_eq!(migrated.metrics.wake_samples.as_ref(), [30]);
         let unknown = worker.tasks.iter().find(|task| task.task_id == 12).unwrap();
-        assert_eq!(unknown.scheduling_delay_nanos, None);
         assert!(unknown.metrics.ready_samples.is_empty());
     }
 
@@ -5569,6 +5567,42 @@ mod tests {
         assert_eq!(snapshot.workers[0].tasks[0].state, "Completed");
         assert_eq!(snapshot.asynchronous_groups[0].polls, 2);
         assert_eq!(snapshot.asynchronous_groups[0].outcomes.completed, 1);
+    }
+
+    #[test]
+    fn runtime_monitor_reports_ready_to_poll_as_scheduling_delay() {
+        let event = |sequence, timestamp, kind, worker_id: Option<u64>| RuntimeEvent {
+            thread_id: ThreadId::new(worker_id.unwrap_or(3)),
+            sequence: EventSequence::new(sequence),
+            timestamp: EventTimestamp::from_ticks(timestamp),
+            kind,
+            payload: EventPayload::Runtime(RuntimeEventPayload {
+                runtime_id: RuntimeId::from_raw(1).unwrap(),
+                worker_id: worker_id.and_then(WorkerId::from_raw),
+                subject_id: 50,
+                related_id: 99,
+                value_0: 0,
+                value_1: 0,
+            }),
+            call_stack: Vec::new(),
+        };
+        let snapshot = RuntimeMonitorSnapshot::from_events(
+            &Events {
+                events: vec![
+                    event(1, 100, RuntimeEventKind::TaskReady, None),
+                    event(2, 140, RuntimeEventKind::TaskPollStarted, Some(2)),
+                    event(3, 150, RuntimeEventKind::TaskPollFinished, Some(2)),
+                ],
+                ..Events::default()
+            },
+            None,
+            &[],
+        );
+
+        let worker = &snapshot.workers[0];
+        assert_eq!(worker.scheduling_time.mean_nanos(), Some(40));
+        assert_eq!(worker.tasks[0].metrics.ready_samples.as_ref(), &[40]);
+        assert_eq!(snapshot.asynchronous_groups[0].ready_samples, [40]);
     }
 
     #[test]
