@@ -124,6 +124,7 @@ pub(super) struct RuntimeWorkerSummary {
     pub(super) metrics: ExecutionMetrics,
     pub(super) blocking: BlockingWorkerSummary,
     pub(super) scheduling_time: DurationSummary,
+    pub(super) scheduling_samples: Vec<u64>,
     pub(super) ready_time: DurationSummary,
     pub(super) window: Option<TimeWindow>,
     pub(super) tasks: Vec<RuntimeTaskSummary>,
@@ -193,6 +194,7 @@ struct TaskBuilder {
     ready: Vec<Interval>,
     ready_samples: Vec<u64>,
     ready_at: Option<u64>,
+    poll_scheduling_delays: BTreeMap<Option<u64>, Option<u64>>,
     wake_samples: Vec<u64>,
     unassigned_poll: Option<Interval>,
     matching_poll_workers: BTreeSet<u64>,
@@ -414,6 +416,7 @@ fn observe_ready_delay(
         .or_insert_with(|| worker_row(runtime_id, worker_id));
     worker.ready_time.observe(Some(duration));
     worker.scheduling_time.observe(Some(duration));
+    worker.scheduling_samples.push(duration);
     let group = groups.entry((runtime_id, worker_id, descriptor)).or_default();
     group.ready_time.observe(Some(duration));
     group.ready_samples.push(duration);
@@ -659,6 +662,9 @@ impl RuntimeMonitorSnapshot {
                         .or_else(|| (runtime.value_1 == 2).then_some(runtime.value_0));
                     if let Some(delay) = delay {
                         task.scheduling_delay_observed(timestamp, delay);
+                        task.poll_scheduling_delays.insert(worker_id, Some(delay));
+                    } else {
+                        task.poll_scheduling_delays.entry(worker_id).or_insert(None);
                     }
                     task.poll_started(
                         worker_id,
@@ -670,16 +676,23 @@ impl RuntimeMonitorSnapshot {
                 }
                 EventKind::TaskMaterialized if task.row.kind == RuntimeTaskKind::Asynchronous => {
                     task.scheduling_delay_observed(timestamp, runtime.value_0);
+                    task.poll_scheduling_delays.insert(worker_id, Some(runtime.value_0));
                     Some(runtime.value_0)
                 }
                 EventKind::TaskPollFinished => {
                     task.executed.insert(worker_id);
+                    let scheduling_delay_nanos = task.poll_scheduling_delays.remove(&worker_id).flatten();
                     let metrics = task.metrics.entry(worker_id).or_default();
                     metrics.poll_samples.push(runtime.value_0);
                     if timestamp != 0
                         && let Some(start) = timestamp.checked_sub(runtime.value_0)
                     {
-                        metrics.polls.push(Interval { start, end: timestamp });
+                        let poll = Interval { start, end: timestamp };
+                        metrics.polls.push(poll);
+                        metrics.poll_executions.push(super::runtime_timeline::PollExecution {
+                            interval: poll,
+                            scheduling_delay_nanos,
+                        });
                     }
                     None
                 }
@@ -788,6 +801,7 @@ fn distribute_tasks(workers: &mut Workers, tasks: BTreeMap<(u64, u64), TaskBuild
             row.metrics.ready_samples = Arc::clone(&ready_samples);
             row.metrics.wake_samples = Arc::clone(&wake_samples);
             worker.metrics.polls.extend_from_slice(&row.metrics.polls);
+            worker.metrics.poll_executions.extend_from_slice(&row.metrics.poll_executions);
             worker.metrics.poll_samples.extend_from_slice(&row.metrics.poll_samples);
             worker.tasks.push(row);
         }

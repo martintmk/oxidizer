@@ -57,6 +57,11 @@ enum Split {
     RuntimeTaskColumns,
     RuntimeTaskDetails,
     RuntimeTaskRows,
+    RuntimeTaskSummaryRows,
+    RuntimeTaskPollColumns,
+    RuntimeTaskDurationColumns,
+    RuntimeTaskEventColumns,
+    RuntimeTaskStackColumns,
     Io,
     Cache,
     Hotspots,
@@ -65,12 +70,12 @@ enum Split {
 #[derive(Default)]
 pub(super) struct Panels {
     pub(super) rows: super::mouse::MouseRows,
-    sizes: [Option<Constraint>; 21],
+    sizes: [Option<Constraint>; 26],
     dragging: Option<(MonitorTab, Split)>,
 }
 
 pub(super) struct Arrangement {
-    pub(super) areas: [Rect; 5],
+    pub(super) areas: [Rect; 8],
     dividers: Vec<Divider>,
 }
 
@@ -91,6 +96,10 @@ impl Panels {
         self.dragging = None;
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one layout dispatcher keeps every tab's draggable split hierarchy together"
+    )]
     pub(super) fn arrange(&self, tab: MonitorTab, area: Rect) -> Arrangement {
         let mut dividers = Vec::new();
         let mut split = |id, direction, parent, default| {
@@ -110,7 +119,7 @@ impl Panels {
             }
             [first, second]
         };
-        let mut areas = [Rect::default(); 5];
+        let mut areas = [Rect::default(); 8];
         match tab {
             MonitorTab::Info => {
                 let [activity, bottom] = split(Split::Info, Direction::Vertical, area, Constraint::Percentage(45));
@@ -122,7 +131,7 @@ impl Panels {
                 let [tiers, details] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(rest);
                 let [buckets, side] = split(Split::HeapColumns, Direction::Horizontal, details, Constraint::Percentage(52));
                 let [hotspots, stack] = split(Split::HeapStack, Direction::Vertical, side, Constraint::Percentage(52));
-                areas = [summary, tiers, buckets, hotspots, stack];
+                areas[..5].copy_from_slice(&[summary, tiers, buckets, hotspots, stack]);
             }
             MonitorTab::Allocations => {
                 [areas[0], areas[1]] = split(Split::Allocations, Direction::Vertical, area, Constraint::Percentage(58));
@@ -138,17 +147,53 @@ impl Panels {
                 let [threads, operations] = split(Split::ThreadColumns, Direction::Horizontal, top, Constraint::Percentage(45));
                 let [participants, rest] = split(Split::ThreadParticipants, Direction::Horizontal, bottom, Constraint::Percentage(38));
                 let [objects, stack] = split(Split::ThreadStack, Direction::Horizontal, rest, Constraint::Percentage(43));
-                areas = [threads, operations, participants, objects, stack];
+                areas[..5].copy_from_slice(&[threads, operations, participants, objects, stack]);
             }
             MonitorTab::Runtime => {
                 let [top, bottom] = split(Split::RuntimeRows, Direction::Vertical, area, Constraint::Percentage(38));
                 let [workers, activity] = split(Split::RuntimeColumns, Direction::Horizontal, top, Constraint::Percentage(60));
                 let [types, lower] = split(Split::RuntimeTaskColumns, Direction::Vertical, bottom, Constraint::Length(10));
                 let [tasks, preview] = split(Split::RuntimeTaskDetails, Direction::Horizontal, lower, Constraint::Percentage(55));
-                areas = [workers, activity, types, tasks, preview];
+                areas[..5].copy_from_slice(&[workers, activity, types, tasks, preview]);
             }
             MonitorTab::RuntimeTask => {
-                [areas[0], areas[1]] = split(Split::RuntimeTaskRows, Direction::Vertical, area, Constraint::Percentage(48));
+                let [top, bottom] = split(Split::RuntimeTaskRows, Direction::Vertical, area, Constraint::Percentage(48));
+                let [summary, metrics] = split(Split::RuntimeTaskSummaryRows, Direction::Vertical, top, Constraint::Percentage(45));
+                let [polls, durations] = split(
+                    Split::RuntimeTaskPollColumns,
+                    Direction::Horizontal,
+                    metrics,
+                    Constraint::Length(42),
+                );
+                let [poll_duration, scheduling_delay] = split(
+                    Split::RuntimeTaskDurationColumns,
+                    Direction::Horizontal,
+                    durations,
+                    Constraint::Percentage(50),
+                );
+                let [notice, events] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(bottom);
+                let [operations, event_details] = split(
+                    Split::RuntimeTaskEventColumns,
+                    Direction::Horizontal,
+                    events,
+                    Constraint::Length(32),
+                );
+                let [occurrences, stack] = split(
+                    Split::RuntimeTaskStackColumns,
+                    Direction::Horizontal,
+                    event_details,
+                    Constraint::Percentage(55),
+                );
+                areas = [
+                    summary,
+                    polls,
+                    poll_duration,
+                    scheduling_delay,
+                    notice,
+                    operations,
+                    occurrences,
+                    stack,
+                ];
             }
             MonitorTab::Io => {
                 [areas[0], areas[1]] = split(Split::Io, Direction::Vertical, area, Constraint::Percentage(35));
@@ -389,6 +434,49 @@ mod tests {
         );
         panels.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 10, 5), MonitorTab::Runtime, area);
         assert_eq!(panels.arrange(MonitorTab::Runtime, area).areas, after);
+    }
+
+    #[test]
+    fn every_runtime_task_view_divider_is_draggable() {
+        let area = Rect::new(0, 0, 180, 60);
+        let expected = [
+            Split::RuntimeTaskRows,
+            Split::RuntimeTaskSummaryRows,
+            Split::RuntimeTaskPollColumns,
+            Split::RuntimeTaskDurationColumns,
+            Split::RuntimeTaskEventColumns,
+            Split::RuntimeTaskStackColumns,
+        ];
+        let arrangement = Panels::default().arrange(MonitorTab::RuntimeTask, area);
+        assert_eq!(
+            arrangement.dividers.iter().map(|divider| divider.split).collect::<Vec<_>>(),
+            expected
+        );
+
+        for expected_split in expected {
+            let mut panels = Panels::default();
+            let arrangement = panels.arrange(MonitorTab::RuntimeTask, area);
+            let divider = arrangement.dividers.iter().find(|divider| divider.split == expected_split).unwrap();
+            let down = match divider.direction {
+                Direction::Horizontal => (divider.hit.x, divider.parent.y + divider.parent.height / 2),
+                Direction::Vertical => (divider.parent.x + divider.parent.width / 2, divider.hit.y),
+            };
+            let drag = match divider.direction {
+                Direction::Horizontal => (divider.hit.x.saturating_add(8).min(divider.parent.right() - 1), divider.hit.y),
+                Direction::Vertical => (divider.hit.x, divider.hit.y.saturating_add(5).min(divider.parent.bottom() - 1)),
+            };
+            panels.handle_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), down.0, down.1),
+                MonitorTab::RuntimeTask,
+                area,
+            );
+            panels.handle_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), drag.0, drag.1),
+                MonitorTab::RuntimeTask,
+                area,
+            );
+            assert!(panels.sizes[expected_split as usize].is_some());
+        }
     }
 
     #[test]

@@ -5601,7 +5601,9 @@ mod tests {
 
         let worker = &snapshot.workers[0];
         assert_eq!(worker.scheduling_time.mean_nanos(), Some(40));
+        assert_eq!(worker.scheduling_samples, [40]);
         assert_eq!(worker.tasks[0].metrics.ready_samples.as_ref(), &[40]);
+        assert_eq!(worker.tasks[0].metrics.poll_executions[0].scheduling_delay_nanos, Some(40));
         assert_eq!(snapshot.asynchronous_groups[0].ready_samples, [40]);
     }
 

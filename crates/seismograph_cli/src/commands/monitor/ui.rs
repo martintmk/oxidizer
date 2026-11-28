@@ -376,7 +376,7 @@ fn draw_connected(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, v
         MonitorTab::Threads => draw_threads(
             frame,
             &view.panels.rows,
-            panels,
+            [panels[0], panels[1], panels[2], panels[3], panels[4]],
             view.snapshot.map(|snapshot| &snapshot.threads),
             view.snapshot_error,
             view.thread_view,
@@ -395,7 +395,10 @@ fn draw_connected(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, v
             runtime_tasks_ui::draw(frame, &view.panels.rows, areas[2], runtime, view.snapshot_error, view.runtime_view);
             let selected_task =
                 runtime_group_ui::draw_task_list(frame, &view.panels.rows, areas[3], runtime, view.snapshot_error, view.runtime_view);
-            if view.runtime_view.detail_mode == super::app::RuntimeDetailMode::Task {
+            if matches!(
+                view.runtime_view.detail_mode,
+                super::app::RuntimeDetailMode::Task | super::app::RuntimeDetailMode::Polls
+            ) {
                 runtime_task_detail_ui::draw(frame, areas[4], selected_task, runtime, view.runtime_view);
             } else if view.runtime_view.group_selected_explicitly {
                 runtime_group_ui::draw_statistics(frame, areas[4], runtime, view.snapshot_error, view.runtime_view);
@@ -422,11 +425,18 @@ fn draw_connected(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, v
                 return;
             };
             let areas = view.panels.arrange(MonitorTab::RuntimeTask, content).areas;
-            runtime_task_detail_ui::draw(frame, areas[0], Some(task), runtime, view.runtime_view);
+            runtime_task_detail_ui::draw_resizable(
+                frame,
+                &view.panels.rows,
+                [areas[0], areas[1], areas[2], areas[3]],
+                task,
+                runtime,
+                view.runtime_view,
+            );
             task_events_ui::draw(
                 frame,
                 &view.panels.rows,
-                areas[1],
+                [areas[4], areas[5], areas[6], areas[7]],
                 Some(task),
                 view.snapshot.map(|snapshot| &snapshot.task_events),
                 view.runtime_view,
@@ -4948,6 +4958,6 @@ mod tests {
             }));
         }
 
-        assert_eq!(stable_digest(&output), (484_730, 87_990_362_589_273_027));
+        assert_eq!(stable_digest(&output), (484_894, 15_940_027_076_857_702_297));
     }
 }

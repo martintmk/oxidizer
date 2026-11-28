@@ -17,12 +17,19 @@ pub(super) struct Interval {
     pub(super) end: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PollExecution {
+    pub(super) interval: Interval,
+    pub(super) scheduling_delay_nanos: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct ExecutionMetrics {
     pub(super) poll_count: u64,
     pub(super) median_poll_nanos: Option<u64>,
     pub(super) max_poll_nanos: Option<u64>,
     pub(super) polls: Vec<Interval>,
+    pub(super) poll_executions: Vec<PollExecution>,
     pub(super) ready: Arc<[Interval]>,
     pub(super) poll_samples: Vec<u64>,
     pub(super) ready_samples: Arc<[u64]>,
@@ -34,6 +41,8 @@ impl ExecutionMetrics {
         self.poll_count = u64::try_from(self.poll_samples.len()).unwrap_or(u64::MAX);
         self.max_poll_nanos = self.poll_samples.iter().copied().max();
         self.median_poll_nanos = median_nanos(&mut self.poll_samples);
+        self.poll_executions
+            .sort_unstable_by_key(|poll| (poll.interval.start, poll.interval.end));
         self.polls = union(&self.polls);
     }
 }
@@ -144,6 +153,42 @@ mod tests {
             ),
             (None, Some(0), Some(2), Some(3), Some(u64::MAX - 1))
         );
+    }
+
+    #[test]
+    fn finishing_metrics_preserves_ordered_poll_executions_before_merging_activity() {
+        let mut metrics = ExecutionMetrics {
+            polls: vec![Interval { start: 5, end: 10 }, Interval { start: 1, end: 6 }],
+            poll_executions: vec![
+                PollExecution {
+                    interval: Interval { start: 5, end: 10 },
+                    scheduling_delay_nanos: Some(2),
+                },
+                PollExecution {
+                    interval: Interval { start: 1, end: 6 },
+                    scheduling_delay_nanos: None,
+                },
+            ],
+            poll_samples: vec![5, 5],
+            ..ExecutionMetrics::default()
+        };
+
+        metrics.finish(None);
+
+        assert_eq!(
+            metrics.poll_executions,
+            [
+                PollExecution {
+                    interval: Interval { start: 1, end: 6 },
+                    scheduling_delay_nanos: None,
+                },
+                PollExecution {
+                    interval: Interval { start: 5, end: 10 },
+                    scheduling_delay_nanos: Some(2),
+                }
+            ]
+        );
+        assert_eq!(metrics.polls, [Interval { start: 1, end: 10 }]);
     }
 
     #[test]

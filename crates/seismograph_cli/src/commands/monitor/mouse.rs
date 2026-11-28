@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders};
 
 use super::app::{
     AllocatorBackend, App, CacheFocus, HeapFocus, IoFocus, MonitorTab, PrimitiveFocus, RuntimeDetailMode, RuntimeSectionFocus,
-    RuntimeTaskRowSort, RuntimeTaskTypeSort, RuntimeWorkersFocus, Screen, TaskEventsFocus, ThreadFocus,
+    RuntimeTaskRowSort, RuntimeTaskTypeSort, RuntimeWorkersFocus, Screen, TaskEventsFocus, TaskPollSort, ThreadFocus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +46,8 @@ pub(super) enum ListTarget {
     RuntimeTaskTypeHeader(RuntimeTaskTypeSort),
     RuntimeGroupTasks,
     RuntimeTaskHeader(RuntimeTaskRowSort),
+    RuntimeTaskPolls(u64, u64),
+    RuntimeTaskPollHeader(TaskPollSort),
     TaskOperations,
     TaskOperationHeader(super::app::TaskEventOperationSort),
     TaskOccurrences,
@@ -92,9 +94,12 @@ impl ListTarget {
             Self::AsynchronousTaskGroups | Self::BlockingTaskGroups | Self::RuntimeTaskTypeHeader(_) | Self::RuntimeGroupTasks => {
                 Some(MonitorTab::Runtime)
             }
-            Self::TaskOperations | Self::TaskOperationHeader(_) | Self::TaskOccurrences | Self::TaskOccurrenceHeader(_) => {
-                Some(MonitorTab::RuntimeTask)
-            }
+            Self::RuntimeTaskPolls(_, _)
+            | Self::RuntimeTaskPollHeader(_)
+            | Self::TaskOperations
+            | Self::TaskOperationHeader(_)
+            | Self::TaskOccurrences
+            | Self::TaskOccurrenceHeader(_) => Some(MonitorTab::RuntimeTask),
             Self::IoResources | Self::IoResourceHeader(_) | Self::IoOperations | Self::IoOperationHeader(_) => Some(MonitorTab::Io),
             Self::CacheTiers | Self::CacheTierHeader(_) | Self::CacheOperations | Self::CacheOperationHeader(_) => Some(MonitorTab::Cache),
             Self::HotspotFindings | Self::HotspotHeader(_) => Some(MonitorTab::Hotspots),
@@ -401,6 +406,18 @@ impl App {
             self.runtime_view.task_selected_explicitly = false;
             return;
         }
+        if let ListTarget::RuntimeTaskPollHeader(sort) = target {
+            self.runtime_view.detail_mode = RuntimeDetailMode::Polls;
+            select_sort(
+                &mut self.runtime_view.poll_sort,
+                &mut self.runtime_view.poll_descending,
+                sort,
+                false,
+            );
+            self.runtime_view.selected_poll = None;
+            self.runtime_view.events.reset();
+            return;
+        }
         self.activate_selectable_mouse_row(target, index);
     }
 
@@ -450,6 +467,7 @@ impl App {
                 self.runtime_view.detail_mode = RuntimeDetailMode::Task;
                 self.runtime_view.task_selected = index;
                 self.runtime_view.task_selected_explicitly = true;
+                self.runtime_view.selected_poll = None;
                 let now = self.io.instant();
                 let double_click = self.last_runtime_task_click.is_some_and(|(previous, at)| {
                     previous == index && now.saturating_duration_since(at) <= std::time::Duration::from_millis(500)
@@ -465,6 +483,12 @@ impl App {
                 } else {
                     self.last_runtime_task_click = Some((index, now));
                 }
+                return;
+            }
+            ListTarget::RuntimeTaskPolls(runtime_id, task_id) => {
+                self.runtime_view.detail_mode = RuntimeDetailMode::Polls;
+                self.runtime_view.selected_poll = Some((runtime_id, task_id, index));
+                self.runtime_view.events.reset();
                 return;
             }
             _ => {}
@@ -548,6 +572,8 @@ impl App {
             | ListTarget::RuntimeTaskTypeHeader(_)
             | ListTarget::RuntimeGroupTasks
             | ListTarget::RuntimeTaskHeader(_)
+            | ListTarget::RuntimeTaskPolls(_, _)
+            | ListTarget::RuntimeTaskPollHeader(_)
             | ListTarget::TaskOperationHeader(_)
             | ListTarget::TaskOccurrenceHeader(_) => return,
             ListTarget::TaskOperations | ListTarget::TaskOccurrences => {
@@ -652,6 +678,30 @@ mod tests {
             ),
             (RuntimeWorkersFocus::Asynchronous, 2, true)
         );
+        app.runtime_view.events.operation_selected = 3;
+        app.runtime_view.events.event_selected = 4;
+        app.activate_selectable_mouse_row(ListTarget::RuntimeTaskPolls(7, 11), 2);
+        assert_eq!(app.runtime_view.selected_poll, Some((7, 11, 2)));
+        assert_eq!(
+            (app.runtime_view.events.operation_selected, app.runtime_view.events.event_selected),
+            (0, 0)
+        );
+        if let Screen::Offline { tab, .. } = &mut app.screen {
+            *tab = MonitorTab::RuntimeTask;
+        }
+        app.activate_mouse_row(ListTarget::RuntimeTaskPollHeader(TaskPollSort::Duration), 0);
+        assert_eq!(
+            (
+                app.runtime_view.poll_sort,
+                app.runtime_view.poll_descending,
+                app.runtime_view.selected_poll,
+                app.runtime_view.events.operation_selected,
+                app.runtime_view.events.event_selected,
+            ),
+            (TaskPollSort::Duration, false, None, 0, 0)
+        );
+        app.activate_mouse_row(ListTarget::RuntimeTaskPollHeader(TaskPollSort::Duration), 0);
+        assert!(app.runtime_view.poll_descending);
         if let Screen::Offline { tab, .. } = &mut app.screen {
             *tab = MonitorTab::Info;
         }

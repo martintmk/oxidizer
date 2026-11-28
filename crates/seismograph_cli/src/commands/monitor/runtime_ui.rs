@@ -9,17 +9,18 @@ use std::cmp::Ordering;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
 use super::super::app::{RuntimeSectionFocus, RuntimeViewState, RuntimeWorkerSort, RuntimeWorkersFocus, compare_runtime_workers};
 use super::super::data::{RuntimeMonitorSnapshot, RuntimeWorkerSummary};
-use super::super::formatting::{format_count, format_histogram_duration, format_runtime_duration};
+#[cfg(test)]
+use super::super::formatting::format_histogram_duration;
+use super::super::formatting::{format_count, format_runtime_duration};
 use super::super::hotspot_analysis::{long_async_poll, long_blocking_execution, long_blocking_queue, long_scheduling_delay};
 use super::super::mouse::{ListTarget, MouseRows};
-use super::super::runtime_timeline::populated_histogram;
 use super::super::table_ui;
 use super::draw_empty_panel_with_message;
-use super::runtime_group_ui::aligned_details;
+use super::runtime_group_ui::{aligned_details, draw_histogram_pair};
 
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
@@ -520,14 +521,13 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
         return;
     };
     if focus == RuntimeWorkersFocus::Asynchronous {
-        let [summary, chart] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
+        let [summary, chart] = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(area);
         let lines = vec![
             Line::from(format!("Thread: {}", worker_thread(worker))),
             Line::from(format!(
                 "Current task: {}",
                 worker.current_task.map_or_else(|| "-".into(), |id| format!("#{id}"))
             )),
-            Line::from(format!("Scheduling samples: {}", format_count(worker.scheduling_time.samples))),
             Line::from(format!("Park events: {}", format_count(worker.park_events))),
             Line::from(format!("Unpark events: {}", format_count(worker.unpark_events))),
         ];
@@ -535,7 +535,12 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
             Paragraph::new(aligned_details(lines)).block(table_ui::focused_block(title, false)),
             summary,
         );
-        draw_poll_histogram(frame, chart, &worker.metrics.poll_samples);
+        draw_histogram_pair(
+            frame,
+            chart,
+            ("Poll duration", &worker.metrics.poll_samples),
+            ("Scheduling delay", &worker.scheduling_samples),
+        );
         return;
     }
     let lines = vec![
@@ -560,40 +565,6 @@ fn draw_worker_activity(frame: &mut ratatui::Frame<'_>, area: Rect, worker: Opti
     ];
     frame.render_widget(
         Paragraph::new(aligned_details(lines)).block(table_ui::focused_block(title, false)),
-        area,
-    );
-}
-
-fn draw_poll_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, samples: &[u64]) {
-    if samples.is_empty() {
-        draw_empty_panel_with_message(frame, area, " Poll Duration ", Some("No completed poll samples."));
-        return;
-    }
-    let count = usize::from(area.width.saturating_sub(2) / 9).clamp(1, 12);
-    let bins = populated_histogram(samples, count);
-    let bars = bins
-        .iter()
-        .map(|bin| {
-            Bar::default()
-                .value(bin.count)
-                .label(Line::from(format_histogram_duration(bin.lower)))
-                .style(Style::default().fg(Color::Cyan))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        BarChart::default()
-            .block(table_ui::focused_block(
-                format!(
-                    " Poll Duration · n={} · max {} ",
-                    samples.len(),
-                    duration(samples.iter().copied().max())
-                ),
-                false,
-            ))
-            .data(BarGroup::default().bars(&bars))
-            .bar_width(5)
-            .bar_gap(1)
-            .max(bins.iter().map(|bin| bin.count).max().unwrap_or(1)),
         area,
     );
 }
@@ -653,8 +624,10 @@ mod tests {
                         poll_count: 7,
                         median_poll_nanos: Some(20),
                         max_poll_nanos: Some(50),
+                        poll_samples: vec![20, 50],
                         ..ExecutionMetrics::default()
                     },
+                    scheduling_samples: vec![40, 60],
                     ..RuntimeWorkerSummary::default()
                 },
                 RuntimeWorkerSummary {
@@ -792,6 +765,10 @@ mod tests {
                     let details = text.split_whitespace().collect::<Vec<_>>().join(" ").replace(" : ", ": ");
                     assert!(details.contains("Park events: 5"), "{details}");
                     assert!(details.contains("Unpark events: 6"), "{details}");
+                    assert!(details.contains("Poll duration"), "{details}");
+                    assert!(details.contains("n=2 · max 50ns"), "{details}");
+                    assert!(details.contains("Scheduling delay"), "{details}");
+                    assert!(details.contains("n=2 · max 60ns"), "{details}");
                 }
                 RuntimeWorkersFocus::Blocking => {
                     assert!(text.contains("Blocking Workers"));

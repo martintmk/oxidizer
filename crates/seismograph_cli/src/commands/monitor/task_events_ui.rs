@@ -3,7 +3,9 @@
 
 //! Inferred task operations, their task-only occurrences, and the selected stack.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+#[cfg(test)]
+use ratatui::layout::Layout;
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState};
@@ -14,6 +16,7 @@ use super::super::app::{
 use super::super::data::{AllocationStackFilter, RuntimeTaskSummary};
 use super::super::formatting::{format_count, format_runtime_duration};
 use super::super::mouse::{ListTarget, MouseRows};
+use super::super::runtime_timeline::Interval;
 use super::super::table_ui;
 use super::super::task_events::{TaskEvent, TaskEventSummary, TaskEventsSnapshot, TaskObject, TaskOperation};
 use super::draw_empty_panel_with_message;
@@ -42,21 +45,30 @@ impl<'a> OccurrenceTable<'a> {
 pub(super) fn draw(
     frame: &mut ratatui::Frame<'_>,
     mouse: &MouseRows,
-    area: Rect,
+    [notice, operations_area, occurrences_area, stack_area]: [Rect; 4],
     task: Option<&RuntimeTaskSummary>,
     snapshot: Option<&TaskEventsSnapshot>,
     runtime_view: RuntimeViewState,
 ) {
-    if area.is_empty() {
+    if notice.is_empty() && operations_area.is_empty() && occurrences_area.is_empty() && stack_area.is_empty() {
         return;
     }
     let events = task.and_then(|task| snapshot?.tasks.get(&(task.runtime_id, task.task_id)));
-    let [notice, content] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let selected_poll = task.and_then(|task| {
+        let selected = runtime_view
+            .selected_poll(task.runtime_id, task.task_id)?
+            .min(task.metrics.poll_executions.len().saturating_sub(1));
+        task.metrics.poll_executions.get(selected).map(|poll| (selected, poll.interval))
+    });
+    let selected_interval = selected_poll.map(|(_, poll)| poll);
     let caption = task.map_or_else(
         || "Select a task to browse inferred operations.".to_owned(),
         |task| {
+            let poll = selected_poll
+                .map(|(selected, _)| selected)
+                .map_or_else(|| "all polls".into(), |selected| format!("poll {}", selected + 1));
             format!(
-                "{}:task{} | {} inferred events across workers | capture: {} unassigned, {} ambiguous | e focus, F1 details",
+                "{}:task{} | {poll} | {} inferred events across workers | capture: {} unassigned, {} ambiguous | e focus, F1 details",
                 task.runtime_id,
                 task.task_id,
                 events.map_or(0, |events| events.inferred_events),
@@ -67,20 +79,29 @@ pub(super) fn draw(
     );
     frame.render_widget(Paragraph::new(caption), notice);
     let view = runtime_view.events;
-    let operations = events.map(|events| sorted_operations(events, view));
+    let operations = events.map(|events| sorted_operations(events, view, selected_interval));
     let operation = operations
         .as_ref()
         .and_then(|operations| operations.get(view.operation_selected.min(operations.len().saturating_sub(1))))
         .copied();
-    let occurrences = operation.map(|operation| sorted_occurrences(operation, view));
-    let offset_origin = events.and_then(first_task_event_timestamp);
+    let occurrences = operation.map(|operation| sorted_occurrences(operation, view, selected_interval));
+    let offset_origin = selected_interval
+        .map(|poll| poll.start)
+        .or_else(|| events.and_then(first_task_event_timestamp));
     let occurrence = occurrences
         .as_ref()
         .and_then(|occurrences| occurrences.get(view.event_selected.min(occurrences.len().saturating_sub(1))))
         .copied();
-    let [operations_area, occurrences_area, stack_area] = areas(content, view.focus);
     let focused = runtime_view.detail_mode == RuntimeDetailMode::Events;
-    draw_operations(frame, mouse, operations_area, operations.as_deref(), view, focused);
+    draw_operations(
+        frame,
+        mouse,
+        operations_area,
+        operations.as_deref(),
+        selected_interval,
+        view,
+        focused,
+    );
     draw_occurrences(
         frame,
         mouse,
@@ -99,12 +120,16 @@ fn first_task_event_timestamp(task: &TaskEventSummary) -> Option<u64> {
         .min()
 }
 
-fn sorted_operations(task: &TaskEventSummary, view: TaskEventsViewState) -> Vec<&TaskOperation> {
-    let mut operations = task.operations.iter().collect::<Vec<_>>();
+fn sorted_operations(task: &TaskEventSummary, view: TaskEventsViewState, poll: Option<Interval>) -> Vec<&TaskOperation> {
+    let mut operations = task
+        .operations
+        .iter()
+        .filter(|operation| operation_event_count(operation, poll) != 0)
+        .collect::<Vec<_>>();
     operations.sort_unstable_by(|left, right| {
         let ordering = match view.operation_sort {
             TaskEventOperationSort::Operation => left.kind.label().cmp(right.kind.label()),
-            TaskEventOperationSort::Events => left.events.cmp(&right.events),
+            TaskEventOperationSort::Events => operation_event_count(left, poll).cmp(&operation_event_count(right, poll)),
         };
         let ordering = table_ui::directed(ordering, view.operation_descending);
         ordering.then_with(|| left.kind.label().cmp(right.kind.label()))
@@ -112,8 +137,11 @@ fn sorted_operations(task: &TaskEventSummary, view: TaskEventsViewState) -> Vec<
     operations
 }
 
-fn sorted_occurrences(operation: &TaskOperation, view: TaskEventsViewState) -> Vec<(&TaskObject, &TaskEvent)> {
-    let mut occurrences = operation.occurrences().collect::<Vec<_>>();
+fn sorted_occurrences(operation: &TaskOperation, view: TaskEventsViewState, poll: Option<Interval>) -> Vec<(&TaskObject, &TaskEvent)> {
+    let mut occurrences = operation
+        .occurrences()
+        .filter(|(_, event)| poll.is_none_or(|poll| event.timestamp >= poll.start && event.timestamp <= poll.end))
+        .collect::<Vec<_>>();
     occurrences.sort_unstable_by(|(left_object, left), (right_object, right)| {
         let ordering = match view.occurrence_sort {
             TaskOccurrenceSort::Time => left.timestamp.cmp(&right.timestamp),
@@ -129,6 +157,19 @@ fn sorted_occurrences(operation: &TaskOperation, view: TaskEventsViewState) -> V
     occurrences
 }
 
+fn operation_event_count(operation: &TaskOperation, poll: Option<Interval>) -> u64 {
+    poll.map_or(operation.events, |poll| {
+        u64::try_from(
+            operation
+                .occurrences()
+                .filter(|(_, event)| event.timestamp >= poll.start && event.timestamp <= poll.end)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    })
+}
+
+#[cfg(test)]
 fn areas(area: Rect, focus: TaskEventsFocus) -> [Rect; 3] {
     if area.width < 110 {
         return match focus {
@@ -147,6 +188,7 @@ fn draw_operations(
     mouse: &MouseRows,
     area: Rect,
     operations: Option<&[&TaskOperation]>,
+    poll: Option<Interval>,
     view: TaskEventsViewState,
     focused: bool,
 ) {
@@ -166,7 +208,10 @@ fn draw_operations(
     let visible = usize::from(area.height.saturating_sub(3));
     let first = selected.saturating_sub(visible.saturating_sub(1));
     let rows = operations.iter().skip(first).take(visible).map(|operation| {
-        let row = Row::new([operation.kind.label().to_owned(), format_count(operation.events)]);
+        let row = Row::new([
+            operation.kind.label().to_owned(),
+            format_count(operation_event_count(operation, poll)),
+        ]);
         if operation.kind.is_contention() {
             row.style(Style::default().fg(Color::Yellow))
         } else {
@@ -431,11 +476,11 @@ mod tests {
         view.operation_selected = 1;
         let mouse = MouseRows::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 5)).unwrap();
-        let operations = sorted_operations(task, view);
+        let operations = sorted_operations(task, view, None);
         terminal
             .draw(|frame| {
                 mouse.begin(frame.area());
-                draw_operations(frame, &mouse, frame.area(), Some(&operations), view, true);
+                draw_operations(frame, &mouse, frame.area(), Some(&operations), None, view, true);
             })
             .unwrap();
         assert_eq!(
@@ -454,7 +499,7 @@ mod tests {
             .iter()
             .find(|operation| operation.kind == super::super::super::data::ThreadOperationKind::MutexAccess)
             .unwrap();
-        let occurrences = sorted_occurrences(operation, view);
+        let occurrences = sorted_occurrences(operation, view, None);
         let offset_origin = first_task_event_timestamp(task);
         terminal
             .draw(|frame| {
@@ -497,6 +542,48 @@ mod tests {
             .unwrap();
         let first = (1..59).map(|x| terminal.backend().buffer()[(x, 1)].symbol()).collect::<String>();
         assert!(first.trim().is_empty());
+    }
+
+    #[test]
+    fn selected_poll_filters_operations_occurrences_and_counts() {
+        let events = Events {
+            clock: EventClock::ProcessMonotonic,
+            total_events: 7,
+            recording: Policies {
+                runtime_tasks: Policy::all(true),
+                general_events: Policy::all(true),
+                arc_dereferences: Policy::all(true),
+                ..Policies::default()
+            },
+            threads: vec![ThreadLog {
+                thread_id: ThreadId::new(1),
+                total_events: 7,
+                ..ThreadLog::default()
+            }],
+            events: vec![
+                task_event(1, EventKind::TaskPollStarted, 0),
+                event(2, EventKind::MutexAccess, EventPayload::Object(ObjectId::new(7))),
+                task_event(3, EventKind::TaskPollFinished, 20),
+                task_event(4, EventKind::TaskPollStarted, 0),
+                event(5, EventKind::MutexAccess, EventPayload::Object(ObjectId::new(7))),
+                event(6, EventKind::ArcClone, EventPayload::Object(ObjectId::new(8))),
+                task_event(7, EventKind::TaskPollFinished, 30),
+            ],
+            ..Events::default()
+        };
+        let snapshot = TaskEventsSnapshot::from_events(&events, &[], None);
+        let task = &snapshot.tasks[&(1, 1)];
+        let view = super::super::super::app::App::new().runtime_view.events;
+        let first_poll = Interval { start: 10, end: 30 };
+
+        let operations = sorted_operations(task, view, Some(first_poll));
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].kind, super::super::super::data::ThreadOperationKind::MutexAccess);
+        assert_eq!(operation_event_count(operations[0], Some(first_poll)), 1);
+        let occurrences = sorted_occurrences(operations[0], view, Some(first_poll));
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].1.timestamp, 20);
+        assert_eq!(format_event_offset(occurrences[0].1.timestamp, Some(first_poll.start)), "10ns");
     }
 
     #[test]

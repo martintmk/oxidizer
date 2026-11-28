@@ -292,15 +292,20 @@ pub(super) fn draw_histogram_pair(frame: &mut ratatui::Frame<'_>, area: Rect, le
     draw_histogram(frame, right_area, right.0, right.1);
 }
 
-fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, samples: &[u64]) {
+pub(super) fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, samples: &[u64]) {
     if area.is_empty() {
         return;
     }
+    let metadata = format!(
+        " n={} · max {} ",
+        format_count(u64::try_from(samples.len()).unwrap_or(u64::MAX)),
+        duration(samples.iter().copied().max())
+    );
     if samples.is_empty() {
         frame.render_widget(
             Paragraph::new("No completed duration samples.")
                 .style(Style::default().fg(Color::DarkGray))
-                .block(table_ui::focused_block(format!(" {label} "), false)),
+                .block(table_ui::focused_block(format!(" {label} "), false).title_bottom(metadata)),
             area,
         );
         return;
@@ -318,7 +323,7 @@ fn draw_histogram(frame: &mut ratatui::Frame<'_>, area: Rect, label: &str, sampl
         .collect::<Vec<_>>();
     frame.render_widget(
         BarChart::default()
-            .block(table_ui::focused_block(format!(" {label} "), false))
+            .block(table_ui::focused_block(format!(" {label} "), false).title_bottom(metadata))
             .data(BarGroup::default().bars(&bars))
             .bar_width(5)
             .bar_gap(1)
@@ -516,7 +521,9 @@ mod tests {
             "Canceled: 2",
             "Panicked: 1",
             "Poll duration",
+            "n=3 · max 8ns",
             "Scheduling delay",
+            "n=1 · max 0ns",
         ] {
             assert!(text.contains(detail), "{detail}: {text}");
         }

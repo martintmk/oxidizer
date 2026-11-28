@@ -762,6 +762,9 @@ pub(super) struct RuntimeViewState {
     pub(super) group_selected_explicitly: bool,
     pub(super) task_selected: usize,
     pub(super) task_selected_explicitly: bool,
+    pub(super) selected_poll: Option<(u64, u64, usize)>,
+    pub(super) poll_sort: TaskPollSort,
+    pub(super) poll_descending: bool,
     pub(super) activity_scroll: usize,
     pub(super) group_histogram: GroupHistogram,
     pub(super) task_type_sort: RuntimeTaskTypeSort,
@@ -789,6 +792,9 @@ impl RuntimeViewState {
             group_selected_explicitly: false,
             task_selected: 0,
             task_selected_explicitly: false,
+            selected_poll: None,
+            poll_sort: TaskPollSort::Order,
+            poll_descending: false,
             activity_scroll: 0,
             group_histogram: GroupHistogram::Primary,
             task_type_sort: RuntimeTaskTypeSort::PollsOrRuns,
@@ -811,9 +817,16 @@ impl RuntimeViewState {
         self.group_selected_explicitly = false;
         self.task_selected = 0;
         self.task_selected_explicitly = false;
+        self.selected_poll = None;
         self.activity_scroll = 0;
         self.detail_mode = RuntimeDetailMode::Group;
         self.events.reset();
+    }
+
+    pub(super) fn selected_poll(self, runtime_id: u64, task_id: u64) -> Option<usize> {
+        self.selected_poll
+            .filter(|(selected_runtime, selected_task, _)| *selected_runtime == runtime_id && *selected_task == task_id)
+            .map(|(_, _, selected)| selected)
     }
 }
 
@@ -857,6 +870,7 @@ pub(super) enum RuntimeSectionFocus {
 pub(super) enum RuntimeDetailMode {
     Group,
     Task,
+    Polls,
     Events,
 }
 
@@ -901,6 +915,13 @@ pub(super) enum RuntimeTaskRowSort {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TaskPollSort {
+    Order,
+    Duration,
+    SchedulingDelay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TaskEventsViewState {
     pub(super) focus: TaskEventsFocus,
     pub(super) operation_selected: usize,
@@ -930,7 +951,7 @@ impl TaskEventsViewState {
         }
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.focus = TaskEventsFocus::Operations;
         self.operation_selected = 0;
         self.event_selected = 0;
@@ -2445,6 +2466,7 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
                 RuntimeSectionFocus::Workers => RuntimeSectionFocus::TaskTypes,
                 RuntimeSectionFocus::TaskTypes => {
                     view.task_selected = 0;
+                    view.selected_poll = None;
                     view.group_selected_explicitly = count != 0;
                     view.task_selected_explicitly = false;
                     view.detail_mode = RuntimeDetailMode::Group;
@@ -2455,6 +2477,7 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
                         return true;
                     }
                     view.task_selected_explicitly = true;
+                    view.selected_poll = None;
                     view.detail_mode = RuntimeDetailMode::Task;
                     RuntimeSectionFocus::GroupTasks
                 }
@@ -2476,6 +2499,7 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
             }
             if group_tasks {
                 view.task_selected_explicitly = true;
+                view.selected_poll = None;
                 view.detail_mode = RuntimeDetailMode::Task;
             } else if view.section == RuntimeSectionFocus::TaskTypes {
                 view.group_selected_explicitly = count != 0;
@@ -2494,6 +2518,7 @@ fn handle_runtime_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Opti
             }
             if group_tasks && count != 0 {
                 view.task_selected_explicitly = true;
+                view.selected_poll = None;
                 view.detail_mode = RuntimeDetailMode::Task;
             } else if view.section == RuntimeSectionFocus::TaskTypes {
                 view.group_selected_explicitly = count != 0;
@@ -2544,6 +2569,7 @@ fn reset_runtime_selections(view: &mut RuntimeViewState) {
     view.group_selected_explicitly = false;
     view.task_selected = 0;
     view.task_selected_explicitly = false;
+    view.selected_poll = None;
     view.activity_scroll = 0;
     view.events.reset();
 }
@@ -2554,6 +2580,7 @@ fn reset_runtime_group_selection(view: &mut RuntimeViewState) {
     view.group_selected_explicitly = false;
     view.task_selected = 0;
     view.task_selected_explicitly = false;
+    view.selected_poll = None;
     view.detail_mode = RuntimeDetailMode::Group;
     view.events.reset();
 }
@@ -2854,6 +2881,7 @@ fn runtime_view_for_task_id(
         .iter()
         .position(|task| task.task_id == task_id)
         .ok_or_else(|| format!("Task #{task_id} is not in its retained task group."))?;
+    view.selected_poll = None;
     view.section = RuntimeSectionFocus::GroupTasks;
     view.group_selected_explicitly = true;
     view.task_selected_explicitly = true;
@@ -2907,6 +2935,29 @@ pub(super) fn sort_runtime_tasks(tasks: &mut Vec<&super::data::RuntimeTaskSummar
     });
 }
 
+pub(super) fn sorted_task_poll_orders(task: &super::data::RuntimeTaskSummary, view: RuntimeViewState) -> Vec<usize> {
+    let mut polls = task.metrics.poll_executions.iter().enumerate().collect::<Vec<_>>();
+    polls.sort_unstable_by(|(left_order, left), (right_order, right)| {
+        let ordering = match view.poll_sort {
+            TaskPollSort::Order => left_order.cmp(right_order),
+            TaskPollSort::Duration => left
+                .interval
+                .end
+                .saturating_sub(left.interval.start)
+                .cmp(&right.interval.end.saturating_sub(right.interval.start)),
+            TaskPollSort::SchedulingDelay => match (left.scheduling_delay_nanos, right.scheduling_delay_nanos) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+        };
+        let ordering = if view.poll_descending { ordering.reverse() } else { ordering };
+        ordering.then_with(|| left_order.cmp(right_order))
+    });
+    polls.into_iter().map(|(order, _)| order).collect()
+}
+
 fn handle_runtime_task_key(code: KeyCode, view: &mut RuntimeViewState, snapshot: Option<&CapturedSnapshot>) -> bool {
     if code == KeyCode::Char('g') && view.group_selected_explicitly {
         view.detail_mode = RuntimeDetailMode::Group;
@@ -2928,6 +2979,12 @@ fn handle_runtime_task_key(code: KeyCode, view: &mut RuntimeViewState, snapshot:
         }
         return handle_task_events_key(code, &mut view.events, events);
     }
+    if view.detail_mode == RuntimeDetailMode::Polls
+        && let Some(task) = task
+        && handle_task_polls_key(code, view, task)
+    {
+        return true;
+    }
     if task.is_none() && view.detail_mode != RuntimeDetailMode::Group {
         return false;
     }
@@ -2945,6 +3002,31 @@ fn handle_runtime_task_key(code: KeyCode, view: &mut RuntimeViewState, snapshot:
         KeyCode::PageDown => view.activity_scroll = view.activity_scroll.saturating_add(5).min(usize::from(u16::MAX)),
         _ => return false,
     }
+    true
+}
+
+fn handle_task_polls_key(code: KeyCode, view: &mut RuntimeViewState, task: &super::data::RuntimeTaskSummary) -> bool {
+    if code == KeyCode::Backspace {
+        view.selected_poll = None;
+        view.detail_mode = RuntimeDetailMode::Task;
+        return true;
+    }
+    let orders = sorted_task_poll_orders(task, *view);
+    if orders.is_empty() {
+        return false;
+    }
+    let selected = view
+        .selected_poll(task.runtime_id, task.task_id)
+        .and_then(|selected| orders.iter().position(|order| *order == selected));
+    let position = match code {
+        KeyCode::Up => selected.unwrap_or(0).saturating_sub(1),
+        KeyCode::Down => selected.map_or(0, |selected| advance_selection(selected, orders.len())),
+        KeyCode::Home => 0,
+        KeyCode::End => orders.len() - 1,
+        _ => return false,
+    };
+    view.selected_poll = Some((task.runtime_id, task.task_id, orders[position]));
+    view.events.reset();
     true
 }
 
@@ -4329,6 +4411,71 @@ mod tests {
         view.detail_mode = RuntimeDetailMode::Task;
         view.focus = RuntimeWorkersFocus::Blocking;
         assert!(!handle_runtime_key(KeyCode::Char('t'), &mut view, None));
+    }
+
+    #[test]
+    fn runtime_poll_keyboard_navigation_follows_visible_sort_order() {
+        let task = super::super::runtime::RuntimeTaskSummary {
+            runtime_id: 1,
+            task_id: 7,
+            kind: super::super::runtime::RuntimeTaskKind::Asynchronous,
+            worker_ids: vec![1],
+            metrics: super::super::runtime_timeline::ExecutionMetrics {
+                poll_executions: vec![
+                    super::super::runtime_timeline::PollExecution {
+                        interval: super::super::runtime_timeline::Interval { start: 0, end: 8 },
+                        scheduling_delay_nanos: Some(5),
+                    },
+                    super::super::runtime_timeline::PollExecution {
+                        interval: super::super::runtime_timeline::Interval { start: 10, end: 11 },
+                        scheduling_delay_nanos: Some(1),
+                    },
+                    super::super::runtime_timeline::PollExecution {
+                        interval: super::super::runtime_timeline::Interval { start: 20, end: 24 },
+                        scheduling_delay_nanos: None,
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut capture = empty_capture();
+        capture.runtime = super::super::runtime::RuntimeMonitorSnapshot {
+            runtimes: vec![super::super::runtime::RuntimeSummary {
+                runtime_id: 1,
+                name: "test".into(),
+            }],
+            workers: vec![super::super::runtime::RuntimeWorkerSummary {
+                runtime_id: 1,
+                worker_id: Some(1),
+                role: "Core".into(),
+                tasks: vec![task],
+                ..Default::default()
+            }],
+            asynchronous_groups: vec![super::super::runtime::AsynchronousTaskGroupSummary {
+                runtime_id: 1,
+                worker_id: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut view = RuntimeViewState {
+            section: RuntimeSectionFocus::GroupTasks,
+            group_selected_explicitly: true,
+            task_selected_explicitly: true,
+            detail_mode: RuntimeDetailMode::Polls,
+            poll_sort: TaskPollSort::Duration,
+            ..RuntimeViewState::new()
+        };
+
+        assert!(handle_runtime_task_key(KeyCode::Home, &mut view, Some(&capture)));
+        assert_eq!(view.selected_poll, Some((1, 7, 1)));
+        assert!(handle_runtime_task_key(KeyCode::Down, &mut view, Some(&capture)));
+        assert_eq!(view.selected_poll, Some((1, 7, 2)));
+        assert!(handle_runtime_task_key(KeyCode::End, &mut view, Some(&capture)));
+        assert_eq!(view.selected_poll, Some((1, 7, 0)));
+        assert!(handle_runtime_task_key(KeyCode::Backspace, &mut view, Some(&capture)));
+        assert_eq!((view.detail_mode, view.selected_poll), (RuntimeDetailMode::Task, None));
     }
 
     #[test]
